@@ -54,7 +54,8 @@ class OursParityRunner:
         # Global knobs from data config (must match base run for parity).
         num_samples_cfg = max(1, int(getattr(cfg.data, "num_samples", 1)))
         max_tokens = getattr(cfg.data, "max_tokens", None)
-        prefill_len = int(max_tokens) if max_tokens else int(p.prefill_len)
+        ratio = float(getattr(cfg.data, "ratio", 1.0))
+        prefill_len, gen_len = cfg.data.resolved_lengths(p.prefill_len, p.gen_len)
 
         # 2. Load base npz
         base_path = cfg.base_run_npz
@@ -82,8 +83,17 @@ class OursParityRunner:
                 num_samples_cfg, num_samples_base, num_samples_base,
             )
         num_samples = num_samples_base
+        base_num_steps = base_gen_tokens.shape[1]
         log.info("Base npz loaded: %d sample(s), %d generated tokens each",
-                 num_samples, base_gen_tokens.shape[1])
+                 num_samples, base_num_steps)
+
+        # gen_len must not exceed what the base run actually generated.
+        if gen_len > base_num_steps:
+            raise ParityValidationError(
+                f"gen_len={gen_len} (from data.max_tokens*ratio split or parity.gen_len) "
+                f"exceeds base npz's recorded {base_num_steps} steps. "
+                f"Re-run parity_base with matching tokens/ratio."
+            )
 
         # 3. Validate identicality
         from utils.config import validate_parity_pair
@@ -185,7 +195,7 @@ class OursParityRunner:
 
             try:
                 with torch.no_grad():
-                    for step in range(p.gen_len):
+                    for step in range(gen_len):
                         if step == 0:
                             inp = tokens.clone()
                         else:
@@ -252,7 +262,7 @@ class OursParityRunner:
                         all_topk.append(np.stack(step_tk, 0))
                         all_ws.append(np.stack(step_ws, 0))
                         if (step+1) % 100 == 0:
-                            log.info("  Step %d/%d", step+1, p.gen_len)
+                            log.info("  Step %d/%d", step+1, gen_len)
             finally:
                 hooks.remove()
 
@@ -267,6 +277,12 @@ class OursParityRunner:
             samples_topk.append(np.stack(ptk, 0))
             samples_ws.append(np.stack(pws, 0))
             samples_evict.append(np.array(all_evict, dtype=bool))
+
+            # Memory hygiene: free per-sample cache, hooks, and tensors before next sample.
+            del cache, cache_config, acc_scores, all_topk, all_ws, all_evict, tokens
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc as _gc; _gc.collect()
 
         # Align K, W, H_q across samples (could differ if eviction trajectories diverged)
         max_K = max(x.shape[-1] for x in samples_topk)
@@ -291,7 +307,7 @@ class OursParityRunner:
         elapsed = time.time() - t0
         log.info("Done: %d samples, %.1fs", num_samples, elapsed)
 
-        St = prefill_len + p.gen_len - ns
+        St = prefill_len + gen_len - ns
         if isinstance(w.local_window_size, float):
             lr = math.ceil(w.local_window_size * St)
             r2 = lr % ws_sz
@@ -313,7 +329,8 @@ class OursParityRunner:
             "tokenizer_sha": tok_sha,
             "prefill_len": prefill_len,
             "max_tokens": max_tokens,
-            "gen_len": p.gen_len,
+            "gen_len": gen_len,
+            "ratio": ratio,
             "window_size": w.window_size,
             "num_sink_tokens": ns,
             "local_window_size_resolved": lr,
