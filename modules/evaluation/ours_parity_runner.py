@@ -268,6 +268,12 @@ class OursParityRunner:
             samples_ws.append(np.stack(pws, 0))
             samples_evict.append(np.array(all_evict, dtype=bool))
 
+            # Memory hygiene: free per-sample cache, hooks, and tensors before next sample.
+            del cache, cache_config, acc_scores, all_topk, all_ws, all_evict, tokens
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc as _gc; _gc.collect()
+
         # Align K, W, H_q across samples (could differ if eviction trajectories diverged)
         max_K = max(x.shape[-1] for x in samples_topk)
         max_W = max(x.shape[-1] for x in samples_ws)

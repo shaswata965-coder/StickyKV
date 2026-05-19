@@ -155,6 +155,12 @@ class BaseParityRunner:
             samples_ws.append(np.stack(pws, 0))
             samples_gen_toks.append(np.array(gen_toks, dtype=np.int64))
 
+            # Memory hygiene: free per-sample tensors before the next sample.
+            del acc_scores, all_topk, all_ws, gen_toks, pkv, input_ids, tokens
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc as _gc; _gc.collect()
+
         # Align K and W across samples (could differ from sample to sample)
         max_K = max(x.shape[-1] for x in samples_topk)
         max_W = max(x.shape[-1] for x in samples_ws)
