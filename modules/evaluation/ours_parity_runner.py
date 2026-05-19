@@ -153,7 +153,8 @@ class OursParityRunner:
                 if hasattr(mod, "rotary_emb"):
                     rope = mod.rotary_emb; break
 
-        ns, ws_sz, ow, tk = w.num_sink_tokens, w.window_size, w.obs_window, w.top_k_windows
+        # H2O-style cumulative scoring: no observation window — every query row contributes.
+        ns, ws_sz, tk = w.num_sink_tokens, w.window_size, w.top_k_windows
         budget = cfg.cache.cache_budget or 0.5
 
         # Per-sample storage
@@ -177,8 +178,7 @@ class OursParityRunner:
             # Fresh cache + hooks per sample (cache state must reset).
             cache_config = WCC(
                 window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
-                local_window_size=w.local_window_size, cache_budget=budget,
-                obs_window=w.obs_window)
+                local_window_size=w.local_window_size, cache_budget=budget)
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -210,7 +210,8 @@ class OursParityRunner:
                         if getattr(out, "attentions", None):
                             for li in range(n_layers):
                                 a = out.attentions[li]
-                                ts = a[..., -ow:, :].sum(dim=-2)
+                                # Sum over ALL query rows (cumulative across steps via acc_scores).
+                                ts = a.sum(dim=-2)
                                 if acc_scores[li] is None:
                                     acc_scores[li] = ts.clone()
                                 else:
@@ -334,7 +335,6 @@ class OursParityRunner:
             "window_size": w.window_size,
             "num_sink_tokens": ns,
             "local_window_size_resolved": lr,
-            "obs_window": ow,
             "top_k_windows": tk,
             "model_name": cfg.model.name,
             "model_revision": cfg.model.revision,

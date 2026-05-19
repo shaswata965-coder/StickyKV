@@ -9,8 +9,13 @@ cannot be read from the real forward pass.  Instead, we:
 3. Score those weights via :func:`scorer.compute_window_scores` and push the
    result into ``cache.cache_kwargs[layer_idx]["window_scores"]``.
 
-Cost: ``O(obs_window × N)`` per layer per scoring step — dominated by the
-``O(N²)`` real attention work and not a bottleneck.
+Scoring policy: H2O-style cumulative.  Every query row in the current
+forward pass contributes to the per-key score; the cache's ``update()``
+then accumulates those per-step scores into ``state.window_scores``
+across steps.  There is no observation window.
+
+Cost: ``O(T × N)`` per layer per scoring step — where T is the current
+forward pass's query length (prefill_len at step 0, 1 thereafter).
 """
 
 from __future__ import annotations
@@ -50,78 +55,6 @@ def _get_attn_classes() -> Tuple:
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
     return tuple(classes)
-
-
-# ---------------------------------------------------------------------------
-# Query ring buffer (pre-allocated)
-# ---------------------------------------------------------------------------
-
-
-class _QRingBuffer:
-    """Pre-allocated ring buffer for recent post-RoPE query vectors.
-
-    Shape: ``[B, H_q, obs_window, head_dim]``.
-    ``data_ptr()`` is stable across generation steps — never reallocated.
-    """
-
-    def __init__(
-        self,
-        B: int,
-        H_q: int,
-        obs_window: int,
-        head_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        self.buffer = torch.zeros(
-            B, H_q, obs_window, head_dim, device=device, dtype=dtype
-        )
-        self.obs_window = obs_window
-        self.write_pos = 0
-        self.count = 0
-
-    def write(self, q: Tensor) -> None:
-        """Write query vector(s) into the ring buffer.
-
-        Parameters
-        ----------
-        q : Tensor
-            Shape ``[B, H_q, T, head_dim]``.  During generation ``T=1``.
-            During prefill, bulk-writes last ``min(T, obs_window)`` rows.
-        """
-        T = q.shape[2]
-        if T >= self.obs_window:
-            # Prefill: take last obs_window rows
-            self.buffer.copy_(q[:, :, -self.obs_window:, :])
-            self.write_pos = 0
-            self.count = self.obs_window
-        else:
-            # Generation (T=1 typically) or short sequences
-            for t in range(T):
-                idx = (self.write_pos + t) % self.obs_window
-                self.buffer[:, :, idx, :] = q[:, :, t, :]
-            self.write_pos = (self.write_pos + T) % self.obs_window
-            self.count = min(self.count + T, self.obs_window)
-
-    def read(self) -> Tensor:
-        """Return the buffered queries in chronological order.
-
-        Returns ``[B, H_q, count, head_dim]``.
-        """
-        if self.count < self.obs_window:
-            return self.buffer[:, :, :self.count, :]
-        # Ring is full — reorder to chronological
-        return torch.cat(
-            [
-                self.buffer[:, :, self.write_pos:, :],
-                self.buffer[:, :, :self.write_pos, :],
-            ],
-            dim=2,
-        )
-
-    @property
-    def data_ptr(self) -> int:
-        return self.buffer.data_ptr()
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +106,9 @@ def install_score_hooks(
     For each ``LlamaAttention`` / ``Qwen2Attention`` module:
     1. Replace ``module.forward`` with a wrapper that captures post-RoPE
        ``query_states`` and ``key_states``.
-    2. Register a post-forward hook that runs the auxiliary SDPA score pass.
+    2. Register a post-forward hook that runs the auxiliary SDPA score pass
+       across **all** query rows of the current step (H2O-style cumulative
+       scoring — no observation-window truncation).
 
     Parameters
     ----------
@@ -182,7 +117,7 @@ def install_score_hooks(
     cache : WindowedCache
         The cache instance — scores are written to ``cache.cache_kwargs``.
     config : WindowedCacheConfig or ResolvedConfig
-        Configuration (``obs_window``, ``window_size``, ``num_sink_tokens``).
+        Configuration (``window_size``, ``num_sink_tokens``).
 
     Returns
     -------
@@ -199,9 +134,6 @@ def install_score_hooks(
         )
         return handles
 
-    obs_window = getattr(config, "obs_window", None) or getattr(
-        config, "window_size", 32
-    )
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
 
@@ -216,13 +148,8 @@ def install_score_hooks(
         head_dim = getattr(model_config, "hidden_size", 4096) // num_q_heads
     num_groups = num_q_heads // num_kv_heads
 
-    # Per-layer q buffers (lazily initialized on first forward)
-    q_buffers: Dict[int, _QRingBuffer] = {}
-    layer_counter = [0]  # mutable counter for layer_idx detection
-
-    layer_idx_map: Dict[int, int] = {}  # id(module) → layer_idx
-
     # Discover attention modules and assign layer indices
+    layer_idx_map: Dict[int, int] = {}
     layer_idx = 0
     for name, module in model.named_modules():
         if isinstance(module, attn_classes):
@@ -240,7 +167,6 @@ def install_score_hooks(
         original_forward = module.forward
         module._original_forward = original_forward
 
-        # Create monkey-patched forward that captures post-RoPE q/k
         def make_patched_forward(mod, orig_fwd):
             def patched_forward(*args, **kwargs):
                 result = orig_fwd(*args, **kwargs)
@@ -253,33 +179,12 @@ def install_score_hooks(
         # Post-forward hook for scoring
         def make_hook(mod, lidx):
             def score_hook(module, input, output):
-                # Try to get captured q/k from module attributes
-                # In the monkey-patch approach, the attention forward
-                # internally computes q/k after RoPE. We capture them
-                # via the module's internal state.
+                # Captured post-RoPE q/k from the patched forward
                 q_rope = getattr(module, "_captured_q", None)
                 k_rope = getattr(module, "_captured_k", None)
 
                 if q_rope is None or k_rope is None:
-                    # Fallback: try to extract from hidden_states
-                    # and compute q/k manually
                     return
-
-                B = q_rope.shape[0]
-
-                # Initialize q_buffer lazily
-                if lidx not in q_buffers:
-                    q_buffers[lidx] = _QRingBuffer(
-                        B, num_q_heads, obs_window, head_dim,
-                        q_rope.device, q_rope.dtype,
-                    )
-
-                q_buf = q_buffers[lidx]
-                q_buf.write(q_rope)
-
-                # Read observation queries
-                q_obs = q_buf.read()  # [B, H_q, T_obs, D]
-                T_obs = q_obs.shape[2]
 
                 # Get current keys from cache state
                 cache_state = cache._states[lidx]
@@ -287,29 +192,28 @@ def install_score_hooks(
                 if k_current is None:
                     return
 
-                S = k_current.shape[2]
-
                 # GQA broadcast: repeat_kv for key
                 if repeat_kv is not None and num_groups > 1:
                     k_expanded = repeat_kv(k_current, num_groups)
                 else:
                     k_expanded = k_current  # [B, H_q, S, D]
 
-                # Auxiliary SDPA (standard PyTorch, NOT flash-attn)
-                # [B, H_q, T_obs, D] @ [B, H_q, D, S] → [B, H_q, T_obs, S]
+                # Auxiliary SDPA over ALL captured query rows (H2O cumulative)
+                # q_rope: [B, H_q, T, D]  →  scores: [B, H_q, T, S]
                 scale = 1.0 / math.sqrt(head_dim)
                 attn_weights = torch.matmul(
-                    q_obs, k_expanded.transpose(-2, -1)
+                    q_rope, k_expanded.transpose(-2, -1)
                 ) * scale
 
                 # Full softmax — no premask
                 attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
-                attn_weights = attn_weights.to(q_obs.dtype)
+                attn_weights = attn_weights.to(q_rope.dtype)
 
-                # Compute window scores
+                # compute_window_scores sums over query rows internally
+                # (every row contributes — no T_obs truncation).
                 scores = compute_window_scores(attn_weights, num_sink, window_size)
 
-                # Push into cache_kwargs
+                # Push into cache_kwargs; cache.update() accumulates across steps.
                 cache.cache_kwargs[lidx]["window_scores"] = scores
 
             return score_hook

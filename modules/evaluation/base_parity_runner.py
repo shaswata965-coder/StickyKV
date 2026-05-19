@@ -71,7 +71,8 @@ class BaseParityRunner:
             attn_implementation="eager", device_map="auto")
         model.eval()
         n_layers = model.config.num_hidden_layers
-        ns, ws_sz, ow, tk = w.num_sink_tokens, w.window_size, w.obs_window, w.top_k_windows
+        # H2O-style cumulative scoring: no observation window — every query row contributes.
+        ns, ws_sz, tk = w.num_sink_tokens, w.window_size, w.top_k_windows
 
         # Per-sample storage
         samples_topk: List[np.ndarray] = []     # each: [num_steps, num_layers, K]
@@ -108,7 +109,8 @@ class BaseParityRunner:
                     gen_toks.append(next_tok.item())
                     for li in range(n_layers):
                         a = out.attentions[li]
-                        ts = a[..., -ow:, :].sum(dim=-2)
+                        # Sum over ALL query rows of this step (cumulative across steps via acc_scores).
+                        ts = a.sum(dim=-2)
                         if acc_scores[li] is None:
                             acc_scores[li] = ts.clone()
                         else:
@@ -218,7 +220,6 @@ class BaseParityRunner:
             "window_size": w.window_size,
             "num_sink_tokens": ns,
             "local_window_size_resolved": lr,
-            "obs_window": ow,
             "top_k_windows": tk,
             "model_name": cfg.model.name,
             "model_revision": cfg.model.revision,

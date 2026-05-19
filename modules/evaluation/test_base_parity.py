@@ -44,7 +44,7 @@ class TestBaseParityRunner:
             "article_sha": "abc123", "tokenizer_sha": "def456",
             "prefill_len": 100, "gen_len": 10,
             "window_size": 8, "num_sink_tokens": 4,
-            "local_window_size_resolved": 32, "obs_window": 8,
+            "local_window_size_resolved": 32,
             "top_k_windows": 2, "model_name": "test",
             "model_revision": "main", "dtype": "float16",
             "attn_implementation": "eager",
@@ -86,6 +86,6 @@ class TestBaseParityRunner:
                             article_index=0, min_article_tokens=100,
                             prefill_len=100, gen_len=10, decoding="greedy"),
             window=MagicMock(window_size=8, num_sink_tokens=4,
-                            local_window_size=32, obs_window=8, top_k_windows=2),
+                            local_window_size=32, top_k_windows=2),
             telemetry=MagicMock(track_scores=True, output_dir=str(tmp_path)),
         )

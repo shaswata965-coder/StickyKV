@@ -37,7 +37,6 @@ window:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 256
-  obs_window: 32
   top_k_windows: 5
 
 telemetry:

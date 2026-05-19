@@ -8,13 +8,18 @@ reads it directly — no monkey-patch, no captured q/k, no auxiliary pass.
 Runner contract: the runner **must** pass ``output_attentions=True`` to
 ``model.generate(...)`` / ``model.forward(...)``.  Without it, HF returns
 ``None`` for attn_weights and the hook warns once and skips.
+
+Scoring policy: H2O-style cumulative.  Every query row in the current
+forward pass contributes to the per-key score; the cache's ``update()``
+accumulates the per-step scores into ``state.window_scores`` across
+steps.  There is no observation window.
 """
 
 from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,112 +46,6 @@ def _get_attn_classes() -> Tuple:
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
     return tuple(classes)
-
-
-# ---------------------------------------------------------------------------
-# Attention-row ring buffer (pre-allocated, with post-eviction reallocation)
-# ---------------------------------------------------------------------------
-
-
-class _AttnRingBuffer:
-    """Pre-allocated ring buffer for recent attention rows.
-
-    Shape: ``[B, H_q, obs_window, current_cache_len]``.
-
-    Unlike the flash backend's q-buffer, the last dim scales with cache length
-    and must be reallocated after eviction.
-
-    Memory at max_cache_len=7500, H_q=32, obs_window=32, fp16:
-    ``1 × 32 × 32 × 7500 × 2 ≈ 15 MB`` per layer.
-    """
-
-    def __init__(
-        self,
-        B: int,
-        H_q: int,
-        obs_window: int,
-        cache_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        self.B = B
-        self.H_q = H_q
-        self.obs_window = obs_window
-        self.device = device
-        self.dtype = dtype
-        self.buffer = torch.zeros(
-            B, H_q, obs_window, cache_len, device=device, dtype=dtype
-        )
-        self.write_pos = 0
-        self.count = 0
-
-    def write(self, attn_row: Tensor) -> None:
-        """Write attention row(s) into the ring buffer.
-
-        Parameters
-        ----------
-        attn_row : Tensor
-            Shape ``[B, H_q, T, S]``.
-            During generation ``T=1``; during prefill ``T=N``.
-        """
-        T = attn_row.shape[2]
-        S = attn_row.shape[3]
-        buf_S = self.buffer.shape[3]
-
-        # Handle cache length growth: pad buffer if needed
-        if S > buf_S:
-            new_buf = torch.zeros(
-                self.B, self.H_q, self.obs_window, S,
-                device=self.device, dtype=self.dtype,
-            )
-            new_buf[:, :, :, :buf_S] = self.buffer
-            self.buffer = new_buf
-
-        if T >= self.obs_window:
-            # Prefill: take last obs_window rows
-            self.buffer[:, :, :, :S] = attn_row[:, :, -self.obs_window:, :]
-            self.write_pos = 0
-            self.count = self.obs_window
-        else:
-            # Generation: write T rows at ring positions
-            for t in range(T):
-                idx = (self.write_pos + t) % self.obs_window
-                self.buffer[:, :, idx, :S] = attn_row[:, :, t, :S]
-            self.write_pos = (self.write_pos + T) % self.obs_window
-            self.count = min(self.count + T, self.obs_window)
-
-    def read(self) -> Tensor:
-        """Return buffered attention rows in chronological order.
-
-        Returns ``[B, H_q, count, S]``.
-        """
-        if self.count < self.obs_window:
-            return self.buffer[:, :, :self.count, :]
-        # Ring is full — reorder to chronological
-        return torch.cat(
-            [
-                self.buffer[:, :, self.write_pos:, :],
-                self.buffer[:, :, :self.write_pos, :],
-            ],
-            dim=2,
-        )
-
-    def _reallocate(self, new_cache_len: int) -> None:
-        """Reallocate buffer for a new cache length (after eviction).
-
-        Old contents are discarded — column indices no longer reference the
-        same physical tokens after compaction.
-        """
-        self.buffer = torch.zeros(
-            self.B, self.H_q, self.obs_window, new_cache_len,
-            device=self.device, dtype=self.dtype,
-        )
-        self.write_pos = 0
-        self.count = 0
-
-    @property
-    def data_ptr(self) -> int:
-        return self.buffer.data_ptr()
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +84,10 @@ def install_score_hooks(
 
     For each ``LlamaAttention`` / ``Qwen2Attention`` module, registers a
     ``forward_hook`` that reads ``attn_weights`` from the module output tuple
-    (requires ``output_attentions=True``).
+    (requires ``output_attentions=True``) and reduces it to per-window scores.
+
+    Scoring uses every query row in the current forward pass (H2O-style
+    cumulative); the cache accumulates the per-step scores across steps.
 
     Parameters
     ----------
@@ -211,17 +113,9 @@ def install_score_hooks(
         )
         return handles
 
-    obs_window = getattr(config, "obs_window", None) or getattr(
-        config, "window_size", 32
-    )
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
 
-    model_config = model.config
-    num_q_heads = getattr(model_config, "num_attention_heads", 32)
-
-    # Per-layer attn buffers and state
-    attn_buffers: Dict[int, _AttnRingBuffer] = {}
     warned_once = [False]
 
     # Discover attention modules
@@ -231,9 +125,6 @@ def install_score_hooks(
         if isinstance(module, attn_classes):
             layer_idx_map[id(module)] = layer_idx
             layer_idx += 1
-
-    # Track cache lengths for reallocation detection
-    prev_cache_lens: Dict[int, int] = {}
 
     for name, module in model.named_modules():
         if not isinstance(module, attn_classes):
@@ -272,43 +163,11 @@ def install_score_hooks(
                     return
 
                 # attn_weights: [B, H_q, T, S]
-                B = attn_weights.shape[0]
-                H_q = attn_weights.shape[1]
-                T = attn_weights.shape[2]
-                S = attn_weights.shape[3]
+                # compute_window_scores sums across the T axis internally;
+                # every query row contributes (H2O cumulative, no obs_window).
+                scores = compute_window_scores(attn_weights, num_sink, window_size)
 
-                # Initialize or reallocate buffer
-                if lidx not in attn_buffers:
-                    attn_buffers[lidx] = _AttnRingBuffer(
-                        B, H_q, obs_window, S,
-                        attn_weights.device, attn_weights.dtype,
-                    )
-                    prev_cache_lens[lidx] = S
-                else:
-                    # Check for cache length change (post-eviction reallocation)
-                    if S != prev_cache_lens.get(lidx, S):
-                        attn_buffers[lidx]._reallocate(S)
-                        prev_cache_lens[lidx] = S
-
-                buf = attn_buffers[lidx]
-
-                # Write attention rows
-                if T > 1:
-                    # Prefill: bulk-write last min(T, obs_window) rows
-                    rows_to_write = attn_weights[:, :, -min(T, obs_window):, :]
-                    buf.write(rows_to_write)
-                else:
-                    # Generation: single row
-                    buf.write(attn_weights)
-
-                # Update prev cache len
-                prev_cache_lens[lidx] = S
-
-                # Read observation window and compute scores
-                obs = buf.read()  # [B, H_q, T_obs, S]
-                scores = compute_window_scores(obs, num_sink, window_size)
-
-                # Push into cache_kwargs
+                # Push into cache_kwargs; cache.update() accumulates across steps.
                 cache.cache_kwargs[lidx]["window_scores"] = scores
 
             return score_hook

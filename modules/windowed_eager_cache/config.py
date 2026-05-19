@@ -34,7 +34,6 @@ class ResolvedConfig:
     bytes_per_token: int
     total_budget_bytes: int
     total_budget_tokens: int
-    obs_window: int
 
 
 # ---------------------------------------------------------------------------
@@ -59,17 +58,19 @@ class WindowedCacheConfig:
     cache_budget : float
         Fraction of full-cache memory to retain, in (0, 1].
         Must be ``float`` — ``int`` and ``bool`` are rejected with clear errors.
-    obs_window : int | None
-        Observation window size for scoring.  Defaults to *window_size*.
     track_scores : bool
         Enable telemetry recording.  Default ``False``.
+
+    Notes
+    -----
+    Scoring is H2O-style cumulative: every query row contributes to the
+    per-key score at every step.  There is no observation window.
     """
 
     window_size: int
     num_sink_tokens: int
     local_window_size: Union[int, float]
     cache_budget: float
-    obs_window: Optional[int] = None
     track_scores: bool = False
 
     def __post_init__(self) -> None:
@@ -137,19 +138,6 @@ class WindowedCacheConfig:
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
             )
-
-        # -- obs_window --
-        if self.obs_window is None:
-            object.__setattr__(self, "obs_window", self.window_size)
-        else:
-            if (
-                not isinstance(self.obs_window, int)
-                or isinstance(self.obs_window, bool)
-                or self.obs_window <= 0
-            ):
-                raise ValueError(
-                    f"obs_window must be a positive int or None, got {self.obs_window!r}"
-                )
 
     # -----------------------------------------------------------------
     # resolve() — pure function, no mutation
@@ -234,5 +222,4 @@ class WindowedCacheConfig:
             bytes_per_token=bytes_per_token,
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
-            obs_window=self.obs_window,  # type: ignore[arg-type]
         )

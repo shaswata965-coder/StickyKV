@@ -21,7 +21,6 @@ cache:
   window_size: 8
   num_sink_tokens: 4
   local_window_size: 0.25              # int (multiple of window_size) or float ratio in (0,1]
-  obs_window: 32                       # observation window for score extraction (flash backend)
   top_k_windows: 2                     # number of evictable windows to retain
 
 data:

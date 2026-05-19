@@ -120,7 +120,7 @@ class PerfRunner:
             w = cfg.window
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
-                      cache_budget=budget or 0.5, obs_window=w.obs_window)
+                      cache_budget=budget or 0.5)
             rope = None
             for nm, mod in model.named_modules():
                 if hasattr(mod, "rotary_emb"):

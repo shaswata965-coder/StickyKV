@@ -21,7 +21,7 @@ from modules.windowed_cache.policy import EvictionPolicy
 from modules.windowed_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_cache.state import CacheState
 from modules.windowed_cache.telemetry import NullTelemetry, Telemetry
-from modules.windowed_cache.hooks import HookHandles, _QRingBuffer
+from modules.windowed_cache.hooks import HookHandles
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,6 @@ def _make_config(**overrides):
         num_sink_tokens=4,
         local_window_size=16,
         cache_budget=0.40,
-        obs_window=8,
         track_scores=False,
     )
     defaults.update(overrides)
@@ -61,7 +60,6 @@ def _make_resolved(**overrides):
         bytes_per_token=4096,
         total_budget_bytes=163840,
         total_budget_tokens=40,
-        obs_window=8,
     )
     defaults.update(overrides)
     return ResolvedConfig(**defaults)
@@ -556,19 +554,6 @@ class TestHooks:
                             f"{mod.__name__}"
                         )
 
-    # -------------------------------------------------------------------
-    # 25. test_q_buffer_preallocation
-    # -------------------------------------------------------------------
-
-    def test_q_buffer_preallocation(self):
-        """q-buffer data_ptr() is stable across 10 generation steps."""
-        buf = _QRingBuffer(
-            B=1, H_q=32, obs_window=8, head_dim=128,
-            device=torch.device("cpu"), dtype=torch.float16,
-        )
-        initial_ptr = buf.data_ptr
-
-        for step in range(10):
-            q = torch.randn(1, 32, 1, 128, dtype=torch.float16)
-            buf.write(q)
-            assert buf.data_ptr == initial_ptr, f"Reallocation at step {step}"
+    # 25. test_q_buffer_preallocation removed:
+    # _QRingBuffer was deleted along with the obs_window scoring path.
+    # H2O-style cumulative scoring needs no per-layer query buffer.
