@@ -1,0 +1,35 @@
+# ============================================================================
+# StickyKV — Base Configuration (shared defaults)
+# ============================================================================
+# All experiment configs should inherit from this via _base_: base.yaml
+# and override only the fields that differ.
+
+run:
+  mode: parity_base                     # parity_base | parity_ours | faithfulness | perf | longbench | longbench_score | visualize
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B
+  revision: null                        # pin a specific HF revision for reproducibility
+  dtype: float16
+  attn_implementation: eager            # eager | flash_attention_2
+
+cache:
+  backend: dynamic                      # dynamic (baseline, DynamicCache) | windowed (ours)
+  backend_package: null                 # flash_attn | eager | null (null for baseline)
+  cache_budget: null                    # float ratio in (0,1]; null for baseline (full cache)
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25              # int (multiple of window_size) or float ratio in (0,1]
+  obs_window: 32                       # observation window for score extraction (flash backend)
+  top_k_windows: 2                     # number of evictable windows to retain
+
+data:
+  dataset: wikitext-103                # wikitext-103 | pg19
+  article_id: 0
+  prefill_len: 100
+  gen_len: 50
+
+telemetry:
+  track_scores: false                  # true only for research/parity runs; false for perf/longbench
+  output_dir: outputs

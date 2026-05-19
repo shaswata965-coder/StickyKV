@@ -1,0 +1,62 @@
+# StickyKV Environment
+# ====================
+# Flash-attn-2 is listed as OPTIONAL so eager-only installs (e.g. Kaggle T4)
+# succeed without it.
+#
+# Install:
+#   conda env create -f environment.yml
+#   conda activate stickykv
+#
+# For flash-attn support (A100/H100 only):
+#   pip install flash-attn --no-build-isolation
+
+name: stickykv
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ---------- Core ----------
+  - python=3.10
+  - pip
+
+  # ---------- PyTorch ----------
+  - pytorch=2.2.*
+  - pytorch-cuda=12.1
+
+  # ---------- Scientific ----------
+  - numpy>=1.24,<2.0
+  - scipy>=1.10
+
+  # ---------- Data / Config ----------
+  - pyyaml>=6.0
+  - datasets>=2.16
+
+  # ---------- Visualization ----------
+  - matplotlib>=3.7
+  - seaborn>=0.13
+
+  # ---------- Testing ----------
+  - pytest>=7.4
+  - pytest-cov
+
+  # ---------- Misc ----------
+  - tqdm
+  - einops>=0.7
+
+  # ---------- pip-only packages ----------
+  - pip:
+    - transformers>=4.36,<4.46
+    - accelerate>=0.25
+    - sentencepiece
+    - protobuf
+
+    # ---- Optional: W&B telemetry ----
+    # - wandb>=0.16
+
+    # ---- Optional: flash-attn-2 (requires CUDA 12.x, Ampere+) ----
+    # Uncomment below OR install manually after env creation:
+    #   pip install flash-attn --no-build-isolation
+    # - flash-attn>=2.5

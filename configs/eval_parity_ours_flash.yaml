@@ -1,0 +1,51 @@
+# ============================================================================
+# StickyKV — Parity Ours (Flash-Attn Backend) — Ampere+ required
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: parity_ours
+  seed: 42
+
+base_run_npz: outputs/parity_base_wikitext-103.npz
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST pair with cache.backend_package: flash_attn
+
+cache:
+  backend: windowed
+  backend_package: flash_attn              # imports modules.windowed_cache
+  cache_budget: 0.25
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+  obs_window: 32
+  top_k_windows: 5
+
+data:
+  dataset: wikitext-103
+  article_id: 0
+  prefill_len: 2048
+  gen_len: 1024
+
+parity:
+  dataset: wikitext-103
+  num_articles: 50
+  article_index: 0
+  min_article_tokens: 4096
+  prefill_len: 2048
+  gen_len: 1024
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+  obs_window: 32
+  top_k_windows: 5
+
+telemetry:
+  track_scores: true
+  output_dir: outputs

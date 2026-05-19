@@ -1,0 +1,19 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+
+# Build / virtualenv
+*.egg-info/
+.venv/
+venv/
+
+# Run outputs
+outputs/
+
+# Harness state (worktrees, agent metadata)
+.claude/

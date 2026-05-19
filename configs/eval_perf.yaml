@@ -1,0 +1,86 @@
+# ============================================================================
+# StickyKV — Performance Benchmarks (Suite C)
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+  obs_window: 32
+  top_k_windows: 5
+
+perf:
+  configs:
+    # --- eager backend (always available; Kaggle-safe) ---
+    - name: baseline_eager
+      cache_backend: dynamic
+      attn_implementation: eager
+    - name: baseline_eager_with_hook
+      cache_backend: dynamic
+      attn_implementation: eager
+      install_hooks_for_measurement: true
+    - name: windowed_eager_50pct
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.50
+    - name: windowed_eager_25pct
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.25
+    - name: windowed_eager_10pct
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.10
+    # --- flash_attn backend (Ampere+ with flash-attn-2) ---
+    - name: baseline_flash_attn
+      cache_backend: dynamic
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+    - name: baseline_flash_attn_with_hook
+      cache_backend: dynamic
+      attn_implementation: flash_attention_2
+      install_hooks_for_measurement: true
+      requires_flash_attn: true
+    - name: windowed_flash_50pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      requires_flash_attn: true
+    - name: windowed_flash_25pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.25
+      requires_flash_attn: true
+    - name: windowed_flash_10pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      requires_flash_attn: true
+
+  prefill_lengths: [2048, 4096]
+  gen_len: 256
+  num_warmup_runs: 2
+  num_measurement_runs: 5
+  allow_shared_gpu: true
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+  enable_clock_locking: false
+
+telemetry:
+  output_dir: outputs
