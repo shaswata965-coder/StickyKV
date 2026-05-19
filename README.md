@@ -1,4 +1,4 @@
-# StickyKV — Windowed KV-Cache with H2O-Style Eviction
+# StickyKV — Windowed KV-Cache
 
 A modular, reproducible evaluation framework for windowed KV-cache eviction in large language models. Supports two attention backends (flash-attn-2 and eager) across multiple hardware targets.
 
