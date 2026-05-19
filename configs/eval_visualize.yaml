@@ -1,0 +1,19 @@
+# ============================================================================
+# StickyKV — Visualization Configuration
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: visualize
+
+visualize:
+  npz_paths:
+    - outputs/parity_base_wikitext-103.npz
+    - outputs/parity_ours_eager_wikitext-103.npz
+  parity_base_npz: outputs/parity_base_wikitext-103.npz
+  parity_ours_npz: outputs/parity_ours_eager_wikitext-103.npz
+  faithfulness_npz: outputs/faithfulness_results.npz
+  perf_npz_dir: outputs
+  output_dir: outputs/figures
+  save_pdf: false
+  dpi: 300

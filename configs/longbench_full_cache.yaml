@@ -1,0 +1,51 @@
+# ============================================================================
+# LongBench — Full Cache Baseline
+# ============================================================================
+# Runs all 16 English datasets with full DynamicCache (no eviction).
+# Produces: outputs/longbench/full_cache/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                      # transformers.DynamicCache, no eviction
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false                   # mandatory; see prompt 04 §1
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false                 # _e length-stratified variants off by default
+  max_length: 7500                      # per-dataset overrides come from dataset2maxlen.json
+  output_dir: outputs/longbench/full_cache
+  seed: 42
+  resume: false
+  skip_oom: true                        # record OOM'd examples as pred=null
+  aggressive_cache_clear: false

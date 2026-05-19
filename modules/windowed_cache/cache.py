@@ -1,0 +1,220 @@
+"""WindowedCache — HuggingFace Cache integration for windowed KV cache.
+
+Orchestration only.  No scoring math, no Top-K math, no attention computation,
+no RoPE math — only calls into :mod:`state` and :mod:`policy`.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from torch import Tensor
+
+try:
+    from transformers import Cache as _HFCacheBase
+except ImportError:
+    _HFCacheBase = object  # type: ignore[assignment,misc]
+
+from .config import ResolvedConfig, WindowedCacheConfig
+from .policy import EvictionPolicy
+from .scorer import accumulate
+from .state import CacheState
+from .telemetry import NullTelemetry, Telemetry
+
+
+class WindowedCache(_HFCacheBase):
+    """Windowed KV cache with H2O-style cumulative eviction.
+
+    Parameters
+    ----------
+    config : WindowedCacheConfig
+        User-facing configuration.
+    prefill_len : int
+        Number of tokens in the prompt (used for budget resolution).
+    model_config
+        HuggingFace ``PretrainedConfig`` or compatible.
+    kv_dtype : torch.dtype
+        Data type of the KV cache tensors.
+    rope_module : nn.Module
+        The model's rotary embedding module for key rerotation.
+    num_layers : int
+        Number of transformer layers.
+    telemetry : Telemetry, optional
+        Telemetry recorder.  Defaults to :class:`NullTelemetry`.
+    """
+
+    def __init__(
+        self,
+        config: WindowedCacheConfig,
+        prefill_len: int,
+        model_config: Any,
+        kv_dtype: torch.dtype,
+        rope_module: torch.nn.Module,
+        num_layers: int,
+        telemetry: Optional[Telemetry] = None,
+    ) -> None:
+        if isinstance(_HFCacheBase, type) and _HFCacheBase is not object:
+            super().__init__()
+
+        self.config = config
+        self.resolved = config.resolve(prefill_len, model_config, kv_dtype)
+        self.rope_module = rope_module
+        self.num_layers = num_layers
+        self.telemetry = telemetry if telemetry is not None else NullTelemetry()
+
+        # Per-layer state and policy
+        self._states: List[CacheState] = [CacheState() for _ in range(num_layers)]
+        self._policies: List[EvictionPolicy] = [
+            EvictionPolicy(self.resolved) for _ in range(num_layers)
+        ]
+        self._generation_step: List[int] = [0] * num_layers
+        self._prefill_done: List[bool] = [False] * num_layers
+        self._num_q_heads: Optional[int] = None
+
+        # Shared scratch for cache_kwargs communication with hooks
+        self.cache_kwargs: Dict[int, Dict[str, Any]] = {
+            i: {} for i in range(num_layers)
+        }
+
+    # -----------------------------------------------------------------
+    # HF Cache interface
+    # -----------------------------------------------------------------
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Return current sequence length for *layer_idx*."""
+        return self._states[layer_idx].seq_length
+
+    def get_max_length(self) -> Optional[int]:
+        """Return ``None`` — windowed cache doesn't have a static max."""
+        return None
+
+    def update(
+        self,
+        key_states: Tensor,
+        value_states: Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Append new KV states and optionally evict.
+
+        Steps:
+        1. ``state.append(k, v, pos)``
+        2. Pull pre-computed window scores from *cache_kwargs*.
+        3. Accumulate into ``state.window_scores``.
+        4. If ``policy.should_evict(step)``:
+           a. Two-step retain: window indices → token indices.
+           b. Snapshot old positions before compaction.
+           c. ``state.slice_and_keep``
+           d. ``state.rerotate_keys``
+           e. Gather ``state.window_scores`` by retained window indices.
+        5. Return ``(state.key_states, state.value_states)``.
+        """
+        state = self._states[layer_idx]
+        policy = self._policies[layer_idx]
+
+        # Extract position_ids from cache_kwargs if provided
+        pos = None
+        if cache_kwargs is not None and "cache_position" in cache_kwargs:
+            pos = cache_kwargs["cache_position"]
+
+        # 1. Append
+        state.append(key_states, value_states, pos)
+        n_new = key_states.shape[2]
+        policy.extend_total_after_append(n_new)
+
+        # Detect prefill vs generation
+        is_prefill = not self._prefill_done[layer_idx]
+        if is_prefill:
+            policy.initialize_after_prefill(state.seq_length)
+            self._prefill_done[layer_idx] = True
+
+        # Infer H_q from window_scores shape if available
+        if self._num_q_heads is None:
+            merged_kwargs = cache_kwargs or {}
+            merged_kwargs.update(self.cache_kwargs.get(layer_idx, {}))
+            ws = merged_kwargs.get("window_scores")
+            if ws is not None:
+                self._num_q_heads = ws.shape[1]
+
+        # 2. Pull pre-computed window scores
+        merged_kwargs = {}
+        if cache_kwargs is not None:
+            merged_kwargs.update(cache_kwargs)
+        merged_kwargs.update(self.cache_kwargs.get(layer_idx, {}))
+        new_window_scores = merged_kwargs.get("window_scores")
+
+        # 3. Initialize or accumulate window_scores
+        if new_window_scores is not None:
+            if state.window_scores is None:
+                state.window_scores = new_window_scores.clone()
+            else:
+                # Handle size mismatch: new scores may cover more windows
+                W_old = state.window_scores.shape[-1]
+                W_new = new_window_scores.shape[-1]
+                if W_new > W_old:
+                    pad = torch.zeros(
+                        state.window_scores.shape[0],
+                        state.window_scores.shape[1],
+                        W_new - W_old,
+                        device=state.window_scores.device,
+                        dtype=state.window_scores.dtype,
+                    )
+                    state.window_scores = torch.cat(
+                        [state.window_scores, pad], dim=-1
+                    )
+                accumulate(state.window_scores, new_window_scores)
+
+        # 4. Eviction
+        step = self._generation_step[layer_idx]
+        should_evict = (
+            (is_prefill and state.window_scores is not None)
+            or (not is_prefill and policy.should_evict(step))
+        )
+
+        if should_evict and state.window_scores is not None:
+            B = state.key_states.shape[0]
+            H_q = state.window_scores.shape[1]
+
+            # a. Two-step retain
+            retained_window_idx = policy.compute_retain_window_indices(
+                state.window_scores
+            )
+            retain_token_idx = policy.expand_to_token_indices(retained_window_idx)
+
+            # Telemetry
+            self.telemetry.record_scores(
+                layer_idx, step, state.window_scores, retain_token_idx
+            )
+
+            # b. Snapshot old positions before compaction
+            old_positions = state.position_ids[retain_token_idx[0]].clone()
+
+            # c. Compact K/V
+            state.slice_and_keep(retain_token_idx)
+
+            # d. Rerotate keys
+            state.rerotate_keys(self.rope_module, old_positions)
+
+            # e. Gather window_scores by retained_window_idx
+            idx_w = retained_window_idx.unsqueeze(1).expand(B, H_q, -1)
+            state.window_scores = torch.gather(
+                state.window_scores, dim=-1, index=idx_w
+            ).contiguous()
+
+            # Update policy
+            policy.set_total_after_compaction(state.seq_length)
+
+        # Advance generation step (only after prefill is done)
+        if not is_prefill:
+            self._generation_step[layer_idx] = step + 1
+
+        # 5. Return
+        return state.key_states, state.value_states
+
+    def reorder_cache(self, beam_idx: Tensor) -> None:
+        """Beam search is out of scope (v1)."""
+        raise NotImplementedError(
+            "WindowedCache does not support beam search (reorder_cache). "
+            "Use greedy or sampling decoding."
+        )

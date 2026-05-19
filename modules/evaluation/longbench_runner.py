@@ -1,0 +1,535 @@
+"""LongBench evaluation runner — one runner, both backends, all 16 datasets.
+
+Follows DefensiveKV's exact protocol:
+- LongBench v1 (THUDM/LongBench), 16 English datasets
+- LLaMA-3-8B-Instruct fp16
+- Greedy decoding, middle truncation, per-dataset max gen length
+- Output jsonl schema matches THUDM/LongBench/pred.py exactly
+
+Backend routing via ``utils/cache_factory.py``.
+"""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+from data.longbench_loader import (
+    LONGBENCH_EN_DATASETS,
+    load_longbench_dataset,
+)
+from utils.env_capture import capture_environment
+from utils.hashing import sha256_file
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+class LongBenchRunner:
+    """End-to-end LongBench prediction runner.
+
+    One runner handles all 16 datasets and both cache backends
+    (flash_attn / eager), routed via the factory in ``utils/cache_factory.py``.
+    """
+
+    def __init__(self, config) -> None:
+        self._assert_tracking_off(config)
+        self.config = config
+
+        # Extract longbench-specific config
+        self.lb = getattr(config, "longbench", None)
+        if self.lb is None:
+            raise ValueError(
+                "Config must have a 'longbench' section for LongBench mode."
+            )
+
+        # Determine cache type
+        cache_backend = getattr(config.cache, "backend", "dynamic")
+        cache_package = getattr(config.cache, "backend_package", None)
+
+        if cache_backend == "windowed" and cache_package:
+            from utils.cache_factory import (
+                get_cache_classes,
+                validate_backend_attn_pairing,
+            )
+
+            validate_backend_attn_pairing(
+                cache_package, config.model.attn_implementation
+            )
+            (
+                self.WindowedCache,
+                self.WindowedCacheConfig,
+                self.install_score_hooks,
+            ) = get_cache_classes(cache_package)
+            self.cache_backend_package = cache_package
+            self.is_windowed = True
+        else:
+            self.WindowedCache = None
+            self.WindowedCacheConfig = None
+            self.install_score_hooks = None
+            self.cache_backend_package = None
+            self.is_windowed = False
+
+        # Load vendored configs (DO NOT reimplement)
+        configs_dir = Path("data/longbench_configs")
+        with open(configs_dir / "dataset2prompt.json", "r", encoding="utf-8") as f:
+            self.dataset2prompt = json.load(f)
+        with open(configs_dir / "dataset2maxlen.json", "r", encoding="utf-8") as f:
+            self.dataset2maxlen = json.load(f)
+
+        # Compute SHA-256 of vendored files for reproducibility
+        self._vendored_shas = {
+            "longbench_dataset2prompt_sha": sha256_file(
+                configs_dir / "dataset2prompt.json"
+            ),
+            "longbench_dataset2maxlen_sha": sha256_file(
+                configs_dir / "dataset2maxlen.json"
+            ),
+            "longbench_dataset2metric_sha": sha256_file(
+                configs_dir / "dataset2metric.json"
+            ),
+            "longbench_metrics_py_sha": self._compute_metrics_sha(),
+        }
+
+        self.model = None
+        self.tokenizer = None
+
+    @staticmethod
+    def _compute_metrics_sha() -> str:
+        """SHA-256 of the vendored metrics module."""
+        metrics_path = Path("modules/evaluation/longbench_metrics.py")
+        if metrics_path.exists():
+            return sha256_file(metrics_path)
+        return "unknown"
+
+    @staticmethod
+    def _assert_tracking_off(config) -> None:
+        """Guard: track_scores must be False for LongBench runs.
+
+        Telemetry buffers grow linearly with
+        ``num_layers × H_q × num_windows × num_steps``; on long-context tasks
+        (~7.5k tokens prompt, up to 512 tokens generation), that's gigabytes
+        of CPU-resident tensors per example.  Distorts throughput numbers and
+        risks OOM.
+        """
+        track = getattr(getattr(config, "telemetry", None), "track_scores", False)
+        if track:
+            raise ValueError(
+                "track_scores must be False for LongBench runs. "
+                "Telemetry buffers grow linearly with run length and "
+                "would distort throughput numbers + risk OOM. "
+                "Set telemetry.track_scores: false in your config. "
+                "Use the parity runner if you want telemetry."
+            )
+
+    def _load_model_and_tokenizer(self) -> Tuple:
+        """Load model and tokenizer (lazy, called once)."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        cfg = self.config
+
+        dtypes = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
+
+        log.info("Loading tokenizer: %s", cfg.model.name)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model.name,
+            revision=getattr(cfg.model, "revision", None),
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        log.info(
+            "Loading model: %s (dtype=%s, attn=%s)",
+            cfg.model.name,
+            cfg.model.dtype,
+            cfg.model.attn_implementation,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model.name,
+            revision=getattr(cfg.model, "revision", None),
+            torch_dtype=model_dtype,
+            attn_implementation=cfg.model.attn_implementation,
+            device_map="auto",
+        )
+        model.eval()
+
+        return model, tokenizer
+
+    def run(self) -> None:
+        """Run predictions on all configured datasets."""
+        # Lazy-load model
+        self.model, self.tokenizer = self._load_model_and_tokenizer()
+
+        datasets = getattr(self.lb, "datasets", LONGBENCH_EN_DATASETS)
+        if isinstance(datasets, str):
+            datasets = [datasets]
+
+        output_dir = Path(getattr(self.lb, "output_dir", "outputs/longbench"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        resume = getattr(self.lb, "resume", False)
+
+        log.info(
+            "LongBench run: %d datasets, output_dir=%s, windowed=%s",
+            len(datasets),
+            output_dir,
+            self.is_windowed,
+        )
+
+        for dataset_name in datasets:
+            jsonl_path = output_dir / f"{dataset_name}.jsonl"
+
+            # Resume support: skip if output already exists with data
+            if resume and jsonl_path.exists():
+                existing_lines = len(
+                    jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+                )
+                if existing_lines > 0:
+                    log.info(
+                        "Skipping %s (resume=true, %d lines exist)",
+                        dataset_name,
+                        existing_lines,
+                    )
+                    continue
+
+            self._run_dataset(dataset_name, output_dir)
+
+        log.info("LongBench run complete. Outputs in %s", output_dir)
+
+    def _run_dataset(self, name: str, output_dir: Path) -> None:
+        """Run predictions on a single dataset."""
+        log.info("=== Dataset: %s ===", name)
+
+        use_e = getattr(self.lb, "use_e_variants", False)
+        examples = load_longbench_dataset(name, use_e_variant=use_e)
+        examples_list = list(examples)
+
+        max_gen_len = self.dataset2maxlen.get(name, 128)
+        prompt_template = self.dataset2prompt.get(name)
+        if prompt_template is None:
+            log.error("No prompt template for dataset %s — skipping", name)
+            return
+
+        out_path = output_dir / f"{name}.jsonl"
+        skip_oom = getattr(self.lb, "skip_oom", False)
+
+        run_start = time.time()
+        n_examples = 0
+        n_oom = 0
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            for i, ex in enumerate(examples_list):
+                try:
+                    pred = self._predict(ex, prompt_template, max_gen_len, name)
+                except torch.cuda.OutOfMemoryError:
+                    if skip_oom:
+                        log.warning(
+                            "%s example %d: OOM — recording null pred", name, i
+                        )
+                        pred = None
+                        n_oom += 1
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    else:
+                        raise
+
+                # Output schema matches THUDM/LongBench/pred.py exactly
+                record = {
+                    "pred": pred,
+                    "answers": ex["answers"],
+                    "all_classes": ex.get("all_classes"),
+                    "length": ex["length"],
+                    "_id": ex.get("_id", str(i)),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                n_examples += 1
+
+                if (i + 1) % 50 == 0:
+                    log.info(
+                        "  %s: %d/%d examples done", name, i + 1, len(examples_list)
+                    )
+
+        run_end = time.time()
+        elapsed = run_end - run_start
+        eps = n_examples / elapsed if elapsed > 0 else 0
+
+        log.info(
+            "%s: %d examples, %d OOM, %.1fs (%.2f ex/s)",
+            name,
+            n_examples,
+            n_oom,
+            elapsed,
+            eps,
+        )
+
+        # Write metadata sidecar
+        self._write_meta(name, n_examples, max_gen_len, run_start, run_end, eps, output_dir)
+
+    def _predict(
+        self,
+        ex: Dict[str, Any],
+        prompt_template: str,
+        max_gen_len: int,
+        dataset_name: str,
+    ) -> str:
+        """Generate a prediction for a single example.
+
+        Follows THUDM/LongBench/pred.py + kvpress protocol exactly.
+        """
+        cfg = self.config
+        model = self.model
+        tokenizer = self.tokenizer
+
+        # 1. Format prompt from template
+        prompt = prompt_template.format(
+            context=ex["context"], input=ex.get("input", "")
+        )
+
+        # 2. Tokenize and middle-truncate if needed
+        max_length = getattr(self.lb, "max_length", 7500)
+        tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+
+        if len(tokenized) > max_length:
+            half = max_length // 2
+            # Middle truncation: keep first half + last half
+            prompt = tokenizer.decode(
+                tokenized[:half], skip_special_tokens=True
+            ) + tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
+
+        # 3. Apply chat template for LLaMA-3-8B-Instruct
+        model_name = cfg.model.name.lower()
+        if "instruct" in model_name or "chat" in model_name:
+            # Use the tokenizer's built-in chat template
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                # Fallback: manual LLaMA-3 template
+                prompt = (
+                    f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+                    f"{prompt}<|eot_id|>"
+                    f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+                )
+
+        # 4. Tokenize final prompt
+        inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
+        input_ids = inputs.input_ids.to(model.device)
+        context_length = input_ids.shape[-1]
+
+        # 5. Set up cache
+        cache = None
+        hooks = None
+
+        if self.is_windowed:
+            cache, hooks = self._setup_windowed_cache(input_ids)
+
+        # 6. Generate
+        try:
+            gen_kwargs = {
+                "max_new_tokens": max_gen_len,
+                "num_beams": 1,
+                "do_sample": False,
+                "temperature": 1.0,
+                "pad_token_id": tokenizer.pad_token_id
+                or tokenizer.eos_token_id,
+            }
+
+            # output_attentions only for eager backend
+            if self.cache_backend_package == "eager":
+                gen_kwargs["output_attentions"] = True
+
+            if cache is not None:
+                gen_kwargs["past_key_values"] = cache
+
+            # samsum special handling: stop at newline
+            if dataset_name == "samsum":
+                newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+                gen_kwargs["eos_token_id"] = [
+                    tokenizer.eos_token_id,
+                    newline_id,
+                ]
+                gen_kwargs["min_length"] = context_length + 1
+
+            with torch.no_grad():
+                output = model.generate(input_ids, **gen_kwargs)
+
+        finally:
+            # 7. Clean up hooks (no leakage between examples)
+            if hooks is not None:
+                hooks.remove()
+
+        # 8. Decode only new tokens
+        pred = tokenizer.decode(
+            output[0][context_length:], skip_special_tokens=True
+        )
+
+        # 9. Post-processing (dataset-specific, matches THUDM pred.py)
+        pred = self._post_process(pred, dataset_name)
+
+        # 10. Memory hygiene
+        self._cleanup_memory(cache)
+
+        return pred
+
+    def _setup_windowed_cache(self, input_ids: torch.Tensor):
+        """Create windowed cache and install hooks."""
+        cfg = self.config
+        model = self.model
+
+        budget = cfg.cache.cache_budget or 0.20
+        cache_config = self.WindowedCacheConfig(
+            window_size=cfg.cache.window_size,
+            num_sink_tokens=cfg.cache.num_sink_tokens,
+            local_window_size=cfg.cache.local_window_size,
+            cache_budget=budget,
+            obs_window=cfg.cache.obs_window,
+        )
+
+        # Get RoPE module
+        rope = None
+        for name, mod in model.named_modules():
+            if "rotary" in name.lower() or "rope" in name.lower():
+                rope = mod
+                break
+        if rope is None:
+            for name, mod in model.named_modules():
+                if hasattr(mod, "rotary_emb"):
+                    rope = mod.rotary_emb
+                    break
+
+        dtypes = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+
+        cache = self.WindowedCache(
+            config=cache_config,
+            prefill_len=input_ids.shape[-1],
+            model_config=model.config,
+            kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
+            rope_module=rope or torch.nn.Identity(),
+            num_layers=model.config.num_hidden_layers,
+        )
+
+        hooks = self.install_score_hooks(model, cache, cache_config)
+        return cache, hooks
+
+    @staticmethod
+    def _post_process(pred: str, dataset_name: str) -> str:
+        """Dataset-specific post-processing (matches THUDM pred.py).
+
+        - samsum: first line only
+        - code datasets: preserve whitespace
+        - all others: return as-is
+        """
+        if dataset_name == "samsum":
+            # Take first line only (prevents illegal repeating output)
+            pred = pred.split("\n")[0].strip()
+        # Code datasets: preserve all whitespace (no stripping)
+        # All others: return as-is (metric functions handle normalization)
+        return pred
+
+    def _cleanup_memory(self, cache=None) -> None:
+        """Memory hygiene between examples."""
+        if cache is not None:
+            del cache
+        aggressive = getattr(self.lb, "aggressive_cache_clear", False)
+        if aggressive or torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if aggressive:
+            gc.collect()
+
+    def _write_meta(
+        self,
+        dataset_name: str,
+        num_examples: int,
+        max_gen_len: int,
+        run_start: float,
+        run_end: float,
+        eps: float,
+        output_dir: Path,
+    ) -> None:
+        """Write per-dataset metadata sidecar JSON."""
+        cfg = self.config
+        env = capture_environment()
+
+        budget = cfg.cache.cache_budget
+        compression_ratio = round(1.0 - budget, 2) if budget else None
+
+        # Resolve local_window_size if possible
+        lws = cfg.cache.local_window_size
+        if isinstance(lws, float) and budget:
+            import math
+            max_len = getattr(self.lb, "max_length", 7500)
+            post_sink = max_len - cfg.cache.num_sink_tokens
+            raw = lws * post_sink
+            ceiled = math.ceil(raw)
+            remainder = ceiled % cfg.cache.window_size
+            if remainder:
+                ceiled += cfg.cache.window_size - remainder
+            lws_resolved = ceiled
+        elif isinstance(lws, int):
+            lws_resolved = lws
+        else:
+            lws_resolved = None
+
+        meta = {
+            "dataset": dataset_name,
+            "num_examples": num_examples,
+            "model_name": cfg.model.name,
+            "model_revision": getattr(cfg.model, "revision", None),
+            "tokenizer_sha": self._get_tokenizer_sha(),
+            "cache_type": "windowed" if self.is_windowed else "full_cache",
+            "cache_backend_package": self.cache_backend_package,
+            "cache_budget": budget,
+            "compression_ratio": compression_ratio,
+            "window_size": cfg.cache.window_size,
+            "num_sink_tokens": cfg.cache.num_sink_tokens,
+            "local_window_size_resolved": lws_resolved,
+            "obs_window": cfg.cache.obs_window,
+            "track_scores": False,
+            "attn_implementation": cfg.model.attn_implementation,
+            "dtype": cfg.model.dtype,
+            "max_length": getattr(self.lb, "max_length", 7500),
+            "max_gen_len": max_gen_len,
+            "seed": cfg.run.seed,
+            **self._vendored_shas,
+            **env,
+            "run_started_utc": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_start)
+            ),
+            "run_finished_utc": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_end)
+            ),
+            "examples_per_second": round(eps, 4),
+        }
+
+        meta_path = output_dir / f"{dataset_name}.meta.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, default=str)
+
+    def _get_tokenizer_sha(self) -> str:
+        """Get tokenizer SHA for reproducibility."""
+        if self.tokenizer is None:
+            return "unknown"
+        try:
+            from utils.hashing import sha256_tokenizer
+            return sha256_tokenizer(self.tokenizer)
+        except Exception:
+            return "unknown"

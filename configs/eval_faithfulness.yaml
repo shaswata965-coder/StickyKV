@@ -1,0 +1,15 @@
+# ============================================================================
+# StickyKV — Faithfulness Evaluation (Suite B)
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: faithfulness
+  seed: 42
+
+faithfulness:
+  base_npz_path: outputs/parity_base_wikitext-103.npz
+  ours_npz_path: outputs/parity_ours_eager_wikitext-103.npz
+
+telemetry:
+  output_dir: outputs
