@@ -42,7 +42,6 @@ class _StubCache:
     window_size: int = 32
     num_sink_tokens: int = 4
     local_window_size: float = 0.25
-    obs_window: int = 32
     top_k_windows: int = 2
 
 @dataclass

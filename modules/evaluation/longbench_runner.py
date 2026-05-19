@@ -408,7 +408,6 @@ class LongBenchRunner:
             num_sink_tokens=cfg.cache.num_sink_tokens,
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
-            obs_window=cfg.cache.obs_window,
         )
 
         # Get RoPE module
@@ -513,7 +512,6 @@ class LongBenchRunner:
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "local_window_size_resolved": lws_resolved,
-            "obs_window": cfg.cache.obs_window,
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,

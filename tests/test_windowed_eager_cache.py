@@ -24,7 +24,7 @@ from modules.windowed_eager_cache.policy import EvictionPolicy
 from modules.windowed_eager_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_eager_cache.state import CacheState
 from modules.windowed_eager_cache.telemetry import NullTelemetry, Telemetry
-from modules.windowed_eager_cache.hooks import HookHandles, _AttnRingBuffer
+from modules.windowed_eager_cache.hooks import HookHandles
 from utils.cache_factory import (
     ConfigValidationError,
     get_cache_classes,
@@ -53,7 +53,6 @@ def _make_config(**overrides):
         num_sink_tokens=4,
         local_window_size=16,
         cache_budget=0.40,
-        obs_window=8,
         track_scores=False,
     )
     defaults.update(overrides)
@@ -69,7 +68,6 @@ def _make_resolved(**overrides):
         bytes_per_token=4096,
         total_budget_bytes=163840,
         total_budget_tokens=40,
-        obs_window=8,
     )
     defaults.update(overrides)
     return ResolvedConfig(**defaults)
@@ -370,24 +368,11 @@ class TestEagerHooks:
         with pytest.raises(ConfigValidationError):
             validate_backend_attn_pairing("eager", "flash_attention_2")
 
-    # Replaces 25 (test_q_buffer_preallocation)
-    def test_eager_ring_buffer_preallocation_and_reallocation(self):
-        """Buffer data_ptr stable during normal ops, reallocates on eviction."""
-        buf = _AttnRingBuffer(
-            B=1, H_q=32, obs_window=8, cache_len=100,
-            device=torch.device("cpu"), dtype=torch.float16,
-        )
-        initial_ptr = buf.data_ptr
-
-        # 10 steps, constant cache length
-        for step in range(10):
-            row = torch.randn(1, 32, 1, 100, dtype=torch.float16)
-            buf.write(row)
-            assert buf.data_ptr == initial_ptr, f"Unexpected reallocation at step {step}"
-
-        # Simulate eviction: cache length changes
-        buf._reallocate(50)
-        assert buf.data_ptr != initial_ptr, "Expected reallocation after cache length change"
+    # test_eager_ring_buffer_preallocation_and_reallocation removed:
+    # _AttnRingBuffer was deleted along with the obs_window scoring path.
+    # H2O-style cumulative scoring needs no per-step row buffer; the per-step
+    # attention is sum-reduced and the cumulative running total lives in
+    # CacheState.window_scores instead.
 
 
 # ===========================================================================

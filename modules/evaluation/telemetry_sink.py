@@ -58,7 +58,6 @@ class TelemetryMetadata:
     window_size: int = 0
     num_sink_tokens: int = 0
     local_window_size_resolved: int = 0
-    obs_window: int = 0
     top_k_windows: int = 0
 
     # Model

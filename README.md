@@ -103,7 +103,7 @@ python main.py --config configs/eval_parity_ours_flash.yaml
 
 Every output file includes a `.meta.json` sidecar with:
 - Schema version, seed, dataset/article identity, tokenizer SHA
-- Full window config (window_size, sink tokens, local window, obs_window, top_k)
+- Full window config (window_size, sink tokens, local window, top_k)
 - Model name, revision, dtype, attention implementation
 - Cache backend + package, budget ratio
 - Library versions (transformers, torch, flash-attn, CUDA)

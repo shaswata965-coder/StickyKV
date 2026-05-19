@@ -60,7 +60,6 @@ class CacheConfig:
     window_size: int = 8
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
-    obs_window: int = 32
     top_k_windows: int = 2
 
     def __post_init__(self) -> None:
@@ -212,7 +211,6 @@ class WindowConfig:
     window_size: int = 32
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 256
-    obs_window: int = 32
     top_k_windows: int = 5
 
 
@@ -473,7 +471,6 @@ _PARITY_IDENTITY_FIELDS = [
     "window_size",
     "num_sink_tokens",
     "local_window_size_resolved",
-    "obs_window",
     "model_name",
     "model_revision",
     "tokenizer_sha",
@@ -516,7 +513,6 @@ def validate_parity_pair(
         "gen_len": eff_gen,
         "window_size": ours_config.window.window_size,
         "num_sink_tokens": ours_config.window.num_sink_tokens,
-        "obs_window": ours_config.window.obs_window,
         "model_name": ours_config.model.name,
         "model_revision": ours_config.model.revision,
     }

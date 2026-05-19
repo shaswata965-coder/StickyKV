@@ -24,7 +24,6 @@ cache:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 0.25
-  obs_window: 32
 
 telemetry:
   track_scores: false
