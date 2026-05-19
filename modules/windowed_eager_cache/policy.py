@@ -198,10 +198,19 @@ class EvictionPolicy:
         # Concatenate sink + window tokens
         all_idx = torch.cat([sink_idx, token_idx], dim=-1)  # [B, total]
 
-        # Trim: geometric cap via Python int arithmetic (no tensor data read)
-        max_tokens = self.total_tokens
-        retained_len = min(all_idx.shape[1], max_tokens)
-        all_idx = all_idx[:, :retained_len]
+        # Mask out indices that exceed the actual sequence length
+        # (partial last window produces OOB token positions).
+        valid_mask = all_idx < self.total_tokens  # [B, total]
+
+        # For batched gather we need rectangular tensors — count valid per row
+        # and truncate to the minimum across the batch.
+        valid_counts = valid_mask.sum(dim=1)          # [B]
+        min_valid = int(valid_counts.min().item())
+
+        # Gather only valid indices: sort valid-first via the mask, take prefix
+        # argsort of ~mask (False=0 sorts before True=1) gives valid-idx-first order
+        order = torch.argsort(~valid_mask, dim=1, stable=True)  # valid first
+        all_idx = torch.gather(all_idx, 1, order)[:, :min_valid]
 
         return all_idx
 
