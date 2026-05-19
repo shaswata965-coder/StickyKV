@@ -273,7 +273,7 @@ class OursParityRunner:
             # Pad per-step arrays within this sample
             mW = max(x.shape[-1] for x in all_ws)
             mK = max(x.shape[-1] for x in all_topk)
-            pws = [np.pad(x, [(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in all_ws]
+            pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in all_ws]
             ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in all_topk]
             mH = max(x.shape[-2] for x in pws)
             pws = [np.pad(x, [(0,0),(0,mH-x.shape[-2]),(0,0)]) if x.shape[-2]<mH else x for x in pws]
