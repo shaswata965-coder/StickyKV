@@ -60,7 +60,6 @@ class CacheConfig:
     window_size: int = 8
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
-    top_k_windows: int = 2
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -206,12 +205,77 @@ class ParityConfig:
 
 @dataclass
 class WindowConfig:
-    """Window scoring configuration (top-level, used by parity runners)."""
+    """Window scoring configuration (top-level, used by parity runners).
+
+    ``top_k_windows`` is derived from ``cache.cache_budget`` + prefill length
+    via :meth:`resolved_top_k`, matching the production eviction policy.
+    If set explicitly it overrides the derivation (useful for tests).
+    """
 
     window_size: int = 32
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 256
-    top_k_windows: int = 5
+    top_k_windows: Optional[int] = None   # None → derived from cache_budget
+
+    def resolved_top_k(self, cache_budget: Optional[float], prefill_len: int) -> int:
+        """Derive top_k_windows from cache budget — matches WindowedCacheConfig.resolve().
+
+        ``K = (budget_tokens - num_sink - local_tokens) // window_size``
+
+        Parameters
+        ----------
+        cache_budget : float, optional
+            Target cache compression ratio in (0, 1].  Required when
+            ``top_k_windows`` is not set explicitly.
+        prefill_len : int
+            Resolved prefill length for this run.
+
+        Returns
+        -------
+        int
+            Non-negative top-K (may be 0 if budget covers only sink + local).
+
+        Raises
+        ------
+        ConfigValidationError
+            If both ``top_k_windows`` and ``cache_budget`` are unset, or if
+            the budget is too small for the sink + local region.
+        """
+        # Explicit override takes precedence (legacy / unit tests).
+        if self.top_k_windows is not None:
+            return int(self.top_k_windows)
+
+        if cache_budget is None:
+            raise ConfigValidationError(
+                "Cannot derive top_k_windows: window.top_k_windows is unset and "
+                "cache.cache_budget is None. Set cache.cache_budget to the target "
+                "compression ratio (e.g., 0.25) — base parity runs use it as the "
+                "comparison target even though they do not evict."
+            )
+
+        # Resolve local_window_size to a concrete int (mirrors WindowedCacheConfig).
+        post_sink = max(1, prefill_len - self.num_sink_tokens)
+        lws = self.local_window_size
+        if isinstance(lws, float):
+            raw = lws * post_sink
+            ceiled = math.ceil(raw)
+            remainder = ceiled % self.window_size
+            if remainder:
+                ceiled += self.window_size - remainder
+            local_tokens = ceiled
+        else:
+            local_tokens = int(lws)
+
+        budget_tokens = int(cache_budget * prefill_len)
+        remaining = budget_tokens - self.num_sink_tokens - local_tokens
+        if remaining < 0:
+            raise ConfigValidationError(
+                f"cache_budget={cache_budget} on prefill_len={prefill_len} yields "
+                f"budget_tokens={budget_tokens}, which is less than num_sink_tokens "
+                f"({self.num_sink_tokens}) + local_tokens ({local_tokens}). "
+                f"Increase cache_budget or reduce sink/local sizes."
+            )
+        return remaining // self.window_size
 
 
 # ---------------------------------------------------------------------------

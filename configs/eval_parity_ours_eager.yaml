@@ -22,7 +22,6 @@ cache:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 256
-  top_k_windows: 5
 
 data:
   dataset: wikitext-103
@@ -42,7 +41,6 @@ window:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 256
-  top_k_windows: 5
 
 telemetry:
   track_scores: true

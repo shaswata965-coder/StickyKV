@@ -14,9 +14,12 @@ model:
   attn_implementation: eager        # base always uses eager for output_attentions
 
 cache:
-  backend: dynamic
+  backend: dynamic                # base run uses full DynamicCache (no eviction)
   backend_package: null
-  cache_budget: null
+  cache_budget: 0.25              # target compression ratio for top_k derivation only
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
 
 data:
   dataset: wikitext-103
@@ -37,7 +40,6 @@ window:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 256
-  top_k_windows: 5
 
 telemetry:
   track_scores: true
