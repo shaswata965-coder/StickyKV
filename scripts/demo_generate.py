@@ -7,7 +7,7 @@ Uses the eager-attention backend with:
   - cache_budget  = 0.2 (20% of prefill KV retained)
 
 Requires: transformers, torch, einops, accelerate
-Model   : TinyLlama/TinyLlama-1.1B-Chat-v1.0 (fits in ~2 GB)
+Model   : Llama 3.2 1B Instruct (local Kaggle path)
 """
 
 from __future__ import annotations
@@ -29,8 +29,26 @@ from modules.windowed_eager_cache import (
 )
 
 # ── Configuration ─────────────────────────────────────────────────────
-MODEL_NAME    = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-PROMPT        = "The future of artificial intelligence is"
+MODEL_NAME    = "/kaggle/input/models/metaresearch/llama-3.2/transformers/1b-instruct/1"
+PROMPT        = (
+    "The future of artificial intelligence is one of the most debated topics "
+    "in modern science and technology. Researchers across the globe are working "
+    "tirelessly to develop systems that can reason, learn, and adapt in ways "
+    "that were once thought to be uniquely human. From natural language "
+    "processing to computer vision, from robotics to drug discovery, AI is "
+    "transforming virtually every field of human endeavor. Yet with these "
+    "advances come profound questions about safety, alignment, and the long-term "
+    "impact on society. Some experts believe that artificial general intelligence "
+    "could be achieved within the next few decades, while others argue that "
+    "current approaches based on deep learning and large language models are "
+    "fundamentally limited. The debate extends beyond technical capabilities "
+    "to encompass ethical considerations, economic disruption, and the very "
+    "nature of consciousness and intelligence. As we stand at this crossroads, "
+    "it is essential that we carefully consider both the tremendous potential "
+    "and the serious risks. The decisions we make today about how to develop "
+    "and deploy these powerful technologies will shape the trajectory of "
+    "human civilization for generations to come. In this essay, we explore"
+)
 MAX_NEW_TOKENS = 128
 WINDOW_SIZE   = 8
 LOCAL_WINDOW  = 32          # tokens (must be multiple of WINDOW_SIZE)
@@ -38,6 +56,10 @@ CACHE_BUDGET  = 0.2         # retain 20% of prefill KV cache
 NUM_SINK      = 4           # always-retained leading tokens
 DTYPE         = torch.float16
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Budget constraint: floor(CACHE_BUDGET * prefill_len) >= NUM_SINK + LOCAL_WINDOW
+# → prefill_len >= (NUM_SINK + LOCAL_WINDOW) / CACHE_BUDGET
+MIN_PREFILL_TOKENS = int((NUM_SINK + LOCAL_WINDOW) / CACHE_BUDGET)
 
 
 def main() -> None:
@@ -78,8 +100,13 @@ def main() -> None:
     # ── 2. Tokenize prompt (= prefill) ────────────────────────────────
     input_ids = tokenizer.encode(PROMPT, return_tensors="pt").to(model.device)
     prefill_len = input_ids.shape[1]
-    print(f"\n[3/5] Prompt ({prefill_len} tokens): \"{PROMPT}\"")
+    print(f"\n[3/5] Prompt ({prefill_len} tokens)")
 
+    if prefill_len < MIN_PREFILL_TOKENS:
+        print(f"\n✗ Prompt too short: {prefill_len} tokens, need ≥ {MIN_PREFILL_TOKENS}")
+        print(f"  Budget constraint: floor({CACHE_BUDGET} × prefill) ≥ {NUM_SINK} + {LOCAL_WINDOW}")
+        print(f"  Extend the prompt or reduce local_window / num_sink / increase budget.")
+        sys.exit(1)
     # ── 3. Build cache + hooks ────────────────────────────────────────
     print("[4/5] Building windowed cache …")
 
