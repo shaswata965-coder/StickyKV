@@ -215,6 +215,17 @@ class LongBenchRunner:
         examples = load_longbench_dataset(name, use_e_variant=use_e)
         examples_list = list(examples)
 
+        # Cap to num_samples per dataset. "max" (default) keeps the full split.
+        ns = getattr(self.lb, "num_samples", "max")
+        if isinstance(ns, int) and ns >= 0:
+            total = len(examples_list)
+            if ns < total:
+                log.info(
+                    "%s: capping examples %d → %d (longbench.num_samples=%d)",
+                    name, total, ns, ns,
+                )
+                examples_list = examples_list[:ns]
+
         max_gen_len = self.dataset2maxlen.get(name, 128)
         prompt_template = self.dataset2prompt.get(name)
         if prompt_template is None:
@@ -508,6 +519,7 @@ class LongBenchRunner:
             "dtype": cfg.model.dtype,
             "max_length": getattr(self.lb, "max_length", 7500),
             "max_gen_len": max_gen_len,
+            "num_samples_requested": getattr(self.lb, "num_samples", "max"),
             "seed": cfg.run.seed,
             **self._vendored_shas,
             **env,

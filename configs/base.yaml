@@ -27,10 +27,12 @@ cache:
 data:
   dataset: wikitext-103                # wikitext-103 | pg19
   article_id: 0
-  prefill_len: 100
-  gen_len: 50
-  num_samples: 1                       # global: how many articles to evaluate (parity runners)
-  max_tokens: null                     # global: prefill tokens per article; null = use prefill_len
+  prefill_len: 100                     # used only when max_tokens is null
+  gen_len: 50                          # used only when max_tokens is null
+  # Global knobs for the parity runners (wikitext-103 / pg-19):
+  num_samples: 1                       # how many articles to evaluate
+  max_tokens: null                     # total tokens per article; when set, splits via `ratio`
+  ratio: 1.0                           # prefill fraction of max_tokens; gen = max_tokens - prefill
 
 telemetry:
   track_scores: false                  # true only for research/parity runs; false for perf/longbench

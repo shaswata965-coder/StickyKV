@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -116,21 +116,55 @@ class CacheConfig:
 class DataConfig:
     """Data / corpus configuration.
 
-    ``num_samples`` and ``max_tokens`` are the **global** knobs used by the
-    parity runners to decide how many corpus articles to evaluate and how
-    many tokens to feed as the prefill window.  When unset, behaviour is
-    identical to the legacy single-article path.
+    Three knobs control parity-run data loading (wikitext-103 / pg-19):
+
+    - ``num_samples`` — how many corpus articles to evaluate.
+    - ``max_tokens`` — total token budget per article.  When set, it
+      replaces ``prefill_len`` + ``gen_len`` as the source of truth.
+    - ``ratio`` — split fraction.  ``prefill_len = int(max_tokens * ratio)``
+      and ``gen_len = max_tokens - prefill_len``.
+
+    When ``max_tokens`` is ``None`` (legacy path), ``prefill_len`` and
+    ``gen_len`` are used as-is and ``ratio`` is ignored.
     """
 
     dataset: str = "wikitext-103"  # "wikitext-103" | "pg19"
     article_id: int = 0
     prefill_len: int = 100
     gen_len: int = 50
-    # Global controls applied by the parity runners (wikitext-103 / pg19).
-    # num_samples=1 + max_tokens=None preserves the legacy single-article
-    # NPZ schema exactly.
+    # Global knobs (apply to parity runners; LongBench has its own num_samples).
     num_samples: int = 1
     max_tokens: Optional[int] = None
+    ratio: float = 1.0   # prefill fraction of max_tokens; 1-ratio is gen
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.ratio <= 1.0):
+            raise ConfigValidationError(
+                f"data.ratio must be in (0, 1], got {self.ratio!r}"
+            )
+        if self.max_tokens is not None and self.max_tokens <= 0:
+            raise ConfigValidationError(
+                f"data.max_tokens must be a positive int, got {self.max_tokens!r}"
+            )
+        if self.num_samples < 1:
+            raise ConfigValidationError(
+                f"data.num_samples must be >= 1, got {self.num_samples!r}"
+            )
+
+    def resolved_lengths(
+        self, default_prefill: int, default_gen: int
+    ) -> Tuple[int, int]:
+        """Return the effective ``(prefill_len, gen_len)``.
+
+        If ``max_tokens`` is set, splits it by ``ratio``.  Otherwise returns
+        the provided defaults (typically ``parity.prefill_len`` / ``gen_len``).
+        """
+        if self.max_tokens is None:
+            return int(default_prefill), int(default_gen)
+        eff_prefill = int(self.max_tokens * self.ratio)
+        eff_prefill = max(1, eff_prefill)              # guard against ratio rounding to 0
+        eff_gen = max(0, int(self.max_tokens) - eff_prefill)
+        return eff_prefill, eff_gen
 
 
 @dataclass
@@ -258,6 +292,11 @@ class LongBenchConfig:
 
     Follows DefensiveKV's exact protocol: LongBench v1, 16 English datasets,
     greedy decoding, middle truncation, per-dataset max gen length.
+
+    ``num_samples`` controls how many examples per dataset are evaluated:
+    the literal string ``"max"`` runs the full split; a non-negative integer
+    caps each dataset to that many examples (after the dataset's natural
+    order — no shuffling).
     """
 
     datasets: List[str] = field(
@@ -278,6 +317,33 @@ class LongBenchConfig:
     resume: bool = False            # skip datasets whose jsonl already exists
     skip_oom: bool = False          # record OOM'd examples as pred=null
     aggressive_cache_clear: bool = False  # essential on Kaggle T4
+    num_samples: Union[int, str] = "max"  # "max" = all examples; int = cap per dataset
+
+    def __post_init__(self) -> None:
+        ns = self.num_samples
+        if isinstance(ns, bool):
+            # bool is a subclass of int in Python; explicitly reject it.
+            raise ConfigValidationError(
+                f"longbench.num_samples must be 'max' or a non-negative int, "
+                f"got bool {ns!r}"
+            )
+        if isinstance(ns, str):
+            if ns.strip().lower() != "max":
+                raise ConfigValidationError(
+                    f"longbench.num_samples string must be 'max', got {ns!r}"
+                )
+            # Normalise so downstream code can do a literal comparison
+            self.num_samples = "max"
+        elif isinstance(ns, int):
+            if ns < 0:
+                raise ConfigValidationError(
+                    f"longbench.num_samples int must be >= 0, got {ns!r}"
+                )
+        else:
+            raise ConfigValidationError(
+                f"longbench.num_samples must be 'max' or a non-negative int, "
+                f"got {type(ns).__name__}: {ns!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -434,13 +500,20 @@ def validate_parity_pair(
     ParityValidationError
         If any identicality-critical field differs.
     """
+    # Resolve effective lengths via DataConfig so the comparison matches
+    # what the runner actually used (max_tokens × ratio overrides
+    # parity.prefill_len / parity.gen_len when set).
+    eff_prefill, eff_gen = ours_config.data.resolved_lengths(
+        ours_config.parity.prefill_len, ours_config.parity.gen_len
+    )
+
     # Build a comparable dict from ours_config
     ours_flat: dict[str, Any] = {
         "seed": ours_config.run.seed,
         "dataset": ours_config.parity.dataset,
         "article_id": ours_config.parity.article_index,
-        "prefill_len": ours_config.parity.prefill_len,
-        "gen_len": ours_config.parity.gen_len,
+        "prefill_len": eff_prefill,
+        "gen_len": eff_gen,
         "window_size": ours_config.window.window_size,
         "num_sink_tokens": ours_config.window.num_sink_tokens,
         "obs_window": ours_config.window.obs_window,

@@ -33,7 +33,10 @@ class BaseParityRunner:
         # num_samples == 1 + max_tokens is None preserves the legacy schema (single sample, sample-axis size 1).
         num_samples = max(1, int(getattr(cfg.data, "num_samples", 1)))
         max_tokens = getattr(cfg.data, "max_tokens", None)
-        prefill_len = int(max_tokens) if max_tokens else int(p.prefill_len)
+        ratio = float(getattr(cfg.data, "ratio", 1.0))
+        # Resolve effective lengths: when max_tokens is set, split by ratio;
+        # otherwise fall back to parity.prefill_len / parity.gen_len.
+        prefill_len, gen_len = cfg.data.resolved_lengths(p.prefill_len, p.gen_len)
 
         # 1. Load corpus once.
         loader = CorpusLoader(p.dataset)
@@ -49,8 +52,10 @@ class BaseParityRunner:
             num_samples = max(1, available)
 
         log.info(
-            "Sampling %d article(s) from index %d, prefill_len=%d, gen_len=%d",
-            num_samples, p.article_index, prefill_len, p.gen_len,
+            "Sampling %d article(s) from index %d, prefill_len=%d, gen_len=%d "
+            "(max_tokens=%s, ratio=%.3f)",
+            num_samples, p.article_index, prefill_len, gen_len,
+            "None" if max_tokens is None else int(max_tokens), ratio,
         )
 
         # 2. Load model + tokenizer (once across all samples).
@@ -94,7 +99,7 @@ class BaseParityRunner:
             input_ids = tokens.clone()
             pkv = DynamicCache()
             with torch.no_grad():
-                for step in range(p.gen_len):
+                for step in range(gen_len):
                     inp = input_ids if step == 0 else next_tok.unsqueeze(0)
                     out = model(input_ids=inp, past_key_values=pkv, use_cache=True,
                                 output_attentions=True, return_dict=True)
@@ -143,7 +148,7 @@ class BaseParityRunner:
                     all_topk.append(np.stack(step_tk, 0))
                     all_ws.append(np.stack(step_ws, 0))
                     if (step+1) % 100 == 0:
-                        log.info("  Step %d/%d", step+1, p.gen_len)
+                        log.info("  Step %d/%d", step+1, gen_len)
 
             # Pad per-step arrays within this sample
             mW = max(x.shape[-1] for x in all_ws)
@@ -178,15 +183,15 @@ class BaseParityRunner:
         top_window_indices = np.stack(aligned_topk, 0)
         window_scores = np.stack(aligned_ws, 0)
         generated_tokens = np.stack(samples_gen_toks, 0)
-        eviction_step_mask = np.zeros((num_samples, p.gen_len), dtype=bool)
+        eviction_step_mask = np.zeros((num_samples, gen_len), dtype=bool)
 
         elapsed = time.time() - t0
-        total_tokens = num_samples * p.gen_len
+        total_tokens = num_samples * gen_len
         log.info("Done: %d samples, %.1fs (%.1f tok/s overall)",
                  num_samples, elapsed, total_tokens / max(elapsed, 1e-6))
 
         # Resolve local_window_size
-        St = prefill_len + p.gen_len - ns
+        St = prefill_len + gen_len - ns
         if isinstance(w.local_window_size, float):
             lr = math.ceil(w.local_window_size * St)
             r2 = lr % ws_sz
@@ -208,7 +213,8 @@ class BaseParityRunner:
             "tokenizer_sha": tok_sha,
             "prefill_len": prefill_len,
             "max_tokens": max_tokens,
-            "gen_len": p.gen_len,
+            "gen_len": gen_len,
+            "ratio": ratio,
             "window_size": w.window_size,
             "num_sink_tokens": ns,
             "local_window_size_resolved": lr,
