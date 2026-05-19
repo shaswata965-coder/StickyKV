@@ -1,7 +1,7 @@
 """Pure scoring functions for windowed KV cache.
 
 Two functions:
-- ``compute_window_scores`` — reduces ``[B, H_q, T_obs, S]`` attention to
+- ``compute_window_scores`` — reduces ``[B, H_q, T, S]`` attention to
   ``[B, H_q, W]`` per-window scores.
 - ``accumulate`` — in-place ``+=`` wrapper for unit testability.
 """
@@ -22,7 +22,7 @@ def compute_window_scores(
     """Reduce full attention weights to per-window scores.
 
     Algorithm:
-    1. Sum over T_obs query rows → per-token received attention ``[B, H_q, S]``.
+    1. Sum over T query rows → per-token received attention ``[B, H_q, S]``.
     2. Strip sink prefix (never scored).
     3. Right-pad trailing partial window with zeros.
     4. ``einops.reduce('b h (w s) -> b h w', 'sum')``.
@@ -30,7 +30,7 @@ def compute_window_scores(
     Parameters
     ----------
     attn : Tensor
-        Shape ``[B, H_q, T_obs, S]``, post-softmax attention weights.
+        Shape ``[B, H_q, T, S]``, post-softmax attention weights.
     num_sink : int
         Number of sink tokens to strip from the key dimension.
     window_size : int
@@ -41,7 +41,7 @@ def compute_window_scores(
     Tensor
         Shape ``[B, H_q, W]``.  Sink tokens are **not** represented.
     """
-    # 1. Sum over T_obs query rows → per-token scores [B, H_q, S]
+    # 1. Sum over T query rows → per-token scores [B, H_q, S]
     token_scores = attn.sum(dim=-2)
 
     # 2. Strip sink prefix

@@ -333,19 +333,15 @@ class TestEagerHooks:
 
     # Replaces 19 (test_monkey_patch_captures_post_rope_qk)
     def test_eager_hook_reads_attn_weights(self):
-        """Eager hook reads attn_weights from module output tuple."""
-        from modules.windowed_eager_cache.hooks import _AttnRingBuffer
+        """Eager hook: compute_window_scores on raw attn_weights (H2O, no buffer)."""
         from modules.windowed_eager_cache.scorer import compute_window_scores
 
         B, H_q, T, S = 1, 4, 1, 20
         attn_weights = torch.randn(B, H_q, T, S).softmax(dim=-1)
 
-        # Directly test ring buffer + scoring pipeline
-        buf = _AttnRingBuffer(B, H_q, 8, S, torch.device("cpu"), torch.float32)
-        buf.write(attn_weights)
-        obs = buf.read()
-        scores = compute_window_scores(obs, num_sink=4, window_size=8)
-        assert scores.shape == (B, H_q, 2)  # (S-4)=16 / 8 = 2
+        # H2O cumulative: score directly from full attention, no ring buffer
+        scores = compute_window_scores(attn_weights, num_sink=4, window_size=8)
+        assert scores.shape == (B, H_q, 2)  # (S - 4) = 16 / 8 = 2 windows
 
     # Replaces 21 (test_score_hook_does_not_disable_flash_attn)
     def test_eager_hook_handles_none_attn_weights_gracefully(self):
