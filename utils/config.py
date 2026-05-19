@@ -114,12 +114,23 @@ class CacheConfig:
 
 @dataclass
 class DataConfig:
-    """Data / corpus configuration."""
+    """Data / corpus configuration.
+
+    ``num_samples`` and ``max_tokens`` are the **global** knobs used by the
+    parity runners to decide how many corpus articles to evaluate and how
+    many tokens to feed as the prefill window.  When unset, behaviour is
+    identical to the legacy single-article path.
+    """
 
     dataset: str = "wikitext-103"  # "wikitext-103" | "pg19"
     article_id: int = 0
     prefill_len: int = 100
     gen_len: int = 50
+    # Global controls applied by the parity runners (wikitext-103 / pg19).
+    # num_samples=1 + max_tokens=None preserves the legacy single-article
+    # NPZ schema exactly.
+    num_samples: int = 1
+    max_tokens: Optional[int] = None
 
 
 @dataclass

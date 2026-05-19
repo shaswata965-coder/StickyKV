@@ -64,13 +64,27 @@ class FaithfulnessRunner:
 
     def _compute_metrics(self, base: dict, ours: dict) -> dict:
         ba, oa = base["arrays"], ours["arrays"]
-        # Window scores: [num_steps, num_layers, H_q, W]
+        # Window scores: legacy [num_steps, num_layers, H_q, W]
+        #                new    [num_samples, num_steps, num_layers, H_q, W]
         base_ws = torch.from_numpy(ba["window_scores"].astype(np.float32))
         ours_ws = torch.from_numpy(oa["window_scores"].astype(np.float32))
-        # Top-K indices: [num_steps, num_layers, K]
+        # Top-K indices: legacy [num_steps, num_layers, K]
+        #                new    [num_samples, num_steps, num_layers, K]
         base_tk = torch.from_numpy(ba["top_window_indices"].astype(np.int64))
         ours_tk = torch.from_numpy(oa["top_window_indices"].astype(np.int64))
-        # Ensure same shape for Jaccard (pad K dimension if needed)
+
+        # Normalise to per-sample form (always add a leading sample axis).
+        # Legacy NPZs (rank 3 topk, rank 4 ws) get a sample-axis of size 1.
+        if base_tk.dim() == 3:
+            base_tk = base_tk.unsqueeze(0)
+            ours_tk = ours_tk.unsqueeze(0)
+        if base_ws.dim() == 4:
+            base_ws = base_ws.unsqueeze(0)
+            ours_ws = ours_ws.unsqueeze(0)
+
+        num_samples = min(base_tk.shape[0], ours_tk.shape[0])
+
+        # Align K across base/ours so jaccard_topk gets matching shapes
         bK, oK = base_tk.shape[-1], ours_tk.shape[-1]
         if bK != oK:
             maxK = max(bK, oK)
@@ -78,38 +92,53 @@ class FaithfulnessRunner:
                 base_tk = torch.nn.functional.pad(base_tk, (0, maxK-bK), value=-1)
             if oK < maxK:
                 ours_tk = torch.nn.functional.pad(ours_tk, (0, maxK-oK), value=-1)
-        # Jaccard needs [num_steps, num_layers, H_q, K] but our topk is [num_steps, num_layers, K]
-        # Expand by adding a dummy H_q=1 dimension for Jaccard
-        if base_tk.dim() == 3:
-            base_tk = base_tk.unsqueeze(2)  # [S, L, 1, K]
-            ours_tk = ours_tk.unsqueeze(2)
-        # Compute Jaccard
-        jaccard = M.jaccard_topk(ours_tk, base_tk)  # [S, L, H_q]
-        jaccard_per_layer = M.aggregate_per_layer(jaccard)  # [S, L]
-        jaccard_global = M.aggregate_global(jaccard)  # [S]
-        heterogeneity = M.final_step_heterogeneity(jaccard)  # [L]
-        # LIR-like metrics from window scores (approximate — full attention not always available)
-        # Use window score overlap as a proxy for LIR
-        num_steps = min(base_ws.shape[0], ours_ws.shape[0])
-        # Compute per-step score-mass retention
-        lir_proxy = torch.zeros(num_steps)
-        for t in range(num_steps):
-            bws = base_ws[t]  # [L, H, W]
-            ows = ours_ws[t]
-            # Total base mass
-            total = bws.sum()
-            if total > 0:
-                # Mass in ours (overlap by position)
-                minW = min(bws.shape[-1], ows.shape[-1])
-                retained = ows[..., :minW].sum()
-                lir_proxy[t] = (retained / total).clamp(0, 1)
+
+        # Compute per-sample metrics, then mean across the sample axis.
+        per_sample_jaccard = []
+        per_sample_lir = []
+        for s in range(num_samples):
+            b_tk_s = base_tk[s]            # [num_steps, num_layers, K]
+            o_tk_s = ours_tk[s]
+            b_ws_s = base_ws[s]            # [num_steps, num_layers, H_q, W]
+            o_ws_s = ours_ws[s]
+
+            # jaccard_topk wants [num_steps, num_layers, H_q, K]; add dummy H_q=1 dim.
+            j = M.jaccard_topk(o_tk_s.unsqueeze(2), b_tk_s.unsqueeze(2))   # [S, L, 1]
+            per_sample_jaccard.append(j)
+
+            # LIR proxy from window-score overlap (per step).
+            num_steps_s = min(b_ws_s.shape[0], o_ws_s.shape[0])
+            lir_s = torch.zeros(num_steps_s)
+            for t in range(num_steps_s):
+                bws = b_ws_s[t]            # [L, H, W]
+                ows = o_ws_s[t]
+                total = bws.sum()
+                if total > 0:
+                    minW = min(bws.shape[-1], ows.shape[-1])
+                    retained = ows[..., :minW].sum()
+                    lir_s[t] = (retained / total).clamp(0, 1)
+            per_sample_lir.append(lir_s)
+
+        # Stack and mean across samples. Each tensor has the same per-sample shape.
+        jaccard_stack = torch.stack(per_sample_jaccard, dim=0)   # [num_samples, S, L, 1]
+        jaccard = jaccard_stack.mean(dim=0)                       # [S, L, 1]
+        lir_stack = torch.stack(per_sample_lir, dim=0)            # [num_samples, S]
+        lir_proxy = lir_stack.mean(dim=0)                         # [S]
+
+        jaccard_per_layer = M.aggregate_per_layer(jaccard)        # [S, L]
+        jaccard_global = M.aggregate_global(jaccard)              # [S]
+        heterogeneity = M.final_step_heterogeneity(jaccard)       # [L]
+
         return {
             "jaccard": jaccard.numpy(),
             "jaccard_per_layer": jaccard_per_layer.numpy(),
             "jaccard_global": jaccard_global.numpy(),
             "heterogeneity": heterogeneity.numpy(),
             "lir_proxy": lir_proxy.numpy(),
-            "global_lir": lir_proxy.numpy(),  # alias
+            "global_lir": lir_proxy.numpy(),                      # alias
+            "num_samples": np.array([num_samples], dtype=np.int64),
+            "per_sample_jaccard_global": jaccard_stack.mean(dim=(2, 3)).numpy(),  # [num_samples, S]
+            "per_sample_lir_proxy": lir_stack.numpy(),            # [num_samples, S]
         }
 
     def _write(self, results: dict, base: dict, ours: dict, cfg: ExperimentConfig) -> Path:
@@ -129,16 +158,20 @@ class FaithfulnessRunner:
         if cfg.output_path:
             npz_path = Path(cfg.output_path)
         npz_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            str(npz_path),
-            jaccard=results["jaccard"],
-            jaccard_per_layer=results["jaccard_per_layer"],
-            jaccard_global=results["jaccard_global"],
-            heterogeneity=results["heterogeneity"],
-            lir_proxy=results["lir_proxy"],
-            global_lir=results["global_lir"],
-            metadata_json=np.array([json.dumps(meta)], dtype=object),
-        )
+        # Persist all results (including optional per-sample breakdowns) plus metadata.
+        save_arrays = {
+            "jaccard": results["jaccard"],
+            "jaccard_per_layer": results["jaccard_per_layer"],
+            "jaccard_global": results["jaccard_global"],
+            "heterogeneity": results["heterogeneity"],
+            "lir_proxy": results["lir_proxy"],
+            "global_lir": results["global_lir"],
+            "metadata_json": np.array([json.dumps(meta)], dtype=object),
+        }
+        for opt in ("num_samples", "per_sample_jaccard_global", "per_sample_lir_proxy"):
+            if opt in results:
+                save_arrays[opt] = results[opt]
+        np.savez_compressed(str(npz_path), **save_arrays)
         with open(npz_path.with_suffix(".meta.json"), "w") as f:
             json.dump(meta, f, indent=2, default=str)
         log.info("Saved faithfulness: %s", npz_path)

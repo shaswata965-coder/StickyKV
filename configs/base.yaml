@@ -29,6 +29,8 @@ data:
   article_id: 0
   prefill_len: 100
   gen_len: 50
+  num_samples: 1                       # global: how many articles to evaluate (parity runners)
+  max_tokens: null                     # global: prefill tokens per article; null = use prefill_len
 
 telemetry:
   track_scores: false                  # true only for research/parity runs; false for perf/longbench
