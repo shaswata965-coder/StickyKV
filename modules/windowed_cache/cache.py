@@ -55,7 +55,14 @@ class WindowedCache(_HFCacheBase):
         telemetry: Optional[Telemetry] = None,
     ) -> None:
         if isinstance(_HFCacheBase, type) and _HFCacheBase is not object:
-            super().__init__()
+            try:
+                super().__init__()
+            except (TypeError, ValueError):
+                # transformers >= 4.50 changed Cache.__init__ to require
+                # `layers` or `layer_class_to_replicate`. We manage our own
+                # per-layer state (self._states) and override the full Cache
+                # interface, so skipping the base init is safe.
+                pass
 
         self.config = config
         self.resolved = config.resolve(prefill_len, model_config, kv_dtype)
