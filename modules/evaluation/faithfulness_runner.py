@@ -96,6 +96,15 @@ class FaithfulnessRunner:
             base_tk = base_tk[..., :minK]
             ours_tk = ours_tk[..., :minK]
 
+        # Derive local-window count from ours metadata for LIR computation.
+        # local windows are never evicted, so they must be added to the
+        # evictable top-K when measuring how much of base's attention mass
+        # ours retains.
+        om = ours["metadata"]
+        ws_sz = int(om.get("window_size", 8))
+        lwr   = int(om.get("local_window_size_resolved", 0))
+        lnw   = max(0, lwr // ws_sz)          # number of local windows
+
         # Compute per-sample metrics, then mean across the sample axis.
         per_sample_jaccard = []
         per_sample_lir = []
@@ -103,23 +112,41 @@ class FaithfulnessRunner:
             b_tk_s = base_tk[s]            # [num_steps, num_layers, K]
             o_tk_s = ours_tk[s]
             b_ws_s = base_ws[s]            # [num_steps, num_layers, H_q, W]
-            o_ws_s = ours_ws[s]
 
             # jaccard_topk wants [num_steps, num_layers, H_q, K]; add dummy H_q=1 dim.
             j = M.jaccard_topk(o_tk_s.unsqueeze(2), b_tk_s.unsqueeze(2))   # [S, L, 1]
             per_sample_jaccard.append(j)
 
-            # LIR proxy from window-score overlap (per step).
-            num_steps_s = min(b_ws_s.shape[0], o_ws_s.shape[0])
+            # LIR: fraction of BASE attention mass that falls on positions
+            # ours retained.  Correct formula:
+            #   LIR = bws[:, :, ours_retained_orig_wins].sum() / bws.sum()
+            # where ours_retained_orig_wins = (top-K evictable, already in
+            # original-sequence space after the index-alignment fix) UNION
+            # (local windows = last lnw windows of the base sequence at that
+            # step, which ours never evicts).
+            # This uses BASE scores only — ours' redistributed attention mass
+            # is not involved, avoiding the post-eviction inflation artifact.
+            num_steps_s = b_ws_s.shape[0]
+            n_layers_s  = b_ws_s.shape[1]
             lir_s = torch.zeros(num_steps_s)
             for t in range(num_steps_s):
-                bws = b_ws_s[t]            # [L, H, W]
-                ows = o_ws_s[t]
-                total = bws.sum()
-                if total > 0:
-                    minW = min(bws.shape[-1], ows.shape[-1])
-                    retained = ows[..., :minW].sum()
-                    lir_s[t] = (retained / total).clamp(0, 1)
+                bws   = b_ws_s[t]          # [L, H, W_base]
+                W_base = bws.shape[-1]
+                total  = bws.sum()
+                if total <= 0:
+                    continue
+                # Local windows: last lnw indices of the current base sequence
+                lnw_t = min(lnw, W_base)
+                local_ids = torch.arange(W_base - lnw_t, W_base, dtype=torch.long)
+                retained_mass = torch.zeros(1)
+                for li in range(n_layers_s):
+                    # Evictable top-K for this layer in original-sequence space
+                    ev_ids = o_tk_s[t, li]                    # [K]
+                    ev_ids = ev_ids[ev_ids >= 0]              # strip -1 padding
+                    ev_ids = ev_ids[ev_ids < W_base]          # clamp to valid range
+                    all_ids = torch.unique(torch.cat([local_ids, ev_ids]))
+                    retained_mass += bws[li, :, all_ids].sum()
+                lir_s[t] = (retained_mass / total).clamp(0, 1)
             per_sample_lir.append(lir_s)
 
         # Stack and mean across samples. Each tensor has the same per-sample shape.
