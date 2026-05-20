@@ -1,15 +1,22 @@
 """Pretty-print faithfulness results (schema v2.0).
 
+Sections:
+  1. Run configuration
+  2. Jaccard similarity — global + per-layer (prefill / generation)
+  3. Master layer scorecard — all 5 distribution metrics side-by-side
+  4. Generation trend — each metric at prefill / Q1 / Q2 / Q3 / Q4 per layer
+  5. Layer rankings — top-3 / bottom-3 per metric
+  6. Head heterogeneity
+  7. Per-sample breakdown
+
 Usage (Kaggle cell):
     exec(open("scripts/print_faithfulness.py").read())
   or:
     %run scripts/print_faithfulness.py
 """
 from __future__ import annotations
-
 import json
 import numpy as np
-from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────
 NPZ_PATH = "/kaggle/working/outputs/faithfulness/faithfulness_results.npz"
@@ -20,191 +27,310 @@ data = np.load(NPZ_PATH, allow_pickle=True)
 jaccard_global    = data["jaccard_global"]       # [T]
 jaccard_per_layer = data["jaccard_per_layer"]    # [T, L]
 het               = data["heterogeneity"]        # [L]
+cos_sim    = data["cos_sim"]        # [T, L]
+pearson    = data["pearson"]        # [T, L]
+spearman   = data["spearman"]       # [T, L]
+kl         = data["kl_ours_base"]   # [T, L]
+mass_ratio = data["mass_ratio"]     # [T, L]
 
-# New distribution-comparison metrics — all [T, L]
-cos_sim     = data["cos_sim"]
-pearson     = data["pearson"]
-spearman    = data["spearman"]
-kl          = data["kl_ours_base"]
-mass_ratio  = data["mass_ratio"]
-
-num_steps  = jaccard_global.shape[0]
-num_layers = jaccard_per_layer.shape[1]
+T, L = jaccard_per_layer.shape
 
 meta = {}
 if "metadata_json" in data.files:
     meta = json.loads(str(data["metadata_json"][0]))
-prefill_len = meta.get("prefill_len", None)
-gen_len     = meta.get("gen_len", None)
 
 PREFILL_STEPS = 1
-GEN_START     = PREFILL_STEPS
-GEN_END       = num_steps
+GEN_START, GEN_END = PREFILL_STEPS, T
+N_GEN = GEN_END - GEN_START
 
-W = 76  # print width
+W = 96   # print width
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def _bar(v: float, lo: float = 0.0, hi: float = 1.0, width: int = 8) -> str:
+    """Filled bar proportional to v in [lo, hi]."""
+    frac = max(0.0, min(1.0, (v - lo) / (hi - lo + 1e-9)))
+    n = int(round(frac * width))
+    return "█" * n + "░" * (width - n)
+
+def _drift_arrow(delta: float, thr: float = 0.005) -> str:
+    """↑ / → / ↓ based on delta magnitude."""
+    if delta >  thr: return "↑"
+    if delta < -thr: return "↓"
+    return "→"
+
+def _gen_quartiles(arr_t: np.ndarray):
+    """Split a 1-D generation array into [Q1, Q2, Q3, Q4] means."""
+    if N_GEN == 0:
+        return [0.0, 0.0, 0.0, 0.0]
+    g = arr_t[GEN_START:GEN_END]
+    q = N_GEN // 4
+    if q == 0:
+        return [g.mean()] * 4
+    segs = [g[:q], g[q:2*q], g[2*q:3*q], g[3*q:]]
+    return [s.mean() for s in segs]
+
+def _hdr(title: str) -> None:
+    print()
+    print("┌" + "─" * (W - 2) + "┐")
+    print("│" + title.center(W - 2) + "│")
+    print("└" + "─" * (W - 2) + "┘")
+
+def _sep() -> None:
+    print("─" * W)
 
 # ══════════════════════════════════════════════════════════════════════
-# Header
+# 1. Configuration header
 # ══════════════════════════════════════════════════════════════════════
 print()
 print("═" * W)
 print("  FAITHFULNESS  RESULTS  SUMMARY".center(W))
 print("═" * W)
-
 if meta:
-    model  = meta.get("model_name", "—")
-    ws     = meta.get("window_size", "—")
-    sink   = meta.get("num_sink_tokens", "—")
-    local  = meta.get("local_window_size_resolved", "—")
-    topk   = meta.get("top_k_windows", "—")
-    budget = meta.get("cache_budget", "—")
-    schema = meta.get("schema_version", "?")
-    print(f"  Model          : {model}")
-    print(f"  Prefill tokens : {prefill_len}    Gen tokens: {gen_len}")
-    print(f"  Window size    : {ws}    Sink: {sink}    Local: {local}")
-    print(f"  Top-K windows  : {topk}    Budget: {budget}")
-    print(f"  Total steps    : {num_steps}  (1 prefill + {num_steps - 1} gen)"
-          f"    Layers: {num_layers}    Schema: v{schema}")
-print("─" * W)
-
-
-def _stats(arr: np.ndarray, label: str, indent: int = 2) -> None:
-    pad = " " * indent
-    print(f"{pad}{'Phase':<14} {'Mean':>8}  {'Min':>8}  {'Max':>8}  {'Std':>8}")
-    print(f"{pad}{'─'*14} {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
-    pre = arr[:PREFILL_STEPS]
-    gen = arr[GEN_START:GEN_END]
-    all_ = arr
-    if len(pre):
-        print(f"{pad}{'Prefill':<14} {pre.mean():>8.4f}  {pre.min():>8.4f}  {pre.max():>8.4f}  {pre.std():>8.4f}")
-    if len(gen):
-        print(f"{pad}{'Generation':<14} {gen.mean():>8.4f}  {gen.min():>8.4f}  {gen.max():>8.4f}  {gen.std():>8.4f}")
-    print(f"{pad}{'Overall':<14} {all_.mean():>8.4f}  {all_.min():>8.4f}  {all_.max():>8.4f}  {all_.std():>8.4f}")
+    print(f"  Model      : {meta.get('model_name','—')}")
+    print(f"  Prefill    : {meta.get('prefill_len','—')} tokens    "
+          f"Gen: {meta.get('gen_len','—')} tokens    "
+          f"Total steps: {T}  (1 prefill + {T-1} gen)    Layers: {L}")
+    print(f"  Window     : {meta.get('window_size','—')}    "
+          f"Sink: {meta.get('num_sink_tokens','—')}    "
+          f"Local: {meta.get('local_window_size_resolved','—')} tokens    "
+          f"Top-K: {meta.get('top_k_windows','—')}    "
+          f"Budget: {meta.get('cache_budget','—')}    "
+          f"Schema: v{meta.get('schema_version','?')}")
+print("═" * W)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. Jaccard
+# 2. Jaccard
 # ══════════════════════════════════════════════════════════════════════
-print()
-print("┌" + "─" * (W - 2) + "┐")
-print("│" + "  JACCARD  SIMILARITY  (Top-K Window Overlap)".center(W - 2) + "│")
-print("└" + "─" * (W - 2) + "┘")
-print()
-_stats(jaccard_global, "Jaccard")
+_hdr("  JACCARD SIMILARITY  —  Top-K Window Overlap  (higher = better)")
 
-# per-layer Jaccard
-jac_pre = jaccard_per_layer[:PREFILL_STEPS]
-jac_gen = jaccard_per_layer[GEN_START:GEN_END]
+jac_pre = jaccard_per_layer[:PREFILL_STEPS]         # [1, L]
+jac_gen = jaccard_per_layer[GEN_START:GEN_END]       # [N_GEN, L]
+
 print()
-print(f"  {'':>8}  ┌{'─ Prefill ─':─^18}┐  ┌{'─ Generation ─':─^18}┐  ┌{'─ Overall ─':─^18}┐")
-print(f"  {'Layer':>8}  {'Mean':>8}  {'Min':>6}      {'Mean':>8}  {'Min':>6}      {'Mean':>8}  {'Std':>6}")
-print(f"  {'─'*8}  {'─'*8}  {'─'*6}      {'─'*8}  {'─'*6}      {'─'*8}  {'─'*6}")
-for li in range(num_layers):
-    pre_v = jac_pre[:, li] if len(jac_pre) else np.array([0.0])
-    gen_v = jac_gen[:, li] if len(jac_gen) else np.array([0.0])
-    all_v = jaccard_per_layer[:, li]
-    bar = "█" * int(round(all_v.mean() * 8)) + "░" * (8 - int(round(all_v.mean() * 8)))
-    print(f"  {li:>8d}  {pre_v.mean():>8.4f}  {pre_v.min():>6.4f}  "
-          f"    {gen_v.mean():>8.4f}  {gen_v.min():>6.4f}  "
-          f"    {all_v.mean():>8.4f}  {all_v.std():>6.4f}  {bar}")
-print(f"  {'─'*8}  {'─'*8}  {'─'*6}      {'─'*8}  {'─'*6}      {'─'*8}  {'─'*6}")
-print(f"  {'avg':>8s}  {jac_pre.mean():>8.4f}  {jac_pre.min():>6.4f}  "
-      f"    {jac_gen.mean():>8.4f}  {jac_gen.min():>6.4f}  "
-      f"    {jaccard_per_layer.mean():>8.4f}  {jaccard_per_layer.std():>6.4f}")
+print(f"  Global  Prefill: {jac_pre.mean():.4f}   "
+      f"Gen: {jac_gen.mean():.4f}   "
+      f"Overall: {jaccard_global.mean():.4f}   "
+      f"Min: {jaccard_global.min():.4f}   Max: {jaccard_global.max():.4f}")
+
+print()
+qdesc = ["Q1", "Q2", "Q3", "Q4"]
+print(f"  {'Lyr':>4}  {'Pre':>6}  "
+      + "  ".join(f"{q:>6}" for q in qdesc)
+      + f"  {'Drift':>5}  {'Gen↓':>6}  {'Overall':>8}  Bar")
+print(f"  {'─'*4}  {'─'*6}  "
+      + "  ".join("─" * 6 for _ in qdesc)
+      + f"  {'─'*5}  {'─'*6}  {'─'*8}  {'─'*8}")
+
+jac_gen_q_all = np.array([_gen_quartiles(jaccard_per_layer[:, li]) for li in range(L)])
+for li in range(L):
+    pre_v = jac_pre[:, li].mean() if len(jac_pre) else 0.0
+    qs    = jac_gen_q_all[li]
+    drift = qs[-1] - qs[0]
+    gen_m = jac_gen[:, li].mean() if N_GEN else 0.0
+    ovr   = jaccard_per_layer[:, li].mean()
+    bar   = _bar(ovr, 0, 1)
+    print(f"  {li:>4d}  {pre_v:>6.4f}  "
+          + "  ".join(f"{q:>6.4f}" for q in qs)
+          + f"  {drift:>+5.3f}  {gen_m:>6.4f}  {ovr:>8.4f}  {bar}")
+
+print(f"  {'avg':>4s}  {jac_pre.mean():>6.4f}  "
+      + "  ".join(f"{jac_gen_q_all[:, i].mean():>6.4f}" for i in range(4))
+      + f"  {'—':>5}  {jac_gen.mean():>6.4f}  {jaccard_per_layer.mean():>8.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. Distribution Comparison Metrics (new, per [step, layer])
+# 3. Master layer scorecard — all 5 metrics, generation phase only
 # ══════════════════════════════════════════════════════════════════════
-print()
-print("┌" + "─" * (W - 2) + "┐")
-print("│" + "  DISTRIBUTION  COMPARISON  (Ours vs Base on Retained Windows)".center(W - 2) + "│")
-print("└" + "─" * (W - 2) + "┘")
-print()
-print("  Metrics are mean over layers, then split by Prefill vs Generation.\n")
+_hdr("  MASTER LAYER SCORECARD  —  Generation-phase means  (cos/pearson/spearman ↑,  kl ↓,  mass_ratio ≈1)")
 
-metrics = [
-    ("cos_sim",    cos_sim,    "Cosine Similarity     (↑ higher = better, max 1.0)"),
-    ("pearson",    pearson,    "Pearson Correlation   (↑ higher = better, max 1.0)"),
-    ("spearman",   spearman,   "Spearman Correlation  (↑ higher = better, max 1.0)"),
-    ("kl_ours_base", kl,       "KL Divergence (ours‖base)  (↓ lower = better, min 0)"),
-    ("mass_ratio", mass_ratio, "Mass Ratio (base/ours)     (≈1 = well-matched)"),
+gen_cos  = cos_sim[GEN_START:GEN_END]
+gen_prs  = pearson[GEN_START:GEN_END]
+gen_spm  = spearman[GEN_START:GEN_END]
+gen_kl   = kl[GEN_START:GEN_END]
+gen_mr   = mass_ratio[GEN_START:GEN_END]
+
+# Per-layer generation means
+cos_l  = gen_cos.mean(axis=0)   # [L]
+prs_l  = gen_prs.mean(axis=0)
+spm_l  = gen_spm.mean(axis=0)
+kl_l   = gen_kl.mean(axis=0)
+mr_l   = gen_mr.mean(axis=0)
+jac_l  = jac_gen.mean(axis=0) if N_GEN else jaccard_per_layer.mean(axis=0)
+
+# Composite rank: normalise each metric to 0-1 (higher=better) then average
+def _norm(v, invert=False):
+    lo, hi = v.min(), v.max()
+    n = (v - lo) / (hi - lo + 1e-9)
+    return 1 - n if invert else n
+
+norm_cos = _norm(cos_l)
+norm_prs = _norm(prs_l)
+norm_spm = _norm(spm_l)
+norm_kl  = _norm(kl_l,  invert=True)   # lower KL = better
+norm_mr  = _norm(-np.abs(mr_l - 1.0), invert=True)  # closer to 1 = better (already inverted)
+composite = (norm_cos + norm_prs + norm_spm + norm_kl + norm_mr + _norm(jac_l)) / 6
+
+print()
+print(f"  {'Lyr':>4}  {'Jac':>7}  {'CosSim':>7}  {'Pearson':>7}  "
+      f"{'Spearman':>8}  {'KL↓':>7}  {'MassRat':>7}  {'Score':>6}  Bar(score)")
+print(f"  {'─'*4}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*6}  {'─'*8}")
+
+for li in range(L):
+    sc = composite[li]
+    print(f"  {li:>4d}  {jac_l[li]:>7.4f}  {cos_l[li]:>7.4f}  {prs_l[li]:>7.4f}  "
+          f"{spm_l[li]:>8.4f}  {kl_l[li]:>7.4f}  {mr_l[li]:>7.4f}  "
+          f"{sc:>6.4f}  {_bar(sc, 0, 1)}")
+
+print(f"  {'─'*4}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*6}")
+print(f"  {'avg':>4s}  {jac_l.mean():>7.4f}  {cos_l.mean():>7.4f}  {prs_l.mean():>7.4f}  "
+      f"{spm_l.mean():>8.4f}  {kl_l.mean():>7.4f}  {mr_l.mean():>7.4f}  "
+      f"{composite.mean():>6.4f}")
+print(f"  {'std':>4s}  {jac_l.std():>7.4f}  {cos_l.std():>7.4f}  {prs_l.std():>7.4f}  "
+      f"{spm_l.std():>8.4f}  {kl_l.std():>7.4f}  {mr_l.std():>7.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4. Generation trend — prefill + Q1/Q2/Q3/Q4 per metric per layer
+# ══════════════════════════════════════════════════════════════════════
+metrics_def = [
+    ("Cosine Similarity",      cos_sim,    False, 0.0, 1.0,  "↑"),
+    ("Pearson Correlation",    pearson,    False, 0.0, 1.0,  "↑"),
+    ("Spearman Correlation",   spearman,   False, 0.0, 1.0,  "↑"),
+    ("KL Divergence (ours‖base)", kl,      True,  0.0, None, "↓"),
+    ("Mass Ratio (base/ours)", mass_ratio, False, 0.0, None, "≈1"),
 ]
 
-print(f"  {'Metric':<34}  {'Overall':>8}  {'Prefill':>8}  {'Gen':>8}  {'Std(gen)':>8}")
-print(f"  {'─'*34}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
-for key, arr, label in metrics:
-    # mean over layers → [T]
-    arr_l = arr.mean(axis=1)
-    pre   = arr_l[:PREFILL_STEPS]
-    gen   = arr_l[GEN_START:GEN_END]
-    print(f"  {label:<34}  {arr_l.mean():>8.4f}  "
-          f"{pre.mean() if len(pre) else 0:>8.4f}  "
-          f"{gen.mean() if len(gen) else 0:>8.4f}  "
-          f"{gen.std()  if len(gen) else 0:>8.4f}")
+for label, arr, invert_bar, bar_lo, bar_hi, direction in metrics_def:
+    _hdr(f"  {label.upper()}  {direction}  —  Prefill + Generation Quartiles per Layer")
 
-# Per-layer breakdown for each metric
-for key, arr, label in metrics:
+    # determine bar range from data
+    gen_arr = arr[GEN_START:GEN_END]
+    _bhi = bar_hi if bar_hi is not None else float(np.percentile(gen_arr, 95))
+    _blo = bar_lo
+
+    # per-layer quartile arrays [L, 4]
+    layer_qs = np.array([_gen_quartiles(arr[:, li]) for li in range(L)])
+
     print()
-    print(f"  ── {label}")
-    print(f"  {'Layer':>6}  {'Overall':>8}  {'Prefill':>8}  {'Gen mean':>8}  {'Gen std':>8}")
-    print(f"  {'─'*6}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}")
-    pre_l = arr[:PREFILL_STEPS]
-    gen_l = arr[GEN_START:GEN_END]
-    for li in range(num_layers):
-        a_li  = arr[:, li]
-        pre_v = pre_l[:, li].mean() if len(pre_l) else 0.0
-        gen_v = gen_l[:, li].mean() if len(gen_l) else 0.0
-        gen_s = gen_l[:, li].std()  if len(gen_l) else 0.0
-        print(f"  {li:>6d}  {a_li.mean():>8.4f}  {pre_v:>8.4f}  {gen_v:>8.4f}  {gen_s:>8.4f}")
-    print(f"  {'avg':>6s}  {arr.mean():>8.4f}  "
-          f"{pre_l.mean() if len(pre_l) else 0:>8.4f}  "
-          f"{gen_l.mean() if len(gen_l) else 0:>8.4f}  "
-          f"{gen_l.std()  if len(gen_l) else 0:>8.4f}")
+    print(f"  {'Lyr':>4}  {'Prefill':>8}  "
+          + "  ".join(f"{'Gen-'+q:>8}" for q in qdesc)
+          + f"  {'Drift':>6}  {'GenMean':>8}  Bar(gen)")
+    print(f"  {'─'*4}  {'─'*8}  "
+          + "  ".join("─" * 8 for _ in qdesc)
+          + f"  {'─'*6}  {'─'*8}  {'─'*8}")
+
+    for li in range(L):
+        pre_v = arr[:PREFILL_STEPS, li].mean() if PREFILL_STEPS else 0.0
+        qs    = layer_qs[li]                   # [4]
+        drift = qs[-1] - qs[0]
+        gen_m = gen_arr[:, li].mean()
+        arr_v = gen_m if not invert_bar else -gen_m
+        bar   = _bar(arr_v, -_bhi if invert_bar else _blo, 0.0 if invert_bar else _bhi)
+        arrow = _drift_arrow(drift if not invert_bar else -drift)
+        print(f"  {li:>4d}  {pre_v:>8.4f}  "
+              + "  ".join(f"{q:>8.4f}" for q in qs)
+              + f"  {drift:>+5.3f}{arrow}  {gen_m:>8.4f}  {bar}")
+
+    # averages row
+    pre_avg  = arr[:PREFILL_STEPS].mean()
+    qs_avg   = layer_qs.mean(axis=0)
+    drift_avg = qs_avg[-1] - qs_avg[0]
+    gen_avg  = gen_arr.mean()
+    print(f"  {'─'*4}  {'─'*8}  "
+          + "  ".join("─" * 8 for _ in qdesc)
+          + f"  {'─'*6}  {'─'*8}")
+    print(f"  {'avg':>4s}  {pre_avg:>8.4f}  "
+          + "  ".join(f"{q:>8.4f}" for q in qs_avg)
+          + f"  {drift_avg:>+5.3f}   {gen_avg:>8.4f}")
+
+    # layer standard deviation row
+    pre_std  = arr[:PREFILL_STEPS].std()
+    qs_std   = layer_qs.std(axis=0)
+    gen_std  = gen_arr.std()
+    print(f"  {'std':>4s}  {pre_std:>8.4f}  "
+          + "  ".join(f"{q:>8.4f}" for q in qs_std)
+          + f"  {'':>6}   {gen_std:>8.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. Head Heterogeneity
+# 5. Layer rankings — best/worst 3 per metric
 # ══════════════════════════════════════════════════════════════════════
+_hdr("  LAYER RANKINGS  —  Best and Worst 3 Layers per Metric  (generation phase)")
+
+rank_metrics = [
+    ("Jaccard",    jac_l,  False),
+    ("CosSim",     cos_l,  False),
+    ("Pearson",    prs_l,  False),
+    ("Spearman",   spm_l,  False),
+    ("KL",         kl_l,   True ),   # lower = better
+    ("MassRatio",  np.abs(mr_l - 1.0), True),  # |mr-1| lower = better
+    ("Composite",  composite, False),
+]
+
+K = min(3, L)
 print()
-print("┌" + "─" * (W - 2) + "┐")
-print("│" + "  HEAD  HETEROGENEITY  (Std across heads at final step)".center(W - 2) + "│")
-print("└" + "─" * (W - 2) + "┘")
+print(f"  {'Metric':<12}  "
+      f"{'Best-1':>8}  {'Best-2':>8}  {'Best-3':>8}    "
+      f"{'Worst-1':>8}  {'Worst-2':>8}  {'Worst-3':>8}")
+print(f"  {'─'*12}  {'─'*8}  {'─'*8}  {'─'*8}    {'─'*8}  {'─'*8}  {'─'*8}")
+
+for name, vals, lower_better in rank_metrics:
+    if lower_better:
+        order = np.argsort(vals)           # ascending → best first
+    else:
+        order = np.argsort(vals)[::-1]     # descending → best first
+    best  = order[:K]
+    worst = order[-K:][::-1]
+
+    def _fmt(idx): return f"L{idx}({vals[idx]:.3f})"
+    bstrs = [_fmt(i).rjust(8) for i in best]  + ["        "] * (K - len(best))
+    wstrs = [_fmt(i).rjust(8) for i in worst] + ["        "] * (K - len(worst))
+    print(f"  {name:<12}  {'  '.join(bstrs)}    {'  '.join(wstrs)}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 6. Head heterogeneity
+# ══════════════════════════════════════════════════════════════════════
+_hdr("  HEAD HETEROGENEITY  —  Std across heads at final step  (higher = heads disagree more)")
+
+het_max = het.argmax()
 print()
-het_max_layer = het.argmax()
-print(f"  Mean across layers : {het.mean():.4f}")
-print(f"  Most heterogeneous : layer {het_max_layer} (std = {het[het_max_layer]:.4f})")
+print(f"  Mean: {het.mean():.4f}    Max: {het[het_max]:.4f} at layer {het_max}"
+      f"    Min: {het.min():.4f} at layer {het.argmin()}")
 print()
 cols = 4
-rows = (num_layers + cols - 1) // cols
+rows = (L + cols - 1) // cols
 for r in range(rows):
     parts = []
     for c in range(cols):
         li = r + c * rows
-        if li < num_layers:
-            marker = " ◄" if li == het_max_layer else "  "
-            parts.append(f"  L{li:<3d} {het[li]:.4f}{marker}")
+        if li < L:
+            marker = " ◄MAX" if li == het_max else "     "
+            bar = _bar(het[li], 0, het.max())
+            parts.append(f"  L{li:<3d} {het[li]:.4f} {bar}{marker}")
     print("".join(parts))
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. Per-Sample Breakdown
+# 7. Per-sample breakdown
 # ══════════════════════════════════════════════════════════════════════
 if "per_sample_jaccard_global" in data.files:
-    psjg = data["per_sample_jaccard_global"]  # [S, T]
-    n_s  = psjg.shape[0]
+    psjg = data["per_sample_jaccard_global"]   # [S, T]
+    S_n  = psjg.shape[0]
+    _hdr(f"  PER-SAMPLE BREAKDOWN  ({S_n} sample{'s' if S_n != 1 else ''})")
     print()
-    print("┌" + "─" * (W - 2) + "┐")
-    print("│" + f"  PER-SAMPLE  BREAKDOWN  ({n_s} samples)".center(W - 2) + "│")
-    print("└" + "─" * (W - 2) + "┘")
-    print()
-    print(f"  {'Sample':>8}  {'Jac overall':>12}  {'Jac prefill':>12}  {'Jac gen':>10}")
-    print(f"  {'─'*8}  {'─'*12}  {'─'*12}  {'─'*10}")
-    for s in range(n_s):
-        sj = psjg[s]
-        print(f"  {s:>8d}  {sj.mean():>12.4f}  "
-              f"{sj[:PREFILL_STEPS].mean():>12.4f}  "
-              f"{sj[GEN_START:].mean() if sj.shape[0]>PREFILL_STEPS else 0:>10.4f}")
+    print(f"  {'Sample':>8}  {'Jac overall':>12}  {'Jac prefill':>12}  {'Jac gen':>10}  "
+          f"{'Jac drift':>10}")
+    print(f"  {'─'*8}  {'─'*12}  {'─'*12}  {'─'*10}  {'─'*10}")
+    for s in range(S_n):
+        sj    = psjg[s]
+        pre   = sj[:PREFILL_STEPS].mean()
+        gen   = sj[GEN_START:].mean() if T > PREFILL_STEPS else 0.0
+        drift = sj[-1] - sj[PREFILL_STEPS] if T > PREFILL_STEPS + 1 else 0.0
+        print(f"  {s:>8d}  {sj.mean():>12.4f}  {pre:>12.4f}  {gen:>10.4f}  "
+              f"  {drift:>+8.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -212,7 +338,7 @@ if "per_sample_jaccard_global" in data.files:
 # ══════════════════════════════════════════════════════════════════════
 print()
 print("═" * W)
-print(f"  Source: {NPZ_PATH}")
-print(f"  Arrays: {', '.join(data.files)}")
+print(f"  Source : {NPZ_PATH}")
+print(f"  Arrays : {', '.join(data.files)}")
 print("═" * W)
 print()
