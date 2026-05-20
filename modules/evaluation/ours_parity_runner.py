@@ -164,6 +164,8 @@ class OursParityRunner:
         samples_topk: List[np.ndarray] = []
         samples_ws: List[np.ndarray] = []
         samples_evict: List[np.ndarray] = []
+        samples_ret_ids: List[np.ndarray] = []     # [num_steps, n_layers, M] int64, -1 pad
+        samples_ret_scores: List[np.ndarray] = []  # [num_steps, n_layers, H_q, M] float16
 
         t0 = time.time()
 
@@ -192,6 +194,8 @@ class OursParityRunner:
             sample_gen_tokens = base_gen_tokens[sample_idx]   # [num_steps]
             acc_scores: List[Optional[Tensor]] = [None] * n_layers
             all_topk, all_ws, all_evict = [], [], []
+            all_ret_ids: List[np.ndarray] = []    # per step: [n_layers, M_step]
+            all_ret_scores: List[np.ndarray] = [] # per step: [n_layers, H_q, M_step]
             gen_kwargs: Dict[str, Any] = {}
             if cfg.cache.backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
@@ -227,54 +231,88 @@ class OursParityRunner:
                                     elif nS < oS:
                                         ts = torch.nn.functional.pad(ts, (0, oS-nS))
                                     acc_scores[li][..., :max(nS,oS)] += ts[..., :max(nS,oS)]
-                        step_tk, step_ws = [], []
+                        step_tk, step_ws, step_ret_ids, step_ret_scores = [], [], [], []
                         for li in range(n_layers):
                             cs = cache._states[li]
                             if cs.window_scores is not None:
-                                ws_v = cs.window_scores
+                                ws_v     = cs.window_scores
                                 orig_ids = cs.original_window_ids  # [W] or None
                             elif acc_scores[li] is not None:
-                                ac = acc_scores[li]
-                                ps = ac[..., ns:]
-                                Sp = ps.shape[-1]
+                                ac  = acc_scores[li]
+                                ps  = ac[..., ns:]
+                                Sp  = ps.shape[-1]
                                 rem = Sp % ws_sz
-                                if rem: ps = torch.nn.functional.pad(ps, (0, ws_sz-rem))
-                                W = ps.shape[-1] // ws_sz
-                                ws_v = ps.reshape(ps.shape[0], ps.shape[1], W, ws_sz).sum(-1)
+                                if rem: ps = torch.nn.functional.pad(ps, (0, ws_sz - rem))
+                                W_tmp = ps.shape[-1] // ws_sz
+                                ws_v     = ps.reshape(ps.shape[0], ps.shape[1], W_tmp, ws_sz).sum(-1)
                                 orig_ids = None
                             else:
                                 step_tk.append(np.zeros(min(tk, 1), dtype=np.int64))
                                 step_ws.append(np.zeros((1, 1), dtype=np.float16))
+                                step_ret_ids.append(np.zeros(0, dtype=np.int64))
+                                step_ret_scores.append(np.zeros((1, 0), dtype=np.float16))
                                 continue
-                            W = ws_v.shape[-1]
+
+                            dev = ws_v.device
+                            W   = ws_v.shape[-1]
                             lws = w.local_window_size
                             if isinstance(lws, float):
-                                Sp = max(W * ws_sz, 1)
-                                lt = math.ceil(lws * Sp)
-                                r2 = lt % ws_sz
+                                Sp  = max(W * ws_sz, 1)
+                                lt  = math.ceil(lws * Sp)
+                                r2  = lt % ws_sz
                                 if r2: lt += ws_sz - r2
                                 lnw = lt // ws_sz
                             else:
                                 lnw = lws // ws_sz
                             lnw = min(lnw, W)
-                            eW = W - lnw
+                            eW  = W - lnw
+
+                            # ── evictable top-K ──────────────────────────────
                             if eW > 0 and tk > 0:
-                                ev = ws_v[..., :eW].mean(dim=1)
-                                k = min(tk, eW)
-                                compact_idx = ev.topk(k, dim=-1).indices[0].cpu()
-                                # Translate compact post-eviction indices to original
-                                # sequence window positions so Jaccard comparison with
-                                # the base runner (which uses original indices) is valid.
-                                if orig_ids is not None:
-                                    orig_idx = orig_ids[compact_idx].cpu().numpy()
-                                else:
-                                    orig_idx = compact_idx.numpy()
-                                step_tk.append(orig_idx)
+                                ev           = ws_v[..., :eW].mean(dim=1)    # [B, eW]
+                                k            = min(tk, eW)
+                                compact_ev   = ev.topk(k, dim=-1).indices[0].cpu()  # [k]
+                                orig_ev      = (orig_ids[compact_ev.to(dev)].cpu()
+                                                if orig_ids is not None else compact_ev)
+                                step_tk.append(orig_ev.numpy())
                             else:
-                                step_tk.append(np.zeros(min(tk, max(W,1)), dtype=np.int64))
+                                compact_ev = torch.zeros(0, dtype=torch.long)
+                                orig_ev    = torch.zeros(0, dtype=torch.long)
+                                step_tk.append(np.zeros(min(tk, max(W, 1)), dtype=np.int64))
+
                             step_ws.append(ws_v[0].cpu().to(torch.float16).numpy())
+
+                            # ── local windows (always retained, compact eW..W-1) ─
+                            compact_loc = torch.arange(eW, W, dtype=torch.long, device=dev)
+                            orig_loc    = (orig_ids[compact_loc].cpu()
+                                           if orig_ids is not None else compact_loc.cpu())
+
+                            # ── all retained: evictable ∪ local, sort by original pos ─
+                            all_compact = torch.cat([compact_ev, compact_loc.cpu()])
+                            all_orig    = torch.cat([orig_ev.long(), orig_loc.long()])
+                            order       = torch.argsort(all_orig)
+                            ret_orig    = all_orig[order].numpy()               # [M]
+                            ret_compact = all_compact[order].to(dev)            # [M]
+
+                            # ours' scores for retained windows: [H_q, M]
+                            ret_sc = ws_v[0, :, ret_compact].cpu().to(torch.float16).numpy()
+                            step_ret_ids.append(ret_orig)
+                            step_ret_scores.append(ret_sc)
+
+                        # ── stack per-layer results for this step ─────────────
                         all_topk.append(np.stack(step_tk, 0))
                         all_ws.append(np.stack(step_ws, 0))
+
+                        # pad retained arrays across layers (M and H_q may differ)
+                        mM_s = max(len(x) for x in step_ret_ids)
+                        mH_s = max(x.shape[0] for x in step_ret_scores)
+                        p_rid = [np.pad(x, [(0, mM_s - len(x))], constant_values=-1)
+                                 for x in step_ret_ids]
+                        p_rsc = [np.pad(x, [(0, mH_s - x.shape[0]),
+                                            (0, mM_s - x.shape[1])])
+                                 for x in step_ret_scores]
+                        all_ret_ids.append(np.stack(p_rid, 0))    # [n_layers, mM_s]
+                        all_ret_scores.append(np.stack(p_rsc, 0)) # [n_layers, mH_s, mM_s]
                         if (step+1) % 100 == 0:
                             log.info("  Step %d/%d", step+1, gen_len)
             finally:
@@ -292,18 +330,33 @@ class OursParityRunner:
             samples_ws.append(np.stack(pws, 0))
             samples_evict.append(np.array(all_evict, dtype=bool))
 
+            # Pad retained arrays across steps (M and H_q may grow over time)
+            mM2  = max(x.shape[-1]  for x in all_ret_ids)
+            mH2  = max(x.shape[-2]  for x in all_ret_scores)
+            prid = [np.pad(x, [(0,0),(0, mM2 - x.shape[-1])],   constant_values=-1)
+                    if x.shape[-1] < mM2 else x for x in all_ret_ids]
+            prsc = [np.pad(x, [(0,0),(0, mH2 - x.shape[-2]),(0, mM2 - x.shape[-1])])
+                    if (x.shape[-2] < mH2 or x.shape[-1] < mM2) else x
+                    for x in all_ret_scores]
+            samples_ret_ids.append(np.stack(prid, 0))    # [num_steps, n_layers, mM2]
+            samples_ret_scores.append(np.stack(prsc, 0)) # [num_steps, n_layers, mH2, mM2]
+
             # Memory hygiene: free per-sample cache, hooks, and tensors before next sample.
             del cache, cache_config, acc_scores, all_topk, all_ws, all_evict, tokens
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             import gc as _gc; _gc.collect()
 
-        # Align K, W, H_q across samples (could differ if eviction trajectories diverged)
-        max_K = max(x.shape[-1] for x in samples_topk)
-        max_W = max(x.shape[-1] for x in samples_ws)
-        max_H = max(x.shape[-2] for x in samples_ws)
+        # Align K, W, H_q, M across samples (could differ if eviction trajectories diverged)
+        max_K  = max(x.shape[-1] for x in samples_topk)
+        max_W  = max(x.shape[-1] for x in samples_ws)
+        max_H  = max(x.shape[-2] for x in samples_ws)
+        max_M  = max(x.shape[-1] for x in samples_ret_ids)
+        max_Hr = max(x.shape[-2] for x in samples_ret_scores)
         aligned_topk, aligned_ws = [], []
-        for tkarr, wsarr in zip(samples_topk, samples_ws):
+        aligned_ret_ids, aligned_ret_scores = [], []
+        for tkarr, wsarr, ridarr, rscarr in zip(
+                samples_topk, samples_ws, samples_ret_ids, samples_ret_scores):
             if tkarr.shape[-1] < max_K:
                 tkarr = np.pad(tkarr, [(0,0),(0,0),(0, max_K - tkarr.shape[-1])],
                                constant_values=-1)
@@ -311,12 +364,23 @@ class OursParityRunner:
                 wsarr = np.pad(wsarr, [(0,0),(0,0),(0, max_H - wsarr.shape[-2]),(0,0)])
             if wsarr.shape[-1] < max_W:
                 wsarr = np.pad(wsarr, [(0,0),(0,0),(0,0),(0, max_W - wsarr.shape[-1])])
+            if ridarr.shape[-1] < max_M:
+                ridarr = np.pad(ridarr, [(0,0),(0,0),(0, max_M - ridarr.shape[-1])],
+                                constant_values=-1)
+            if rscarr.shape[-2] < max_Hr:
+                rscarr = np.pad(rscarr, [(0,0),(0,0),(0, max_Hr - rscarr.shape[-2]),(0,0)])
+            if rscarr.shape[-1] < max_M:
+                rscarr = np.pad(rscarr, [(0,0),(0,0),(0,0),(0, max_M - rscarr.shape[-1])])
             aligned_topk.append(tkarr)
             aligned_ws.append(wsarr)
+            aligned_ret_ids.append(ridarr)
+            aligned_ret_scores.append(rscarr)
 
-        top_window_indices = np.stack(aligned_topk, 0)
-        window_scores = np.stack(aligned_ws, 0)
-        eviction_step_mask = np.stack(samples_evict, 0)
+        top_window_indices     = np.stack(aligned_topk, 0)
+        window_scores          = np.stack(aligned_ws, 0)
+        eviction_step_mask     = np.stack(samples_evict, 0)
+        retained_window_ids    = np.stack(aligned_ret_ids, 0)    # [S, T, L, M]
+        retained_window_scores = np.stack(aligned_ret_scores, 0) # [S, T, L, H, M]
 
         elapsed = time.time() - t0
         log.info("Done: %d samples, %.1fs", num_samples, elapsed)
@@ -370,6 +434,8 @@ class OursParityRunner:
             window_scores=window_scores,
             eviction_step_mask=eviction_step_mask,
             generated_tokens=base_gen_tokens,           # carry-through from base [num_samples, num_steps]
+            retained_window_ids=retained_window_ids,    # [S, T, L, M] original IDs, -1 pad
+            retained_window_scores=retained_window_scores,  # [S, T, L, H, M] ours' scores
             metadata_json=np.array([json.dumps(meta)], dtype=object),
         )
         with open(npz.with_suffix(".meta.json"), "w") as f:
