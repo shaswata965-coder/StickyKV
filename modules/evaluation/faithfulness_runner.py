@@ -84,14 +84,17 @@ class FaithfulnessRunner:
 
         num_samples = min(base_tk.shape[0], ours_tk.shape[0])
 
-        # Align K across base/ours so jaccard_topk gets matching shapes
+        # Align K across base/ours by truncating to the smaller side.
+        # Padding the smaller with -1 was wrong: -1 slots never match any
+        # valid index, inflating the Jaccard denominator and deflating the
+        # score.  Truncating base to min(bK, oK) means we ask "do the
+        # windows ours kept appear in base's top-minK?" — the correct
+        # question given that ours has a bounded cache budget.
         bK, oK = base_tk.shape[-1], ours_tk.shape[-1]
         if bK != oK:
-            maxK = max(bK, oK)
-            if bK < maxK:
-                base_tk = torch.nn.functional.pad(base_tk, (0, maxK-bK), value=-1)
-            if oK < maxK:
-                ours_tk = torch.nn.functional.pad(ours_tk, (0, maxK-oK), value=-1)
+            minK = min(bK, oK)
+            base_tk = base_tk[..., :minK]
+            ours_tk = ours_tk[..., :minK]
 
         # Compute per-sample metrics, then mean across the sample axis.
         per_sample_jaccard = []

@@ -25,15 +25,24 @@ class CacheState:
         Shape ``[T]``, int64.  Rebased to ``arange(T)`` after eviction.
     window_scores : Tensor
         Shape ``[B, H_q, W]``.  Running cumulative per-window scores.
+    original_window_ids : Tensor
+        Shape ``[W]``, int64.  Maps each surviving compact window index to
+        its original sequence window index (0-based after sinks).  Stays
+        identity before the first eviction; gathered alongside
+        ``window_scores`` at every subsequent eviction so that compact
+        top-K indices can be translated back to original positions for
+        faithful Jaccard comparison.
     """
 
-    __slots__ = ("key_states", "value_states", "position_ids", "window_scores")
+    __slots__ = ("key_states", "value_states", "position_ids",
+                 "window_scores", "original_window_ids")
 
     def __init__(self) -> None:
         self.key_states: Optional[Tensor] = None
         self.value_states: Optional[Tensor] = None
         self.position_ids: Optional[Tensor] = None
         self.window_scores: Optional[Tensor] = None
+        self.original_window_ids: Optional[Tensor] = None
 
     # -----------------------------------------------------------------
     # seq_length property

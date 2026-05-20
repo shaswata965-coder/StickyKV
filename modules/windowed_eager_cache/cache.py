@@ -155,6 +155,11 @@ class WindowedCache(_HFCacheBase):
         if new_window_scores is not None:
             if state.window_scores is None:
                 state.window_scores = new_window_scores.clone()
+                # Initialize identity mapping: compact index i == original window i
+                W = new_window_scores.shape[-1]
+                state.original_window_ids = torch.arange(
+                    W, device=new_window_scores.device, dtype=torch.long
+                )
             else:
                 # Handle size mismatch: new scores may cover more windows
                 W_old = state.window_scores.shape[-1]
@@ -170,6 +175,16 @@ class WindowedCache(_HFCacheBase):
                     state.window_scores = torch.cat(
                         [state.window_scores, pad], dim=-1
                     )
+                    # Extend original_window_ids for new windows
+                    if state.original_window_ids is not None:
+                        extra = torch.arange(
+                            W_old, W_new,
+                            device=state.original_window_ids.device,
+                            dtype=torch.long,
+                        )
+                        state.original_window_ids = torch.cat(
+                            [state.original_window_ids, extra]
+                        )
                 accumulate(state.window_scores, new_window_scores)
 
         # 4. Eviction
@@ -208,6 +223,12 @@ class WindowedCache(_HFCacheBase):
             state.window_scores = torch.gather(
                 state.window_scores, dim=-1, index=idx_w
             ).contiguous()
+
+            # f. Keep original_window_ids in sync with the surviving windows
+            if state.original_window_ids is not None:
+                state.original_window_ids = state.original_window_ids[
+                    retained_window_idx[0]
+                ].contiguous()
 
             # Update policy
             policy.set_total_after_compaction(state.seq_length)

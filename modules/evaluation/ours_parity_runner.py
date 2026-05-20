@@ -232,6 +232,7 @@ class OursParityRunner:
                             cs = cache._states[li]
                             if cs.window_scores is not None:
                                 ws_v = cs.window_scores
+                                orig_ids = cs.original_window_ids  # [W] or None
                             elif acc_scores[li] is not None:
                                 ac = acc_scores[li]
                                 ps = ac[..., ns:]
@@ -240,6 +241,7 @@ class OursParityRunner:
                                 if rem: ps = torch.nn.functional.pad(ps, (0, ws_sz-rem))
                                 W = ps.shape[-1] // ws_sz
                                 ws_v = ps.reshape(ps.shape[0], ps.shape[1], W, ws_sz).sum(-1)
+                                orig_ids = None
                             else:
                                 step_tk.append(np.zeros(min(tk, 1), dtype=np.int64))
                                 step_ws.append(np.zeros((1, 1), dtype=np.float16))
@@ -259,7 +261,15 @@ class OursParityRunner:
                             if eW > 0 and tk > 0:
                                 ev = ws_v[..., :eW].mean(dim=1)
                                 k = min(tk, eW)
-                                step_tk.append(ev.topk(k, dim=-1).indices[0].cpu().numpy())
+                                compact_idx = ev.topk(k, dim=-1).indices[0].cpu()
+                                # Translate compact post-eviction indices to original
+                                # sequence window positions so Jaccard comparison with
+                                # the base runner (which uses original indices) is valid.
+                                if orig_ids is not None:
+                                    orig_idx = orig_ids[compact_idx].cpu().numpy()
+                                else:
+                                    orig_idx = compact_idx.numpy()
+                                step_tk.append(orig_idx)
                             else:
                                 step_tk.append(np.zeros(min(tk, max(W,1)), dtype=np.int64))
                             step_ws.append(ws_v[0].cpu().to(torch.float16).numpy())
