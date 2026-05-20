@@ -110,7 +110,6 @@ class FaithfulnessRunner:
         # Compute per-sample metrics, then mean across the sample axis.
         per_sample_jaccard = []
         per_sample_lir = []
-        _diag_printed = False
         for s in range(num_samples):
             b_tk_s = base_tk[s]            # [num_steps, num_layers, K]
             o_tk_s = ours_tk[s]
@@ -158,26 +157,21 @@ class FaithfulnessRunner:
                     all_ids = torch.unique(torch.cat([local_ids, ev_ids]))
                     retained_mass += bws[li, :, all_ids].sum()
                 lir_s[t] = (retained_mass / total).clamp(0, 1)
-                # Diagnostic at three representative steps for sample 0
-                diag_steps = {0, num_steps_s // 4, num_steps_s // 2,
-                               3 * num_steps_s // 4, num_steps_s - 1}
-                if s == 0 and t in diag_steps:
-                    n_retained    = len(all_ids)
-                    all_valid_mass = bws[:, :, :W_actual].sum().item()
-                    ret_mass_v    = retained_mass.item()
-                    uniform_lir   = n_retained / W_actual if W_actual > 0 else 0.0
-                    log.info(
-                        "[LIR diag] s=%d t=%d/%d  W_actual=%d lnw_t=%d "
-                        "n_local=%d n_ev_ids=%d n_all_ids=%d  "
-                        "ret_mass=%.4f total=%.4f all_valid=%.4f  "
-                        "lir=%.4f  uniform_lir=%.4f  ev_ids[:5]=%s",
-                        s, t, num_steps_s - 1,
-                        W_actual, lnw_t,
-                        len(local_ids), len(ev_ids), n_retained,
-                        ret_mass_v, total.item(), all_valid_mass,
-                        lir_s[t].item(), uniform_lir,
-                        ev_ids[:5].tolist(),
-                    )
+                # Debug diagnostics: lir vs uniform_lir (= n_retained/W_actual)
+                # shows how much above the flat-attention baseline H2O is.
+                # Enabled only when DEBUG logging is active to keep INFO clean.
+                if log.isEnabledFor(10) and s == 0:   # 10 == logging.DEBUG
+                    diag_steps = {0, num_steps_s // 4, num_steps_s // 2,
+                                   3 * num_steps_s // 4, num_steps_s - 1}
+                    if t in diag_steps:
+                        uniform_lir = len(all_ids) / W_actual if W_actual > 0 else 0.0
+                        log.debug(
+                            "[LIR diag] t=%d/%d W_actual=%d n_all_ids=%d "
+                            "lir=%.4f uniform_lir=%.4f lift=%.2fx",
+                            t, num_steps_s - 1, W_actual, len(all_ids),
+                            lir_s[t].item(), uniform_lir,
+                            lir_s[t].item() / uniform_lir if uniform_lir > 0 else 0,
+                        )
             per_sample_lir.append(lir_s)
 
         # Stack and mean across samples. Each tensor has the same per-sample shape.
