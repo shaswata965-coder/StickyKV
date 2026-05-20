@@ -4,7 +4,7 @@ Reads both base and ours npz files. Computes LIR, missed mass, inverse KL,
 global LIR. No model loaded — pure tensor ops via utils/metrics.py.
 """
 from __future__ import annotations
-import json, time
+import json, math, time
 from pathlib import Path
 from typing import Any, Dict
 import numpy as np
@@ -96,14 +96,16 @@ class FaithfulnessRunner:
             base_tk = base_tk[..., :minK]
             ours_tk = ours_tk[..., :minK]
 
-        # Derive local-window count from ours metadata for LIR computation.
+        # Derive parameters needed for per-step LIR computation.
         # local windows are never evicted, so they must be added to the
         # evictable top-K when measuring how much of base's attention mass
         # ours retains.
-        om = ours["metadata"]
-        ws_sz = int(om.get("window_size", 8))
-        lwr   = int(om.get("local_window_size_resolved", 0))
-        lnw   = max(0, lwr // ws_sz)          # number of local windows
+        om          = ours["metadata"]
+        ws_sz       = int(om.get("window_size", 8))
+        lwr         = int(om.get("local_window_size_resolved", 0))
+        lnw_max     = max(0, lwr // ws_sz)    # local window count (end-of-run upper bound)
+        prefill_len = int(om.get("prefill_len", 0))
+        ns          = int(om.get("num_sink_tokens", 0))
 
         # Compute per-sample metrics, then mean across the sample axis.
         per_sample_jaccard = []
@@ -128,22 +130,30 @@ class FaithfulnessRunner:
             # is not involved, avoiding the post-eviction inflation artifact.
             num_steps_s = b_ws_s.shape[0]
             n_layers_s  = b_ws_s.shape[1]
+            W_padded    = b_ws_s.shape[-1]   # padded max width — do NOT use for indexing
             lir_s = torch.zeros(num_steps_s)
             for t in range(num_steps_s):
-                bws   = b_ws_s[t]          # [L, H, W_base]
-                W_base = bws.shape[-1]
+                bws   = b_ws_s[t]          # [L, H, W_padded] — trailing cols are zero
                 total  = bws.sum()
                 if total <= 0:
                     continue
-                # Local windows: last lnw indices of the current base sequence
-                lnw_t = min(lnw, W_base)
-                local_ids = torch.arange(W_base - lnw_t, W_base, dtype=torch.long)
+                # Actual window count at step t: base adds one token per step
+                # starting from prefill_len tokens at step 0.
+                # base_parity_runner uses ceil so we match that here.
+                Sp_t     = max(1, prefill_len + t - ns)
+                W_actual = min(math.ceil(Sp_t / ws_sz), W_padded)
+                # Local windows = last lnw_t of the VALID portion.
+                # bws.shape[-1] is W_padded (zero-filled beyond W_actual), so
+                # using it for local_ids would point into zero-padding for most
+                # steps and contribute nothing — hence the collapsed LIR.
+                lnw_t     = min(lnw_max, W_actual)
+                local_ids = torch.arange(W_actual - lnw_t, W_actual, dtype=torch.long)
                 retained_mass = torch.zeros(1)
                 for li in range(n_layers_s):
                     # Evictable top-K for this layer in original-sequence space
                     ev_ids = o_tk_s[t, li]                    # [K]
                     ev_ids = ev_ids[ev_ids >= 0]              # strip -1 padding
-                    ev_ids = ev_ids[ev_ids < W_base]          # clamp to valid range
+                    ev_ids = ev_ids[ev_ids < W_actual]        # clamp to valid range
                     all_ids = torch.unique(torch.cat([local_ids, ev_ids]))
                     retained_mass += bws[li, :, all_ids].sum()
                 lir_s[t] = (retained_mass / total).clamp(0, 1)
