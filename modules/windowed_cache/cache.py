@@ -77,7 +77,6 @@ class WindowedCache(_HFCacheBase):
         ]
         self._generation_step: List[int] = [0] * num_layers
         self._prefill_done: List[bool] = [False] * num_layers
-        self._num_q_heads: Optional[int] = None
 
         # Shared scratch for cache_kwargs communication with hooks
         self.cache_kwargs: Dict[int, Dict[str, Any]] = {
@@ -136,14 +135,6 @@ class WindowedCache(_HFCacheBase):
             policy.initialize_after_prefill(state.seq_length)
             self._prefill_done[layer_idx] = True
 
-        # Infer H_q from window_scores shape if available
-        if self._num_q_heads is None:
-            merged_kwargs = cache_kwargs or {}
-            merged_kwargs.update(self.cache_kwargs.get(layer_idx, {}))
-            ws = merged_kwargs.get("window_scores")
-            if ws is not None:
-                self._num_q_heads = ws.shape[1]
-
         # 2. Pull pre-computed window scores
         merged_kwargs = {}
         if cache_kwargs is not None:
@@ -189,10 +180,7 @@ class WindowedCache(_HFCacheBase):
 
         # 4. Eviction
         step = self._generation_step[layer_idx]
-        should_evict = (
-            (is_prefill and state.window_scores is not None)
-            or (not is_prefill and policy.should_evict(step))
-        )
+        should_evict = not is_prefill and policy.should_evict(step)
 
         if should_evict and state.window_scores is not None:
             B = state.key_states.shape[0]

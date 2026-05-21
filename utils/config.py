@@ -284,19 +284,6 @@ class WindowConfig:
 
 
 @dataclass
-class PerfConfigEntry:
-    """A single perf-benchmark configuration."""
-
-    name: str = ""
-    cache_backend: str = "dynamic"
-    attn_implementation: str = "eager"
-    cache_package: Optional[str] = None
-    cache_budget: Optional[float] = None
-    install_hooks_for_measurement: bool = False
-    requires_flash_attn: bool = False
-
-
-@dataclass
 class PerfConfig:
     """Performance benchmark configuration (Suite C)."""
 

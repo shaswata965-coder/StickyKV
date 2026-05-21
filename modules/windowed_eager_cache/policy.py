@@ -32,7 +32,6 @@ class EvictionPolicy:
         self.local_windows: int = resolved.local_tokens // resolved.window_size
         self.top_k_windows: int = resolved.top_k_windows
         self.total_tokens: int = 0
-        self._generation_step: int = 0
 
     # -----------------------------------------------------------------
     # State bookkeeping
@@ -45,11 +44,6 @@ class EvictionPolicy:
     def extend_total_after_append(self, n_new: int) -> None:
         """Update total token count after appending *n_new* tokens."""
         self.total_tokens += n_new
-
-    def slide_local_window(self) -> None:
-        """Advance the local window boundary after a generation step."""
-        # Region boundaries are recalculated on-the-fly from total_tokens
-        pass
 
     def set_total_after_compaction(self, new_total: int) -> None:
         """Update state after eviction compaction."""
@@ -213,18 +207,3 @@ class EvictionPolicy:
         all_idx = torch.gather(all_idx, 1, order)[:, :min_valid]
 
         return all_idx
-
-    # -----------------------------------------------------------------
-    # Convenience: combined
-    # -----------------------------------------------------------------
-
-    def compute_retain_token_indices(
-        self, window_scores: Tensor
-    ) -> Tensor:
-        """Convenience: ``expand_to_token_indices(compute_retain_window_indices(...))``.
-
-        The cache **must** use the two-step form so it can also gather
-        ``state.window_scores`` by ``retained_window_idx``.
-        """
-        retained_win = self.compute_retain_window_indices(window_scores)
-        return self.expand_to_token_indices(retained_win)
