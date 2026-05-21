@@ -1,44 +1,50 @@
-"""Score hooks for the flash-attn-2 backend — KVPress-style monkey-patch.
+"""Score hooks for the flash-attn-2 backend — auxiliary-SDPA forward hook.
 
-Flash-attention-2 does not materialize the full attention matrix, so scores
-cannot be read from the real forward pass.  Instead, we:
-1. Monkey-patch each attention module's ``forward`` to capture post-RoPE
-   ``query_states`` and ``key_states`` inside the forward.
-2. Register a post-forward hook that runs an auxiliary SDPA pass on the
-   captured (q, k) to produce explicit attention weights.
-3. Score those weights via :func:`scorer.compute_window_scores` and push the
-   result into ``cache.cache_kwargs[layer_idx]["window_scores"]``.
+Flash-attention-2 never materializes the attention matrix, so per-key
+importance scores cannot be read from the real forward pass.  Instead, a
+``forward_hook`` on each attention module:
+
+1. Recomputes the post-RoPE query states from the layer's own inputs
+   (``hidden_states`` + ``position_embeddings``) — one extra ``q_proj``
+   matmul, cheap relative to attention itself.
+2. Reads the post-RoPE keys straight from the cache — they were appended by
+   ``WindowedCache.update`` earlier in the same forward pass.
+3. Runs an auxiliary SDPA pass over (q, k) to produce explicit attention
+   weights.  Multi-row (prefill) passes are causally masked so a query row
+   never attends to keys ahead of it.
+4. Scores the weights via :func:`scorer.compute_window_scores` and writes
+   the result to ``cache.cache_kwargs[layer_idx]["window_scores"]``.
 
 Scoring policy: H2O-style cumulative.  Every query row in the current
 forward pass contributes to the per-key score; the cache's ``update()``
-then accumulates those per-step scores into ``state.window_scores``
-across steps.  There is no observation window.
+then accumulates the per-step scores into ``state.window_scores``.  There
+is no observation window.
 
-Cost: ``O(T × N)`` per layer per scoring step — where T is the current
-forward pass's query length (prefill_len at step 0, 1 thereafter).
+Cost: the prefill auxiliary SDPA is ``O(N²)`` — the same order as the real
+attention — and each generation step is ``O(S)``.  Neither is a bottleneck.
 """
 
 from __future__ import annotations
 
-import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 from .scorer import compute_window_scores
 
 try:
     from transformers.models.llama.modeling_llama import (
         LlamaAttention,
+        apply_rotary_pos_emb,
         repeat_kv,
     )
 except ImportError:
     LlamaAttention = None  # type: ignore[assignment,misc]
+    apply_rotary_pos_emb = None  # type: ignore[assignment]
     repeat_kv = None  # type: ignore[assignment]
 
 try:
@@ -57,6 +63,17 @@ def _get_attn_classes() -> Tuple:
     return tuple(classes)
 
 
+def _extract_arg(
+    args: Tuple, kwargs: Dict[str, Any], name: str, pos: int
+) -> Optional[Any]:
+    """Pull a forward argument by keyword name, falling back to position."""
+    if name in kwargs:
+        return kwargs[name]
+    if len(args) > pos:
+        return args[pos]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # HookHandles — idempotent removal
 # ---------------------------------------------------------------------------
@@ -64,30 +81,18 @@ def _get_attn_classes() -> Tuple:
 
 @dataclass
 class HookHandles:
-    """Manages installed hooks with idempotent ``remove()``."""
+    """Manages installed forward hooks with idempotent ``remove()``."""
 
     _hook_handles: List[Any] = field(default_factory=list)
-    _patched_modules: List[Tuple[nn.Module, Callable]] = field(
-        default_factory=list
-    )
     _removed: bool = False
 
     def remove(self) -> None:
-        """Remove all hooks and restore original forwards.  Idempotent."""
+        """Remove all hooks.  Idempotent."""
         if self._removed:
             return
         for handle in self._hook_handles:
             handle.remove()
-        for module, original_forward in self._patched_modules:
-            module.forward = original_forward
-            if hasattr(module, "_captured_q"):
-                del module._captured_q
-            if hasattr(module, "_captured_k"):
-                del module._captured_k
-            if hasattr(module, "_original_forward"):
-                del module._original_forward
         self._hook_handles.clear()
-        self._patched_modules.clear()
         self._removed = True
 
 
@@ -103,12 +108,13 @@ def install_score_hooks(
 ) -> HookHandles:
     """Install score-extraction hooks on all attention modules.
 
-    For each ``LlamaAttention`` / ``Qwen2Attention`` module:
-    1. Replace ``module.forward`` with a wrapper that captures post-RoPE
-       ``query_states`` and ``key_states``.
-    2. Register a post-forward hook that runs the auxiliary SDPA score pass
-       across **all** query rows of the current step (H2O-style cumulative
-       scoring — no observation-window truncation).
+    For each ``LlamaAttention`` / ``Qwen2Attention`` module, registers a
+    ``forward_hook`` (with kwargs) that recomputes the post-RoPE query from
+    the layer inputs, runs a causally-masked auxiliary SDPA against the
+    cached keys, and reduces the result to per-window scores.
+
+    Scoring uses every query row in the current forward pass (H2O-style
+    cumulative); the cache accumulates the per-step scores across steps.
 
     Parameters
     ----------
@@ -133,92 +139,119 @@ def install_score_hooks(
             stacklevel=2,
         )
         return handles
+    if apply_rotary_pos_emb is None or repeat_kv is None:
+        warnings.warn(
+            "transformers RoPE/GQA helpers unavailable — flash score hooks "
+            "not installed; eviction would degrade to sink+local only.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return handles
 
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
 
-    # Get H_q and head_dim from model config
-    model_config = model.config
-    num_q_heads = getattr(model_config, "num_attention_heads", 32)
-    num_kv_heads = getattr(
-        model_config, "num_key_value_heads", num_q_heads
-    )
-    head_dim = getattr(model_config, "head_dim", None)
-    if head_dim is None:
-        head_dim = getattr(model_config, "hidden_size", 4096) // num_q_heads
-    num_groups = num_q_heads // num_kv_heads
-
-    # Discover attention modules and assign layer indices
+    # Discover attention modules and assign layer indices in module order.
     layer_idx_map: Dict[int, int] = {}
     layer_idx = 0
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         if isinstance(module, attn_classes):
             layer_idx_map[id(module)] = layer_idx
             layer_idx += 1
 
-    # Install monkey-patch + hook for each attention module
-    for name, module in model.named_modules():
+    warned_once = [False]
+
+    for _name, module in model.named_modules():
         if not isinstance(module, attn_classes):
             continue
 
         this_layer_idx = layer_idx_map[id(module)]
 
-        # Save original forward
-        original_forward = module.forward
-        module._original_forward = original_forward
-
-        def make_patched_forward(mod, orig_fwd):
-            def patched_forward(*args, **kwargs):
-                result = orig_fwd(*args, **kwargs)
-                return result
-            return patched_forward
-
-        module.forward = make_patched_forward(module, original_forward)
-        handles._patched_modules.append((module, original_forward))
-
-        # Post-forward hook for scoring
-        def make_hook(mod, lidx):
-            def score_hook(module, input, output):
-                # Captured post-RoPE q/k from the patched forward
-                q_rope = getattr(module, "_captured_q", None)
-                k_rope = getattr(module, "_captured_k", None)
-
-                if q_rope is None or k_rope is None:
+        def make_hook(lidx: int):
+            def score_hook(module, args, kwargs, output):
+                hidden_states = _extract_arg(args, kwargs, "hidden_states", 0)
+                position_embeddings = _extract_arg(
+                    args, kwargs, "position_embeddings", 1
+                )
+                if hidden_states is None or position_embeddings is None:
+                    if not warned_once[0]:
+                        warnings.warn(
+                            "Flash hook: hidden_states / position_embeddings "
+                            "not found in the attention call — scoring "
+                            "disabled, eviction degrades to sink+local only.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        warned_once[0] = True
                     return
 
-                # Get current keys from cache state
-                cache_state = cache._states[lidx]
-                k_current = cache_state.key_states  # [B, H_kv, S, D]
+                # Keys: already RoPE-applied and appended by cache.update()
+                # earlier in this same forward pass.
+                k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
                 if k_current is None:
                     return
 
-                # GQA broadcast: repeat_kv for key
-                if repeat_kv is not None and num_groups > 1:
+                # 1. Recompute post-RoPE query from the layer's own inputs.
+                head_dim = module.head_dim
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, head_dim)
+                q = (
+                    module.q_proj(hidden_states)
+                    .view(hidden_shape)
+                    .transpose(1, 2)
+                )  # [B, H_q, T, D]
+                cos, sin = position_embeddings
+                q, _ = apply_rotary_pos_emb(q, q, cos, sin)
+                q = q.to(k_current.dtype)
+
+                T = q.shape[2]
+                S = k_current.shape[2]
+
+                # 2. GQA broadcast so keys match the query head count.
+                num_groups = getattr(module, "num_key_value_groups", 1)
+                if num_groups > 1:
                     k_expanded = repeat_kv(k_current, num_groups)
                 else:
                     k_expanded = k_current  # [B, H_q, S, D]
 
-                # Auxiliary SDPA over ALL captured query rows (H2O cumulative)
-                # q_rope: [B, H_q, T, D]  →  scores: [B, H_q, T, S]
-                scale = 1.0 / math.sqrt(head_dim)
-                attn_weights = torch.matmul(
-                    q_rope, k_expanded.transpose(-2, -1)
-                ) * scale
+                # 3. Auxiliary SDPA (standard PyTorch, NOT flash-attn).
+                # [B, H_q, T, D] @ [B, H_q, D, S] -> [B, H_q, T, S]
+                scaling = getattr(module, "scaling", head_dim ** -0.5)
+                attn_weights = (
+                    torch.matmul(q, k_expanded.transpose(-2, -1)) * scaling
+                )
 
-                # Full softmax — no premask
-                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
-                attn_weights = attn_weights.to(q_rope.dtype)
+                # Causal mask for multi-row (prefill) passes: query row r is
+                # at absolute position S-T+r and may attend to keys 0..S-T+r.
+                # Generation passes have T=1 and need no mask.
+                if T > 1:
+                    causal = torch.triu(
+                        torch.ones(
+                            T, S,
+                            device=attn_weights.device,
+                            dtype=torch.bool,
+                        ),
+                        diagonal=S - T + 1,
+                    )
+                    attn_weights = attn_weights.masked_fill(
+                        causal, float("-inf")
+                    )
 
-                # compute_window_scores sums over query rows internally
-                # (every row contributes — no T_obs truncation).
-                scores = compute_window_scores(attn_weights, num_sink, window_size)
+                attn_weights = F.softmax(
+                    attn_weights, dim=-1, dtype=torch.float32
+                ).to(q.dtype)
 
-                # Push into cache_kwargs; cache.update() accumulates across steps.
+                # 4. Reduce to per-window scores and hand off to the cache.
+                scores = compute_window_scores(
+                    attn_weights, num_sink, window_size
+                )
                 cache.cache_kwargs[lidx]["window_scores"] = scores
 
             return score_hook
 
-        handle = module.register_forward_hook(make_hook(module, this_layer_idx))
+        handle = module.register_forward_hook(
+            make_hook(this_layer_idx), with_kwargs=True
+        )
         handles._hook_handles.append(handle)
 
     return handles

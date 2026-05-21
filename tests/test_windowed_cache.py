@@ -460,20 +460,18 @@ class TestEviction:
 class TestHooks:
 
     # -------------------------------------------------------------------
-    # 19. test_monkey_patch_captures_post_rope_qk
+    # 19. test_extract_arg_prefers_kwarg_then_positional
     # -------------------------------------------------------------------
 
-    def test_monkey_patch_captures_post_rope_qk(self):
-        """Flash hooks install q/k capture attributes on attention modules."""
-        # The monkey-patch stores _captured_q / _captured_k on the module.
-        # We verify the HookHandles data structure.
-        handles = HookHandles()
-        assert not handles._removed
-        handles.remove()
-        assert handles._removed
-        # Second call is no-op
-        handles.remove()
-        assert handles._removed
+    def test_extract_arg_prefers_kwarg_then_positional(self):
+        """_extract_arg reads a forward arg by keyword, falling back to position."""
+        from modules.windowed_cache.hooks import _extract_arg
+        # keyword present -> returned directly
+        assert _extract_arg((), {"hidden_states": 7}, "hidden_states", 0) == 7
+        # absent keyword -> positional fallback at the given index
+        assert _extract_arg(("h", "pe"), {}, "position_embeddings", 1) == "pe"
+        # neither -> None
+        assert _extract_arg((), {}, "hidden_states", 0) is None
 
     # -------------------------------------------------------------------
     # 20. test_hook_removal_idempotent
@@ -492,12 +490,12 @@ class TestHooks:
     # -------------------------------------------------------------------
 
     def test_score_hook_does_not_disable_flash_attn(self):
-        """Hooks are forward hooks, not replacement forwards — flash-attn stays active."""
-        # Structural test: HookHandles stores hooks separately from patches
+        """Scoring uses pure forward hooks — no forward replacement, flash-attn stays active."""
         handles = HookHandles()
-        # _hook_handles for register_forward_hook, _patched_modules for forward replacement
+        # register_forward_hook handles only — the backend never replaces
+        # module.forward, so flash-attn-2 runs untouched.
         assert hasattr(handles, "_hook_handles")
-        assert hasattr(handles, "_patched_modules")
+        assert not hasattr(handles, "_patched_modules")
 
     # -------------------------------------------------------------------
     # 22. test_telemetry_disabled_is_noop
