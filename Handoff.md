@@ -1,7 +1,7 @@
 # StickyKV — Conversation Handoff
 
-> Last updated: 2026-05-21  
-> Branch: `main` (HEAD: `cb4b490`)  
+> Last updated: 2026-05-22  
+> Branch: `main`  
 > Purpose: Complete context for picking up this project in a new conversation without losing thread.
 
 ---
@@ -150,6 +150,12 @@ Rich 7-section pretty-printer:
 
 ### Bug 5: LIR was replaced entirely with 5 distribution-comparison metrics (`0d88f5d`)
 **Rationale**: LIR (~0.26) was actually *correct* — cache holds ~9% of windows, even with 2x H2O lift that's ~0.21–0.26. The number was not a bug but also not insightful. The real question is: "for the windows we do keep, how similar is our score vector to base's?" The 5 new metrics answer this directly. Requires storing ours' actual scores per retained window, hence the new npz arrays.
+
+### Bug 6: Flash backend never produced window scores (`91ca8a7`)
+**Problem**: `modules/windowed_cache/hooks.py` installed a monkey-patched attention `forward` that was an empty pass-through — it never set the `_captured_q` / `_captured_k` attributes the score hook read. The hook hit its early `return` on every call, so the flash backend produced no `window_scores` and eviction silently degraded to sink + local only (no H2O top-K selection).
+**Fix**: Removed the broken monkey-patch. The score hook is now a plain `forward_hook` (registered `with_kwargs=True`) that recomputes the post-RoPE query from the layer's own inputs (`hidden_states` + `position_embeddings`) and reads keys from the cache. It also adds a causal mask to the auxiliary SDPA so prefill query rows do not attend to future keys — without it, the full N×N softmax inflated the scores of later windows.
+
+> A 2026-05-22 cleanup pass (`2779ed1`) also removed confirmed dead code from `cache.py`, `policy.py`, `config.py`, and `metrics.py` (write-only attributes, uncalled methods, an unreachable branch, and the superseded LIR functions). No behaviour change — verified by the full CPU test suite.
 
 ---
 
@@ -345,8 +351,17 @@ For the 5 metrics, given the cache retains ~9-10% of windows with ~2x H2O lift:
 | Re-run OursParityRunner on Kaggle | **Required next** | Any existing ours npz predates `retained_window_ids` / `retained_window_scores` |
 | Re-run FaithfulnessRunner | Blocked on above | Will work immediately after new ours npz is available |
 | Read and interpret the 5-metric output | Next analysis step | No code changes needed |
-| Extend to flash-attn backend | Not started | Same runner, different `backend_package` in config |
+| Validate flash-attn backend end to end | Hooks fixed (`91ca8a7`) | Score capture + eviction now work; needs a real GPU + flash-attn run to confirm |
 | LongBench evaluation | Not started | `longbench_runner.py` exists, not recently touched |
+
+### Known issues (2026-05-22 code review — not yet fixed)
+
+| Issue | Where | Notes |
+|-------|-------|-------|
+| Windowed perf configs never evict | `perf_runner.py` `_measure_config` | Score hooks are installed against a throwaway cache; the live forwards use different cache objects, so `window_scores` never reaches them — windowed perf numbers measure a non-evicting cache. |
+| `eviction_step_mask` off by one | `ours_parity_runner.py:213` | Reads `cache._generation_step` after `update()` already incremented it — flags step r when eviction happened at r+1. Currently latent (no consumer). |
+| Stale visualization schema | `visualize.py` | `make_lir_trajectory` / `make_missed_mass_distribution` / `make_budget_sweep` read `global_lir` arrays the faithfulness runner stopped emitting after `0d88f5d`; those 3 plots render empty. |
+| transformers version mismatch | `environment.yml` vs installed | `environment.yml` pins `transformers>=4.36,<4.46`; on transformers 5.x `WindowedCache` crashes in `create_causal_mask` (`get_mask_sizes` / missing `.layers`). Run with a 4.36–4.45 transformers. |
 
 ---
 
@@ -354,6 +369,10 @@ For the 5 metrics, given the cache retains ~9-10% of windows with ~2x H2O lift:
 
 | Hash | Message |
 |------|---------|
+| `2779ed1` | Remove dead code from cache, policy, config, and metrics modules |
+| `91ca8a7` | Fix flash-attn backend score hooks: implement query capture, add causal mask |
+| `a1622e6` | Add three deep-dive documentation files for StickyKV |
+| `080b85f` | Add Handoff.md: comprehensive session context for new conversations |
 | `cb4b490` | Enrich print_faithfulness: master scorecard, generation quartile trends, layer rankings |
 | `0d88f5d` | Replace LIR with 5 distribution-comparison metrics per (step, layer) |
 | `449cf3d` | Downgrade LIR diagnostics from INFO to DEBUG |
