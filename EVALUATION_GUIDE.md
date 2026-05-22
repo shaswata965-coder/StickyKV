@@ -276,50 +276,7 @@ np.savez_compressed("outputs/faithfulness_results.npz",
 
 ---
 
-## 4. Suite B — Legacy Faithfulness Metrics (utils/metrics.py)
-
-These functions exist for historical/alternative faithfulness measures.
-They operate on raw attention tensors (not window scores).
-
-### Layer Information Retention — `lir()` (metrics.py:88)
-
-```python
-lir(full_attn, retained_positions)
-# full_attn:         [S, L, H, max_cache_len]
-# retained_positions:[S, L, max_retained]  (-1 padded)
-
-gathered = gather(full_attn, dim=-1, retained_positions)  # [S, L, H, max_retained]
-gathered *= valid_mask    # zero out -1-padded slots
-lir_val  = gathered.sum(dim=-1)   # [S, L, H]  ∈ [0, 1]
-```
-
-**Interpretation:** fraction of base attention mass that falls on retained tokens.
-1.0 = all attention is on retained tokens.
-
-### Missed mass — `missed_mass()` (metrics.py:133)
-
-```python
-1.0 - lir(full_attn, retained_positions)
-```
-
-### KL (alternative form) — `kl_inverse()` (metrics.py:148)
-
-```python
-kl_inverse(full_attn, ours_attn, retained_positions)
-# Gather base attention at retained positions, renormalize to a sub-distribution.
-# Compute KL(ours_attn ‖ base_restricted) over the retained set.
-# Returns [S, L, H]
-```
-
-### Global LIR — `global_lir()` (metrics.py:205)
-
-```python
-per_head_lir.mean(dim=(-2, -1))   # mean over layers and heads → [S]
-```
-
----
-
-## 5. Suite D — LongBench
+## 4. Suite D — LongBench
 
 ### Runner
 
@@ -396,7 +353,7 @@ f1_score(prediction.split(), ground_truth.split())
 
 ---
 
-## 6. Metric Quick Reference
+## 5. Metric Quick Reference
 
 | Suite | Metric | Range | Better |
 |---|---|---|---|
@@ -406,13 +363,11 @@ f1_score(prediction.split(), ground_truth.split())
 | B | Spearman rank correlation | [-1, 1] | Higher |
 | B | KL(ours ‖ base) | [0, ∞) | Lower |
 | B | Mass ratio (base/ours) | (0, ∞) | ≈ 1 |
-| B (legacy) | LIR | [0, 1] | Higher |
-| B (legacy) | Missed mass | [0, 1] | Lower |
 | D | Dataset-specific (F1/ROUGE/exact) | [0, 100] | Higher |
 
 ---
 
-## 7. End-to-End Evaluation Pipeline
+## 6. End-to-End Evaluation Pipeline
 
 ```
 CorpusLoader.load()

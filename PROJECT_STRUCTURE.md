@@ -33,7 +33,7 @@ C:\StickyKV/
 │   │   ├── policy.py                # EvictionPolicy — top-K window selection, trigger logic
 │   │   ├── state.py                 # CacheState — per-layer KV tensors + scores + positions
 │   │   ├── scorer.py                # compute_window_scores() + accumulate()
-│   │   ├── hooks.py                 # install_score_hooks() — monkey-patch + post-forward hook
+│   │   ├── hooks.py                 # install_score_hooks() — forward hook + auxiliary SDPA
 │   │   ├── config.py                # WindowedCacheConfig, ResolvedConfig
 │   │   └── telemetry.py             # Telemetry / NullTelemetry for score recording
 │   │
@@ -74,7 +74,7 @@ C:\StickyKV/
 └── utils/                           # Shared utilities
     ├── config.py                    # Typed config dataclasses + load_config() + validate_parity_pair()
     ├── cache_factory.py             # get_cache_classes() — backend selection + pairing validation
-    ├── metrics.py                   # Jaccard, LIR, missed_mass, kl_inverse, aggregation
+    ├── metrics.py                   # Jaccard similarity + aggregation helpers
     ├── hashing.py                   # sha256_file(), sha256_text()
     ├── logger.py                    # get_logger() — structured logging setup
     └── seed.py                      # seed_everything() — Python + NumPy + PyTorch seeding
@@ -184,9 +184,10 @@ attention weights.
 
 Used when `backend_package: flash_attn` and `attn_implementation: flash_attention_2`.
 
-Flash attention does not expose the attention matrix, so `hooks.py` monkey-patches
-each attention module to capture post-RoPE `(q, k)` and runs a separate auxiliary
-SDPA call to reconstruct attention weights.
+Flash attention does not expose the attention matrix, so `hooks.py` registers a
+`forward_hook` that recomputes the post-RoPE query from the layer inputs, reads
+the keys from the cache, and runs a separate (causally-masked) auxiliary SDPA
+call to reconstruct attention weights.
 
 ### `modules/windowed_eager_cache/` — Eager backend
 
@@ -459,7 +460,6 @@ score_longbench.sh           (post-hoc, reads jsonl outputs only)
 - `jaccard_topk()` — vectorized Jaccard similarity of top-K window sets
 - `aggregate_per_layer()`, `aggregate_global()` — aggregation helpers
 - `final_step_heterogeneity()` — std across heads at last step
-- `lir()`, `missed_mass()`, `kl_inverse()`, `global_lir()` — legacy faithfulness metrics
 
 ### `utils/hashing.py` — Reproducibility fingerprints
 

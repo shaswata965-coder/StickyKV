@@ -81,12 +81,15 @@ All prompt tokens arrive in one batch.
 
 **Flash-attention backend:**  
 `modules/windowed_cache/hooks.py:install_score_hooks()` (lines 99–224)  
-- Monkey-patches each `LlamaAttention.forward()` (or equivalent) to capture
-  post-RoPE `(q, k)` tensors.
-- Registers a post-forward hook that:
-  1. Runs an auxiliary scaled-dot-product attention on `(q, k_current)` → `[B, H_q, T, S]`.
-  2. Calls `compute_window_scores()` → `[B, H_q, W]`.
-  3. Stores the result in `cache.cache_kwargs[layer_idx]["window_scores"]`.
+- Registers a `forward_hook` (with kwargs) on each `LlamaAttention` /
+  `Qwen2Attention` module. Flash-attention-2 never materializes the attention
+  matrix, so the hook reconstructs it:
+  1. Recompute the post-RoPE query from the layer inputs (`hidden_states`
+     + `position_embeddings`); read the post-RoPE keys from the cache.
+  2. Run an auxiliary scaled-dot-product attention on `(q, k_current)` → `[B, H_q, T, S]`,
+     causally masked so prefill query rows do not attend to future keys.
+  3. Call `compute_window_scores()` → `[B, H_q, W]`.
+  4. Store the result in `cache.cache_kwargs[layer_idx]["window_scores"]`.
 
 **Eager backend:**  
 `modules/windowed_eager_cache/hooks.py:install_score_hooks()` (lines 78–178)  
@@ -123,43 +126,41 @@ window_scores = einops.reduce(post_sink, "b h (w s) -> b h w", "sum", s=window_s
 
 ### 3c. `WindowedCache.update()` — prefill path
 
-**File:** `modules/windowed_cache/cache.py:99`
+**File:** `modules/windowed_cache/cache.py`
 
 Called once per layer (each attention block calls `past_key_values.update()`).
+The score hook runs *after* the attention forward, so during the prefill
+`update()` no scores are available yet:
 
 ```python
 # 1. Append prefill K/V
-state.append(key_states, value_states, pos)        # state.py:62
-policy.extend_total_after_append(n_new)            # policy.py:45
+state.append(key_states, value_states, pos)        # state.py
+policy.extend_total_after_append(n_new)            # policy.py
 
 # is_prefill=True (first call to this layer)
-policy.initialize_after_prefill(state.seq_length)  # policy.py:41
+policy.initialize_after_prefill(state.seq_length)  # policy.py
 self._prefill_done[layer_idx] = True
 
-# 2. Pull pre-computed window scores left by the hook
+# 2. Pull pre-computed window scores left by the hook.
+#    cache_kwargs is still empty here — the prefill hook has not run yet —
+#    so new_window_scores is None and state.window_scores stays None.
 new_window_scores = merged_kwargs.get("window_scores")
 
-# 3. Initialize state.window_scores (first time)
-state.window_scores = new_window_scores.clone()    # [B, H_q, W]
-# Initialize identity mapping W → original window id
-state.original_window_ids = torch.arange(W, ...)
-
-# 4. Trigger eviction immediately after prefill
-#    (is_prefill=True  AND  window_scores is not None)
-#    → should_evict is forced True; see cache.py:192-194
-#    Runs the full eviction block described in §5 below.
+# 3. No eviction during prefill: should_evict requires `not is_prefill`.
 ```
 
-The prefill eviction is a "right-size" pass: it trims the cache from `prefill_len`
-tokens down to the budget immediately before any generation step.
+**Prefill does not evict.** The prefill hook computes the prefill window scores
+*after* this `update()` returns; they are consumed — and `state.window_scores`
+is initialized — on the first generation step's `update()`. The cache grows to
+`prefill_len` and is first compacted at generation step `window_size`.
 
 ---
 
 ## 4. Step N — Generation (one token per step)
 
 Each new token runs a forward pass. The hook fires again and produces a
-`window_scores` of shape `[B, H_q, 1_window_or_more]` (usually just the window
-that the new token's position falls into).
+`window_scores` of shape `[B, H_q, W]` covering every window currently in the
+cache — H2O-style, every query row contributes.
 
 ### 4a. `WindowedCache.update()` — generation path
 
@@ -188,7 +189,7 @@ full history of attention is summed.
 
 ---
 
-## 5. The Eviction Block (runs at prefill and every `window_size` generation steps)
+## 5. The Eviction Block (runs every `window_size` generation steps)
 
 All code lives in `cache.py:197-234`.
 
@@ -348,14 +349,14 @@ def append(self, key, value, pos=None):
 
 | Condition | `should_evict` result |
 |---|---|
-| Prefill step (first call to `update()`) | Always True (forced in cache.py:192-194) |
+| Prefill step (first call to `update()`) | False (`not is_prefill` required) |
 | Generation step 0 | False (`step > 0` required) |
 | Generation step N where `N % window_size != 0` | False |
 | Generation step N where `N % window_size == 0` | True |
 
-The forced prefill eviction ensures the cache is at budget size before the first
-generated token. Subsequent evictions fire once every `window_size` steps,
-amortizing the `O(T × N)` hook cost over `window_size` generations.
+The cache grows freely through prefill and the first `window_size` generation
+steps; the first compaction fires at generation step `window_size`, then once
+every `window_size` steps after, amortizing the `O(T × N)` hook cost.
 
 ---
 
@@ -364,8 +365,8 @@ amortizing the `O(T × N)` hook cost over `window_size` generations.
 | | Flash-attention backend | Eager backend |
 |---|---|---|
 | **Module** | `modules/windowed_cache/` | `modules/windowed_eager_cache/` |
-| **Hook type** | Monkey-patch + post-forward | Plain `register_forward_hook` |
-| **Attention source** | Auxiliary SDPA on captured q/k | Materialized `attn_weights` from output tuple |
+| **Hook type** | `forward_hook` (with kwargs) | `forward_hook` |
+| **Attention source** | Auxiliary causal SDPA (recomputed query + cached keys) | Materialized `attn_weights` from output tuple |
 | **Requires `output_attentions`** | No | Yes |
 | **attn_implementation** | `"flash_attention_2"` | `"eager"` |
 
@@ -382,11 +383,11 @@ model.generate() — one step
   │
   └─► LlamaAttention.forward(q, k, v, ...)
         │
-        ├─► [HOOK PRE] capture q, k  (flash hook only)
-        │
         ├─► attention computation (flash or eager)
         │
-        └─► [HOOK POST]
+        └─► [FORWARD HOOK]
+              ├─► flash: recompute post-RoPE query, run auxiliary causal SDPA
+              │   eager: read materialized attn_weights from the output tuple
               ├─► compute_window_scores(attn, num_sink, window_size)
               │     scorer.py:17
               └─► cache.cache_kwargs[layer_idx]["window_scores"] = scores
