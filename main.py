@@ -18,10 +18,6 @@ from utils.logger import get_logger
 from utils.seed import seed_everything
 
 log = get_logger("main")
-
-# Mode → Runner class mapping.
-# Runner classes are imported lazily to avoid pulling in heavy deps
-# (torch, transformers) when only checking --help.
 _RUNNER_REGISTRY: dict[str, str] = {
     "parity_base": "modules.evaluation.base_parity_runner.BaseParityRunner",
     "parity_ours": "modules.evaluation.ours_parity_runner.OursParityRunner",
@@ -34,7 +30,6 @@ _RUNNER_REGISTRY: dict[str, str] = {
 
 
 def _import_runner(mode: str):
-    """Lazily import and return the Runner class for *mode*."""
     if mode not in _RUNNER_REGISTRY:
         available = ", ".join(sorted(_RUNNER_REGISTRY.keys()))
         log.error("Unknown mode: %r.  Available: %s", mode, available)
@@ -54,9 +49,6 @@ def _import_runner(mode: str):
             mode,
             dotted_path,
             e,
-        )
-        log.error(
-            "This runner may not be implemented yet (see Prompts 02–04)."
         )
         sys.exit(1)
 

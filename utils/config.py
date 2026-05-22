@@ -1,13 +1,3 @@
-"""Typed YAML configuration loader and cross-config validator.
-
-Provides:
-- ``load_config(path)`` — loads a YAML file into a typed ``ExperimentConfig``
-  dataclass hierarchy.
-- ``validate_parity_pair(base_meta, ours_config)`` — validates that
-  identicality-critical fields match between a base run's metadata and an
-  *ours* config, raising ``ParityValidationError`` on mismatch.
-"""
-
 from __future__ import annotations
 
 import math
@@ -42,8 +32,6 @@ class ConfigValidationError(ValueError):
 
 @dataclass
 class ModelConfig:
-    """Model-related configuration."""
-
     name: str = "meta-llama/Meta-Llama-3-8B"
     revision: Optional[str] = None
     dtype: str = "float16"
@@ -52,9 +40,8 @@ class ModelConfig:
 
 @dataclass
 class CacheConfig:
-    """Cache / eviction configuration."""
 
-    backend: str = "dynamic"  # "dynamic" (baseline) | "windowed"
+    backend: str = "dynamic"
     backend_package: Optional[str] = None  # "flash_attn" | "eager" | None
     cache_budget: Optional[float] = None  # float ratio in (0, 1]; None for baseline
     window_size: int = 8
@@ -63,11 +50,6 @@ class CacheConfig:
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
-            if isinstance(self.cache_budget, int) and not isinstance(self.cache_budget, bool):
-                raise ConfigValidationError(
-                    f"cache_budget must be a float ratio in (0, 1], got int {self.cache_budget}. "
-                    f"Use e.g. 0.40 instead of 40."
-                )
             if not (0.0 < self.cache_budget <= 1.0):
                 raise ConfigValidationError(
                     f"cache_budget must be in (0, 1], got {self.cache_budget}"
@@ -87,17 +69,6 @@ class CacheConfig:
                 )
 
     def resolve_local_window_size(self, post_sink_tokens: int) -> int:
-        """Resolve ``local_window_size`` to a concrete int.
-
-        If ``local_window_size`` is a float ratio, it is resolved as:
-          ``ceil(ratio * post_sink_tokens)`` snapped up to the nearest
-          multiple of ``window_size``.
-
-        Returns
-        -------
-        int
-            Resolved local window size in tokens.
-        """
         if isinstance(self.local_window_size, int):
             return self.local_window_size
 
@@ -112,19 +83,6 @@ class CacheConfig:
 
 @dataclass
 class DataConfig:
-    """Data / corpus configuration.
-
-    Three knobs control parity-run data loading (wikitext-103 / pg-19):
-
-    - ``num_samples`` — how many corpus articles to evaluate.
-    - ``max_tokens`` — total token budget per article.  When set, it
-      replaces ``prefill_len`` + ``gen_len`` as the source of truth.
-    - ``ratio`` — split fraction.  ``prefill_len = int(max_tokens * ratio)``
-      and ``gen_len = max_tokens - prefill_len``.
-
-    When ``max_tokens`` is ``None`` (legacy path), ``prefill_len`` and
-    ``gen_len`` are used as-is and ``ratio`` is ignored.
-    """
 
     dataset: str = "wikitext-103"  # "wikitext-103" | "pg19"
     article_id: int = 0
@@ -152,22 +110,16 @@ class DataConfig:
     def resolved_lengths(
         self, default_prefill: int, default_gen: int
     ) -> Tuple[int, int]:
-        """Return the effective ``(prefill_len, gen_len)``.
-
-        If ``max_tokens`` is set, splits it by ``ratio``.  Otherwise returns
-        the provided defaults (typically ``parity.prefill_len`` / ``gen_len``).
-        """
         if self.max_tokens is None:
             return int(default_prefill), int(default_gen)
         eff_prefill = int(self.max_tokens * self.ratio)
-        eff_prefill = max(1, eff_prefill)              # guard against ratio rounding to 0
+        eff_prefill = max(1, eff_prefill)
         eff_gen = max(0, int(self.max_tokens) - eff_prefill)
         return eff_prefill, eff_gen
 
 
 @dataclass
 class TelemetryConfig:
-    """Telemetry output configuration."""
 
     track_scores: bool = False
     output_dir: str = "outputs"
@@ -178,8 +130,6 @@ class RunConfig:
     """Top-level run configuration."""
 
     mode: str = "parity_base"
-    # modes: parity_base, parity_ours, faithfulness, perf, longbench,
-    #        longbench_score, visualize
     seed: int = 42
 
 
@@ -200,48 +150,18 @@ class ParityConfig:
     gen_len: int = 1024
     decoding: str = "greedy"
     record_full_attention: bool = False
-    full_attention_sample_rate: int = 10  # record every N steps
+    full_attention_sample_rate: int = 10
 
 
 @dataclass
 class WindowConfig:
-    """Window scoring configuration (top-level, used by parity runners).
-
-    ``top_k_windows`` is derived from ``cache.cache_budget`` + prefill length
-    via :meth:`resolved_top_k`, matching the production eviction policy.
-    If set explicitly it overrides the derivation (useful for tests).
-    """
 
     window_size: int = 32
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 256
-    top_k_windows: Optional[int] = None   # None → derived from cache_budget
+    top_k_windows: Optional[int] = None
 
     def resolved_top_k(self, cache_budget: Optional[float], prefill_len: int) -> int:
-        """Derive top_k_windows from cache budget — matches WindowedCacheConfig.resolve().
-
-        ``K = (budget_tokens - num_sink - local_tokens) // window_size``
-
-        Parameters
-        ----------
-        cache_budget : float, optional
-            Target cache compression ratio in (0, 1].  Required when
-            ``top_k_windows`` is not set explicitly.
-        prefill_len : int
-            Resolved prefill length for this run.
-
-        Returns
-        -------
-        int
-            Non-negative top-K (may be 0 if budget covers only sink + local).
-
-        Raises
-        ------
-        ConfigValidationError
-            If both ``top_k_windows`` and ``cache_budget`` are unset, or if
-            the budget is too small for the sink + local region.
-        """
-        # Explicit override takes precedence (legacy / unit tests).
         if self.top_k_windows is not None:
             return int(self.top_k_windows)
 
@@ -337,16 +257,6 @@ class VisualizeConfig:
 
 @dataclass
 class LongBenchConfig:
-    """LongBench evaluation configuration (Suite D).
-
-    Follows DefensiveKV's exact protocol: LongBench v1, 16 English datasets,
-    greedy decoding, middle truncation, per-dataset max gen length.
-
-    ``num_samples`` controls how many examples per dataset are evaluated:
-    the literal string ``"max"`` runs the full split; a non-negative integer
-    caps each dataset to that many examples (after the dataset's natural
-    order — no shuffling).
-    """
 
     datasets: List[str] = field(
         default_factory=lambda: [
@@ -533,24 +443,6 @@ def validate_parity_pair(
     base_meta: dict[str, Any],
     ours_config: ExperimentConfig,
 ) -> None:
-    """Validate that identicality-critical fields match.
-
-    Parameters
-    ----------
-    base_meta : dict
-        Metadata dict from a completed base run (loaded from ``.meta.json``
-        or the npz metadata).
-    ours_config : ExperimentConfig
-        Configuration for the ours run to be validated against the base.
-
-    Raises
-    ------
-    ParityValidationError
-        If any identicality-critical field differs.
-    """
-    # Resolve effective lengths via DataConfig so the comparison matches
-    # what the runner actually used (max_tokens × ratio overrides
-    # parity.prefill_len / parity.gen_len when set).
     eff_prefill, eff_gen = ours_config.data.resolved_lengths(
         ours_config.parity.prefill_len, ours_config.parity.gen_len
     )
