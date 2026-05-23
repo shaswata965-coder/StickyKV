@@ -208,10 +208,13 @@ class PerfConfig:
     """Performance benchmark configuration (Suite C)."""
 
     configs: List[Dict[str, Any]] = field(default_factory=list)
+    # ChunkKV-style (prefill_len, gen_len) grid. If empty, falls back to the
+    # cartesian product of `prefill_lengths` x [`gen_len`].
+    grid: List[Dict[str, int]] = field(default_factory=list)
     prefill_lengths: List[int] = field(default_factory=lambda: [2048, 4096])
     gen_len: int = 256
     num_warmup_runs: int = 2
-    num_measurement_runs: int = 5
+    num_measurement_runs: int = 10
     allow_shared_gpu: bool = True
     skip_if_oom: bool = True
     skip_if_flash_attn_unavailable: bool = True

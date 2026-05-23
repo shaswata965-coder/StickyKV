@@ -71,10 +71,16 @@ perf:
       cache_budget: 0.10
       requires_flash_attn: true
 
-  prefill_lengths: [2048, 4096]
-  gen_len: 256
+  # ChunkKV-identical (prefill, gen) grid — NeurIPS 2025, arXiv 2502.00299.
+  # Same shape so direct comparison is possible; backend may be eager or
+  # flash_attention_2 per-config (no FlashAttention required to run the grid).
+  grid:
+    - { prefill_len: 4096, gen_len: 1024 }
+    - { prefill_len: 4096, gen_len: 4096 }
+    - { prefill_len: 8192, gen_len: 1024 }
+    - { prefill_len: 8192, gen_len: 4096 }
   num_warmup_runs: 2
-  num_measurement_runs: 5
+  num_measurement_runs: 10
   allow_shared_gpu: true
   skip_if_oom: true
   skip_if_flash_attn_unavailable: true
