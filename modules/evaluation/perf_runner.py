@@ -40,16 +40,23 @@ class PerfRunner:
         clocks_locked = False
         if pc.enable_clock_locking:
             clocks_locked = self._try_lock_clocks()
+        # Build (prefill_len, gen_len) grid. Explicit `grid:` wins; otherwise
+        # fall back to legacy `prefill_lengths` x scalar `gen_len`.
+        if pc.grid:
+            cells = [(int(g["prefill_len"]), int(g["gen_len"])) for g in pc.grid]
+        else:
+            cells = [(p, pc.gen_len) for p in pc.prefill_lengths]
         output_paths = []
-        for prefill_len in pc.prefill_lengths:
-            log.info("--- Prefill length: %d ---", prefill_len)
-            result = self._run_prefill(prefill_len, pc, cfg, flash_ok, env)
+        for prefill_len, gen_len in cells:
+            log.info("--- Cell: prefill=%d gen=%d ---", prefill_len, gen_len)
+            result = self._run_prefill(prefill_len, gen_len, pc, cfg, flash_ok, env)
             result["clocks_locked"] = clocks_locked
-            path = self._save(result, prefill_len, cfg, env, clocks_locked)
+            result["gen_len"] = gen_len
+            path = self._save(result, prefill_len, gen_len, cfg, env, clocks_locked)
             output_paths.append(path)
         return output_paths
 
-    def _run_prefill(self, prefill_len: int, pc, cfg, flash_ok: bool, env: dict) -> dict:
+    def _run_prefill(self, prefill_len: int, gen_len: int, pc, cfg, flash_ok: bool, env: dict) -> dict:
         configs = pc.configs
         n_configs = len(configs)
         n_runs = pc.num_measurement_runs
@@ -72,7 +79,7 @@ class PerfRunner:
                     continue
             log.info("Running config: %s", name)
             try:
-                measurements = self._measure_config(c, prefill_len, pc, cfg)
+                measurements = self._measure_config(c, prefill_len, gen_len, pc, cfg)
                 for ri, m in enumerate(measurements):
                     ttft[ci, ri] = m["ttft_ms"]
                     throughput[ci, ri] = m["throughput_tokps"]
@@ -94,7 +101,7 @@ class PerfRunner:
                 "throughput": throughput, "tpot": tpot, "peak_mem": peak_mem,
                 "skipped": skipped}
 
-    def _measure_config(self, c: dict, prefill_len: int, pc, cfg) -> List[dict]:
+    def _measure_config(self, c: dict, prefill_len: int, gen_len: int, pc, cfg) -> List[dict]:
         from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
         dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         torch_dtype = dtypes.get(cfg.model.dtype, torch.float16)
@@ -151,7 +158,6 @@ class PerfRunner:
                 torch.cuda.empty_cache()
         # Measurement runs
         measurements = []
-        gen_len = pc.gen_len
         for ri in range(pc.num_measurement_runs):
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -199,11 +205,12 @@ class PerfRunner:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         return measurements
 
-    def _save(self, result: dict, prefill_len: int, cfg, env: dict, clocks_locked: bool) -> Path:
+    def _save(self, result: dict, prefill_len: int, gen_len: int, cfg, env: dict, clocks_locked: bool) -> Path:
         od = Path(cfg.telemetry.output_dir); od.mkdir(parents=True, exist_ok=True)
-        npz_path = od / f"perf_prefill{prefill_len}.npz"
+        npz_path = od / f"perf_prefill{prefill_len}_gen{gen_len}.npz"
         meta = {
             "prefill_len": prefill_len,
+            "gen_len": gen_len,
             **env,
             "clocks_locked": clocks_locked,
         }

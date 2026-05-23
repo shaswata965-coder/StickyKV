@@ -77,6 +77,11 @@ class WindowedCache(_HFCacheBase):
         ]
         self._generation_step: List[int] = [0] * num_layers
         self._prefill_done: List[bool] = [False] * num_layers
+        # Running counter of the next original-sequence window ID to assign
+        # when new windows appear (post-eviction or as generation extends the cache).
+        # Without this, the W_new > W_old branch would emit compact-space indices
+        # that collide with surviving original IDs.
+        self._next_original_window_id: List[int] = [0] * num_layers
 
         # Shared scratch for cache_kwargs communication with hooks
         self.cache_kwargs: Dict[int, Dict[str, Any]] = {
@@ -142,6 +147,12 @@ class WindowedCache(_HFCacheBase):
         merged_kwargs.update(self.cache_kwargs.get(layer_idx, {}))
         new_window_scores = merged_kwargs.get("window_scores")
 
+        # Clear consumed scores so a hook that silently returns on the next step
+        # does not cause stale values to be re-accumulated.
+        layer_kwargs = self.cache_kwargs.get(layer_idx)
+        if layer_kwargs is not None and "window_scores" in layer_kwargs:
+            del layer_kwargs["window_scores"]
+
         # 3. Initialize or accumulate window_scores
         if new_window_scores is not None:
             if state.window_scores is None:
@@ -151,6 +162,7 @@ class WindowedCache(_HFCacheBase):
                 state.original_window_ids = torch.arange(
                     W, device=new_window_scores.device, dtype=torch.long
                 )
+                self._next_original_window_id[layer_idx] = W
             else:
                 # Handle size mismatch: new scores may cover more windows
                 W_old = state.window_scores.shape[-1]
@@ -166,16 +178,21 @@ class WindowedCache(_HFCacheBase):
                     state.window_scores = torch.cat(
                         [state.window_scores, pad], dim=-1
                     )
-                    # Extend original_window_ids for new windows
+                    # Extend original_window_ids for new windows using the
+                    # running original-sequence counter, not compact-space
+                    # indices (which would collide with surviving IDs).
                     if state.original_window_ids is not None:
+                        n_extra = W_new - W_old
+                        start_id = self._next_original_window_id[layer_idx]
                         extra = torch.arange(
-                            W_old, W_new,
+                            start_id, start_id + n_extra,
                             device=state.original_window_ids.device,
                             dtype=torch.long,
                         )
                         state.original_window_ids = torch.cat(
                             [state.original_window_ids, extra]
                         )
+                        self._next_original_window_id[layer_idx] = start_id + n_extra
                 accumulate(state.window_scores, new_window_scores)
 
         # 4. Eviction
