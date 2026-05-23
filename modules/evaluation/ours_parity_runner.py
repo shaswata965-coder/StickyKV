@@ -385,7 +385,8 @@ class OursParityRunner:
         elapsed = time.time() - t0
         log.info("Done: %d samples, %.1fs", num_samples, elapsed)
 
-        St = prefill_len + gen_len - ns
+        # Must match WindowedCacheConfig.resolve(), which uses prefill_len - num_sink_tokens.
+        St = prefill_len - ns
         if isinstance(w.local_window_size, float):
             lr = math.ceil(w.local_window_size * St)
             r2 = lr % ws_sz

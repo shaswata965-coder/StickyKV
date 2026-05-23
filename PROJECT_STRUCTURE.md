@@ -75,7 +75,7 @@ C:\StickyKV/
     ├── config.py                    # Typed config dataclasses + load_config() + validate_parity_pair()
     ├── cache_factory.py             # get_cache_classes() — backend selection + pairing validation
     ├── metrics.py                   # Jaccard similarity + aggregation helpers
-    ├── hashing.py                   # sha256_file(), sha256_text()
+    ├── hashing.py                   # sha256_file(), sha256_string()
     ├── logger.py                    # get_logger() — structured logging setup
     └── seed.py                      # seed_everything() — Python + NumPy + PyTorch seeding
 ```
@@ -464,7 +464,7 @@ score_longbench.sh           (post-hoc, reads jsonl outputs only)
 ### `utils/hashing.py` — Reproducibility fingerprints
 
 - `sha256_file(path)` — SHA-256 of a file on disk
-- `sha256_text(text)` — SHA-256 of an article string
+- `sha256_string(text)` — SHA-256 of an article string
 
 These are embedded in every NPZ's `metadata_json` so any downstream runner
 can verify it is reading the exact same data it expects.

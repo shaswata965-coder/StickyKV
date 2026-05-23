@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Tuple, Type
 
+from utils.config import ConfigValidationError
 
-class ConfigValidationError(ValueError):
-    """Raised when cache backend and attention implementation are mismatched."""
+__all__ = ["ConfigValidationError", "get_cache_classes", "validate_backend_attn_pairing"]
 
 
 _BACKEND_TO_ATTN_IMPL = {
