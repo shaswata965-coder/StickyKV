@@ -133,7 +133,9 @@ def score_predictions(
                 pred = pred.lstrip("\n").split("\n")[0]
 
             answers = ex.get("answers", [])
-            all_classes = ex.get("all_classes")
+            # `classification_score` iterates over `all_classes`; a missing or
+            # null field would crash with `'NoneType' is not iterable`.
+            all_classes = ex.get("all_classes") or []
 
             # Per-example score = max over ground truths (THUDM convention)
             best = max(

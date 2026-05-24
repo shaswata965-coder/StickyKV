@@ -403,6 +403,11 @@ class LongBenchRunner:
         cfg = self.config
         model = self.model
 
+        # LongBench reads window params from cfg.cache.*; parity runners read
+        # from cfg.window.*. Warn loudly if the two configs disagree so a user
+        # who copied a parity template doesn't silently get cache defaults.
+        self._warn_on_cache_window_disagreement()
+
         budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.20
         cache_config = self.WindowedCacheConfig(
             window_size=cfg.cache.window_size,
@@ -543,6 +548,29 @@ class LongBenchRunner:
         meta_path = output_dir / f"{dataset_name}.meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, default=str)
+
+    def _warn_on_cache_window_disagreement(self) -> None:
+        """Warn if cfg.cache.* and cfg.window.* disagree on shared fields.
+
+        LongBench reads window parameters from cfg.cache (CacheConfig), but
+        parity runners read from cfg.window (WindowConfig). The two dataclasses
+        have different defaults, so a user who only sets cfg.window.* while
+        switching to LongBench would silently inherit CacheConfig's defaults.
+        """
+        cfg = self.config
+        pairs = [
+            ("window_size", cfg.cache.window_size, cfg.window.window_size),
+            ("num_sink_tokens", cfg.cache.num_sink_tokens, cfg.window.num_sink_tokens),
+            ("local_window_size", cfg.cache.local_window_size, cfg.window.local_window_size),
+        ]
+        for name, cache_val, window_val in pairs:
+            if cache_val != window_val:
+                log.warning(
+                    "cfg.cache.%s=%r != cfg.window.%s=%r — LongBench uses "
+                    "cfg.cache.* for the runtime cache. Update cfg.cache.%s "
+                    "if you meant the cfg.window.* value.",
+                    name, cache_val, name, window_val, name,
+                )
 
     def _get_tokenizer_sha(self) -> str:
         """Get tokenizer SHA for reproducibility."""

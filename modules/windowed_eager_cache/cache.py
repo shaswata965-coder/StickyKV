@@ -182,19 +182,6 @@ class WindowedCache(_HFCacheBase):
                     state.window_scores = torch.cat(
                         [state.window_scores, pad], dim=-1
                     )
-                elif W_new < W_old:
-                    # Symmetric pad on the incoming scores so in-place += works
-                    # without changing accumulate's contract.
-                    pad = torch.zeros(
-                        new_window_scores.shape[0],
-                        new_window_scores.shape[1],
-                        W_old - W_new,
-                        device=new_window_scores.device,
-                        dtype=new_window_scores.dtype,
-                    )
-                    new_window_scores = torch.cat(
-                        [new_window_scores, pad], dim=-1
-                    )
                     # Extend original_window_ids for new windows using the
                     # running original-sequence counter, not compact-space
                     # indices (which would collide with surviving IDs).
@@ -210,6 +197,20 @@ class WindowedCache(_HFCacheBase):
                             [state.original_window_ids, extra]
                         )
                         self._next_original_window_id[layer_idx] = start_id + n_extra
+                elif W_new < W_old:
+                    # Symmetric pad on the incoming scores so in-place += works
+                    # without changing accumulate's contract. No
+                    # original_window_ids change: no new windows appeared.
+                    pad = torch.zeros(
+                        new_window_scores.shape[0],
+                        new_window_scores.shape[1],
+                        W_old - W_new,
+                        device=new_window_scores.device,
+                        dtype=new_window_scores.dtype,
+                    )
+                    new_window_scores = torch.cat(
+                        [new_window_scores, pad], dim=-1
+                    )
                 accumulate(state.window_scores, new_window_scores)
 
         # 4. Eviction

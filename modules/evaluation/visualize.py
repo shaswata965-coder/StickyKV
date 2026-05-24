@@ -243,14 +243,25 @@ def make_topk_window_age_histogram(npz_paths: List[Path], out_dir: Path,
         d = _load_npz(str(p))
         topk = d["arrays"].get("top_window_indices")
         if topk is None: continue
-        S = topk.shape[0]
         ages = []
-        for t in range(S):
-            valid = topk[t][topk[t] >= 0]
-            if len(valid) > 0:
-                # Age = current step - window index (proxy)
-                age = t - valid.astype(float)
-                ages.extend(age.tolist())
+        # Schema v1.0: [num_steps, num_layers, K]
+        # Schema v1.1: [num_samples, num_steps, num_layers, K]
+        if topk.ndim == 4:
+            num_samples, num_steps = topk.shape[0], topk.shape[1]
+            for s in range(num_samples):
+                for t in range(num_steps):
+                    valid = topk[s, t][topk[s, t] >= 0]
+                    if len(valid) > 0:
+                        # Age = current step - window index (proxy)
+                        age = t - valid.astype(float)
+                        ages.extend(age.tolist())
+        else:
+            num_steps = topk.shape[0]
+            for t in range(num_steps):
+                valid = topk[t][topk[t] >= 0]
+                if len(valid) > 0:
+                    age = t - valid.astype(float)
+                    ages.extend(age.tolist())
         if ages:
             ax.hist(ages, bins=50, alpha=0.6, label=Path(str(p)).stem)
     ax.set_xlabel("Window Age (steps)"); ax.set_ylabel("Count")

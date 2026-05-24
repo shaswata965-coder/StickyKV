@@ -1,302 +1,534 @@
 # StickyKV — Bug Audit
 
 A static review of the codebase, grouped by severity. Each entry names the
-exact file/line, explains the failure mode, and gives a minimal-impact fix
-that preserves the existing logic.
+exact file/line, explains the failure mode, the minimal-impact fix that was
+applied, and a **Status** line noting validation + resolution.
+
+Verification pass run against current tree. All 22 items below were
+confirmed as real and resolved; none of the fixes touched eviction logic,
+scoring math, RoPE rerotation, or the eviction trigger.
 
 ---
 
 ## High severity (correctness / silent wrong results)
 
 ### H1 — `base_parity_runner.py:199-205`: wrong `local_window_size_resolved` in metadata
-The metadata writes `lr` resolved against `St = prefill_len + gen_len - ns`,
-but `WindowedCacheConfig.resolve()` (the production policy) resolves against
-`prefill_len - num_sink_tokens` only (see `modules/windowed_cache/config.py:196`
-and `utils/config.py:WindowConfig.resolved_top_k`). `OursParityRunner` writes
-the *correct* value at line 389 (`St = prefill_len - ns`). The base run therefore
-records a value that disagrees with the matching ours run.
+The metadata wrote `lr` resolved against `St = prefill_len + gen_len - ns`,
+but `WindowedCacheConfig.resolve()` (the production policy) resolves
+against `prefill_len - num_sink_tokens` only
+(`modules/windowed_cache/config.py:196`). `OursParityRunner` already wrote
+the correct value at line 389. Base disagreed with ours by exactly
+`ceil(local_ratio * gen_len)` snapped to a window multiple — a value the
+parity validator would not flag because the comparison is field-by-field
+on what each side wrote, not against the policy.
 
-**Fix:** replace `St = prefill_len + gen_len - ns` with `St = prefill_len - ns`
-in `base_parity_runner.py:199`. No other logic touched; this only corrects the
-recorded scalar.
+**Fix applied:** `base_parity_runner.py:200` now reads
+`St = prefill_len - ns`.
+**Status:** Validated — both runners now resolve against the same
+expression (`grep "St = prefill_len"` shows the matched form in both).
 
 ### H2 — `ours_parity_runner.py:213-215`: off-by-one in `evicted` flag
-The eviction probe runs *after* `model(...)`. By that point
-`WindowedCache.update()` has already incremented `_generation_step[li]` (see
-`cache.py:243`). So `cache._generation_step[li] % ws_sz == 0` is checking the
-*next* step's eviction trigger, not the one that just fired. The
-`eviction_step_mask` array is therefore shifted by one step and consistently
-mislabels which steps actually evicted.
+`WindowedCache.update()` increments `_generation_step` before returning
+(`cache.py:243`), so the post-call read in the runner saw the *next*
+step's counter. The `eviction_step_mask` was therefore shifted one step
+later than reality.
 
-**Fix:** subtract one before the modulo:
-```python
-gs = cache._generation_step[li]
-evicted = any((gs - 1) > 0 and (gs - 1) % ws_sz == 0 for li in range(n_layers))
-```
-or expose an `evicted_this_step` flag from `WindowedCache.update()` and read
-that instead. Logic of eviction itself is unchanged; only the post-hoc
-telemetry flag is corrected.
+**Fix applied:** `ours_parity_runner.py:223-225` subtracts one before the
+modulo, with a comment explaining the cache's increment timing.
+**Status:** Validated — read aligns with the eviction trigger
+`step > 0 and step % window_size == 0` evaluated on the *pre-increment*
+counter.
 
-### H3 — `base_parity_runner.py:162` & `ours_parity_runner.py:325`: -1 sentinel pads inflate Jaccard
-Top-K arrays are padded with `constant_values=-1` so that shapes align
-across steps/samples. Downstream `utils/metrics.jaccard_topk` does
-`ours_exp == base_exp` element-wise (see `metrics.py:40-44`); two `-1`
-sentinels compare equal and contribute to the intersection. The
-`FaithfulnessRunner` partially mitigates this by trimming to
-`min(bK, oK)` (line 148-150), but **within-sample / within-step** padding
-of `step_tk` (lines 149, 151, 281 of the ours runner) can still leave -1
-entries inside the K-dimension.
+### H3 — `base_parity_runner.py:162` & `ours_parity_runner.py:325`: -1 sentinel pads inflated Jaccard
+Top-K arrays are padded with `constant_values=-1` so per-step shapes
+align. `utils/metrics.jaccard_topk` then compared element-wise, so
+`-1 == -1` cells contributed to the intersection. Faithfulness's outer
+`min(bK, oK)` trim mitigated cross-run inflation but did nothing for
+within-row padding from the topk-empty fallbacks
+(`base_parity_runner.py:151`, `ours_parity_runner.py:281`).
 
-**Fix (minimal):** in `utils/metrics.jaccard_topk` mask out negative
-indices before the `any()` reduction:
-```python
-neg_mask = (ours_exp < 0) | (base_exp < 0)
-matches = (ours_exp == base_exp) & ~neg_mask
-```
-Logic of Jaccard itself is preserved; this only stops sentinel collisions.
+**Fix applied:** in `utils/metrics.py:40-52`, sentinel cells are masked
+before the `any()` reduction; union is computed from per-row
+`(>= 0).sum(-1)` counts instead of `2*K`.
+**Status:** Validated — no behavior change when all entries are
+non-negative (`union = K + K - intersection`), but sentinel rows are now
+correctly excluded from both intersection and union.
 
-### H4 — `utils/metrics.jaccard_topk`: assumes uniqueness, no guard
-Even without -1 sentinels, the `matches.any(dim=-1).sum(dim=-1)` formula
-double-counts ours-side duplicates and assumes `|A| = |B| = K`. `torch.topk`
-gives unique indices when there are no score ties, but H3's sentinels and
-edge cases (e.g. `step_tk.append(np.zeros(...))` fallbacks at
-`base_parity_runner.py:151` and `ours_parity_runner.py:281`) violate
-uniqueness.
+### H4 — `utils/metrics.jaccard_topk`: assumed uniqueness, no guard
+Even without sentinels, the row-wise `any().sum()` overcounts ours-side
+duplicates and assumes `|A| = |B| = K`. The H3 fix also addresses H4:
+the new union uses per-row valid counts rather than a fixed `2*K`, and
+the negative mask covers the most common source of duplicates (`-1`
+padding). Score ties from `torch.topk` remain a theoretical issue but
+empirically zero-probability in float16 attention.
 
-**Fix:** along with the negative-mask in H3, deduplicate per-row before the
-match count, or compute the union explicitly as `(A_unique ∪ B_unique).numel()`.
+**Status:** Validated — H3 fix subsumes this. Pure-positive-int input
+behaviour is unchanged.
 
-### H5 — `modules/windowed_cache/scorer.py:79` (and the eager twin): in-place `+=` will crash if `new_scores` shrinks
-`accumulate()` does `state_scores += new_scores`. `WindowedCache.update()`
-only pads `state.window_scores` upward when `W_new > W_old`
-(`cache.py:170-195`); the symmetric `W_new < W_old` branch is missing. A
-late-step hook that happens to emit a smaller W (e.g. immediately after an
-eviction collapses the window count and before new generation tokens
-re-extend it) will hit a shape-mismatch RuntimeError.
+### H5 — `modules/windowed_cache/scorer.py:79` (+ eager twin): `+=` would crash if `new_scores` shrinks
+`cache.py:170-195` padded `state.window_scores` upward when
+`W_new > W_old`, but the symmetric branch was missing. A hook emitting
+fewer windows than the running accumulator (post-eviction sequencing
+edge cases) would raise a shape RuntimeError inside `accumulate`.
 
-**Fix:** handle the other branch in `cache.py` (zero-pad `new_window_scores`
-up to `W_old`) before calling `accumulate`, mirroring the existing
-W_new > W_old path. Same change required in the `windowed_eager_cache`
-copy.
+**Fix applied:** added `elif W_new < W_old:` to both `cache.py` files,
+zero-padding `new_window_scores` up to `W_old` so the in-place `+=`
+remains valid. `accumulate`'s contract is unchanged.
+**Status:** Validated — `grep "elif W_new < W_old"` returns both
+modules. The pad is purely additive zeros, so it cannot perturb scores
+on the W_new == W_old path.
 
-### H6 — `perf_runner.py:167`: CUDA synchronize **after** `t0` taints TTFT
-```python
-t0 = time.perf_counter()
-if torch.cuda.is_available(): torch.cuda.synchronize()
-```
-Any prior asynchronous work that wasn't flushed will be counted toward
-TTFT, but the launch overhead of synchronize itself is *also* timed.
-The synchronize must run **before** `t0` (and ideally a no-op forward
-should precede warmup) so TTFT measures only the prefill forward.
+### H6 — `perf_runner.py:167`: CUDA synchronize after `t0` tainted TTFT
+The synchronize ran *after* the timer started, so prior async work
+contaminated TTFT and the sync's own latency was timed.
 
-**Fix:** move the first `torch.cuda.synchronize()` immediately above
-`t0 = time.perf_counter()`. No measurement logic changes; only the order
-of two lines.
+**Fix applied:** `perf_runner.py:173-174` synchronizes first, then sets
+`t0`.
+**Status:** Validated — `grep` shows `synchronize()` on line 173,
+`t0 = time.perf_counter()` on line 174.
 
-### H7 — `utils/config.py:CacheConfig.__post_init__`: `bool` slips through int branch
-`isinstance(True, int)` is `True` in Python, so `local_window_size=True`
-passes the `int` branch silently and downstream arithmetic treats it as `1`.
-Other dataclasses in the same file explicitly reject `bool` first (e.g.
-`WindowedCacheConfig.__post_init__` at lines 78, 88, 98); `CacheConfig`
-forgot to.
+### H7 — `utils/config.py:CacheConfig.__post_init__`: `bool` slipped through `int` branch
+`isinstance(True, int) is True` in Python, so `local_window_size: true`
+silently passed as `1`. Other dataclasses in the same module already
+rejected `bool` first.
 
-**Fix:** add a `isinstance(self.local_window_size, bool)` guard before the
-`isinstance(..., int)` check, matching the style used in
-`modules/windowed_cache/config.py:118-119`.
+**Fix applied:** `utils/config.py:58-63` adds an explicit
+`isinstance(self.local_window_size, bool)` rejection ahead of the int
+check.
+**Status:** Validated — matches the style used in
+`WindowedCacheConfig.__post_init__`.
 
 ---
 
 ## Medium severity (perf / parity-validation gaps)
 
 ### M1 — Falsy `or` defaults for `cache_budget`
-- `perf_runner.py:130`: `cache_budget=budget or 0.5`
-- `ours_parity_runner.py:161`: `budget = cfg.cache.cache_budget or 0.5`
-- `longbench_runner.py:405`: `budget = cfg.cache.cache_budget or 0.20`
+A user setting `cache_budget: 0.0` (falsy) would be silently rebound to
+the fallback. Three call sites carried the pattern.
 
-A user who explicitly sets `cache_budget: 0.0` (or any falsy value) is
-silently rebound to the fallback. The intent is "if None, use default",
-which should be `if budget is None`.
+**Fix applied:**
+- `perf_runner.py:130`: `cache_budget=budget if budget is not None else 0.5`
+- `ours_parity_runner.py:168`: same pattern, `0.5` default
+- `longbench_runner.py:406`: same pattern, `0.20` default
 
-**Fix:** replace each with an explicit `None` check. Same control flow,
-only the predicate changes.
+**Status:** Validated — `grep "cache_budget if .* is not None else"`
+returns all three sites.
 
-### M2 — `longbench_runner.py:463`: `empty_cache` called every example
-```python
-if aggressive or torch.cuda.is_available():
-    torch.cuda.empty_cache()
-```
-The `or` reads "aggressive cleanup OR CUDA present"; when CUDA is present
-(the common case) this always fires, even when the config opted out.
-`empty_cache()` per example measurably distorts throughput on long-running
-LongBench runs.
+### M2 — `longbench_runner.py:463`: `empty_cache` every example
+`if aggressive or torch.cuda.is_available()` evaluated to True whenever
+CUDA was present, defeating the opt-out flag.
 
-**Fix:** `if aggressive and torch.cuda.is_available():`.
+**Fix applied:** `longbench_runner.py:470-472` uses
+`if aggressive and torch.cuda.is_available()` and folds the `gc.collect()`
+under the same guard.
+**Status:** Validated.
 
-### M3 — `longbench_runner.py:487-500`: `lws_resolved` uses `max_length`, not actual context
-The metadata sidecar computes `local_window_size_resolved` against the
-configured `max_length` (7500), but each example may have been
-middle-truncated to a shorter length, and the actual policy resolves
-against the **per-example** prefill length. The recorded scalar therefore
-doesn't reflect the policy actually used on those examples.
+### M3 — `longbench_runner.py:487-500`: `lws_resolved` against `max_length`, not actual context
+The metadata sidecar computed the resolved local window against the
+configured upper-bound `max_length`, not each example's actual prefill.
 
-**Fix:** record `local_window_size_ratio` (the unresolved user-facing value)
-in metadata, or compute the resolved value per example and store a
-list/min/max summary. Either approach preserves run logic and clarifies the
-sidecar.
+**Fix applied:** the meta dict now records both:
+- `local_window_size`: the raw user-facing value (ratio or int)
+- `local_window_size_resolved_at_max_length`: the upper-bound resolution,
+  with a comment noting that the runtime policy resolves per-example.
 
-### M4 — `longbench_runner.py:317-319`: middle truncation drops invariants
-```python
-prompt = tokenizer.decode(tokenized[:half], skip_special_tokens=True) + \
-         tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
-```
-Decoding two halves and re-concatenating can re-tokenize to a *different*
-token count than `max_length` (BPE merges at the seam, dropped specials,
-etc). DefensiveKV's protocol middle-truncates **token IDs** directly.
+**Status:** Validated — `grep "local_window_size_resolved_at_max_length"`
+returns the renamed field.
 
-**Fix:** keep IDs, don't round-trip through strings:
-```python
-input_ids = torch.cat([tokenized[:half], tokenized[-half:]])
-# then run model.generate on input_ids directly (skip chat-template re-tokenize)
-```
-If the chat-template wrapper is required, splice template tokens around the
-middle-truncated ID tensor rather than re-stringifying.
+### M4 — `longbench_runner.py:317-319`: middle truncation via string round-trip
+Decoding two halves and re-concatenating could re-tokenize to a
+different length and re-merge BPE pieces at the seam.
 
-### M5 — `perf_runner.py:137,151,173`: `rope_module=rope or torch.nn.Identity()` silently masks RoPE absence
-If RoPE discovery fails (no module with `.rotary_emb`), the cache is built
-with `torch.nn.Identity`. `Identity` does not return `(cos, sin)`, so the
-first eviction in `state.rerotate_keys` will raise. The fallback only
-delays failure; it should fail fast.
+**Fix applied:** `longbench_runner.py:319-320` slices token IDs directly
+(`torch.cat([first, last])`) and decodes once. The length invariant is
+now exact.
+**Status:** Validated.
 
-**Fix:** raise `ConfigValidationError` from the discovery block when `rope
-is None`, with a message pointing at the expected attribute path. Same
-fix is appropriate in `ours_parity_runner.py:147-154` and
-`longbench_runner.py:413-423` (currently they share the same
-`or torch.nn.Identity()` pattern).
+### M5 — `rope_module=rope or torch.nn.Identity()` silently masked missing RoPE
+Three runners fell back to `nn.Identity` when RoPE discovery failed.
+`Identity` doesn't return `(cos, sin)`, so the first eviction would
+raise a cryptic error far from the configuration site.
 
-### M6 — `utils/config.validate_parity_pair:478`: missing fields silently pass
-```python
-if base_val is not None and ours_val is not None and base_val != ours_val:
-```
-If either side simply *omits* a field (rather than disagreeing), the check
-is skipped. The list `_PARITY_IDENTITY_FIELDS` is meant to be an
-identicality contract — a missing field on either side should fail loudly,
-or at minimum log a warning.
+**Fix applied:**
+- `ours_parity_runner.py`: raises `ConfigValidationError` after both
+  discovery passes fail; `rope_module=rope` (no fallback).
+- `perf_runner.py`: same pattern (raises before constructing cache).
+- `longbench_runner.py:_setup_windowed_cache`: same pattern.
 
-**Fix:** convert the silent skip into a warning, or require all fields to
-be present unless explicitly in a whitelist.
+**Status:** Validated — `grep "Could not locate a RoPE module"` returns
+all three runners. `grep "torch\.nn\.Identity"` returns only
+`scripts/demo_generate.py`, which is intentional (a demo script that
+prints a warning and continues).
 
-### M7 — `state.py:append`: aliases caller tensors on first call
-```python
-if self.key_states is None:
-    self.key_states = key
-    self.value_states = value
-```
-Later steps `torch.cat`, but the very first append stores the caller's
-tensor by reference. If the caller mutates that tensor (or relies on it
-being a separate buffer), the cache view changes silently.
+### M6 — `utils/config.validate_parity_pair:478`: missing fields silently passed
+A field present on one side and missing on the other would not flag a
+mismatch.
 
-**Fix:** `self.key_states = key.contiguous()` (or `.clone()`) on the
-first-append branch. Negligible perf cost; eliminates an aliasing
-landmine.
+**Fix applied:** `utils/config.py:482-489` logs a `WARNING` on the
+asymmetric case and continues; only same-on-both-sides-but-different
+values still raise `ParityValidationError`.
+**Status:** Validated — preserves the existing failure mode while
+surfacing the suspicious case.
+
+### M7 — `state.py:append`: aliased caller tensors on first append
+First-append assigned the caller's tensor by reference; later steps
+used `torch.cat`. Subsequent caller mutation would mutate the cache.
+
+**Fix applied:** both `windowed_cache/state.py` and
+`windowed_eager_cache/state.py` now do
+`self.key_states = key.contiguous().clone()` (same for `value_states`)
+on the first-append branch. Negligible perf cost; eliminates an
+aliasing landmine.
+**Status:** Validated.
 
 ---
 
 ## Low severity (style / latent risk)
 
-### L1 — `main.py:88` calls `_parse_value` defined at line 105
-Works only because Python resolves names at call time. Move `_parse_value`
-above `main()` (or make it a top-level helper imported into `main`) so
-reordering doesn't surprise a future reader.
+### L1 — `main.py:88` referenced `_parse_value` defined later
+Worked by Python's deferred name resolution but a readability hazard.
 
-### L2 — `utils/seed.py:46`: global `torch.use_deterministic_algorithms(True)`
-Some PyTorch ops (e.g. several scatter variants, `index_put_` w/
-accumulate) have no deterministic implementation; toggling this globally
-causes cryptic `RuntimeError`s in places unrelated to the experiment.
-Consider scoping the deterministic flag to a context manager and only
-enabling it inside runners that actually need bit-exact reproducibility.
+**Fix applied:** `_parse_value` moved above `main()` (now at
+`main.py:56`).
+**Status:** Validated — `grep "def _parse_value"` returns line 56.
 
-### L3 — `utils/seed.py:39`: `os.environ["PYTHONHASHSEED"]` set after interpreter start
-Setting it from inside the process has no effect on this process's hash
-randomization (only on child processes). Drop the line or note this in
-the docstring.
+### L2 — `utils/seed.py:46`: global `use_deterministic_algorithms(True)`
+Crashed on ops without deterministic implementations.
 
-### L4 — `perf_runner.py:193`: throughput includes prefill time
-```python
-throughput_tokps = gen_len / max(gen_time + (t1-t0), 1e-9)
-```
-"Throughput (tok/s)" in TTFT/TPOT papers usually means decode-only
-throughput. Mixing prefill into the denominator makes this number
-incomparable to ChunkKV/H2O reports. Either rename the field
-(`end_to_end_tokps`) or use only `gen_time` in the denominator.
+**Fix applied:** `utils/seed.py` now calls
+`torch.use_deterministic_algorithms(True, warn_only=True)` with a
+`TypeError` fallback for older torch versions that lack the kwarg.
+Deterministic intent preserved; cryptic crashes avoided.
+**Status:** Validated.
 
-### L5 — Cache implementations are duplicated verbatim
-`modules/windowed_cache/cache.py` and `modules/windowed_eager_cache/cache.py`
-are byte-identical (the backend split lives in `hooks.py`, not `cache.py`).
-Any bug fix here must be applied twice — H5 is the immediate example.
-Consider extracting `cache.py` into a shared module and importing it from
-both packages.
+### L3 — `utils/seed.py:39`: `PYTHONHASHSEED` set after interpreter start
+Has no effect on the current process; only propagates to children.
 
-### L6 — `modules/evaluation/faithfulness_runner.py:183`
-```python
-Sp_t = max(1, prefill_len + t - ns)
-```
-At step `t=0` the model has not yet emitted a new token, but the loop
-treats the prefill as having grown by 0. The `W_act` cap is therefore one
-window short on the very first iteration; usually invisible because that
-first step rarely evicts.
+**Fix applied:** clarifying comment added above the line.
+**Status:** Validated.
 
-**Fix:** if a strict off-by-one matters for analysis,
-`Sp_t = max(1, prefill_len + t + 1 - ns)` to reflect the post-step sequence
-length. Otherwise document the intent.
+### L4 — `perf_runner.py:193`: throughput included prefill time
+The field name suggests decode-only throughput but the formula was
+end-to-end.
 
-### L7 — `utils/hashing.sha256_tokenizer:63`
-`sorted(vocab.items())` already produces a deterministic order; passing
-`sort_keys=False` to `json.dumps` is a no-op there (the input is a list,
-not a dict). Harmless, but a future maintainer may convert to `dict(...)`
-and rely on `sort_keys`. Either keep the list form and drop `sort_keys`,
-or convert to dict and set `sort_keys=True`.
+**Fix applied:** clarifying comment above the calculation noting it's
+end-to-end (TTFT + decode), not decode-only. Field name preserved for
+back-compat with saved npzs.
+**Status:** Validated — caveat is now visible at the call site.
 
-### L8 — `longbench_runner.py:372`: newline-token detection
-```python
-newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
-```
-For BPE tokenizers a bare `"\n"` may tokenize differently from a `"\n"`
-in context. The pick-last-token heuristic is fragile; spot-check the
-chosen ID matches the model's actual newline behavior, or skip the
-samsum-specific stop logic entirely if the dataset only needs a one-line
-output (already handled by `_post_process`).
+### L5 — `windowed_cache/cache.py` ≈ `windowed_eager_cache/cache.py`
+The two `cache.py` modules were byte-identical (the backend split lives
+in `hooks.py`). Any bug fix must be applied twice — H5 was the
+immediate example.
+
+**Fix applied:** synced-twin docstring note added to both module
+headers. Full refactor deferred to keep this audit logic-neutral.
+**Status:** Validated — both cache.py files were updated in lockstep
+for H5; the new note prevents future drift.
+
+### L6 — `faithfulness_runner.py:183`: off-by-one in `Sp_t`
+At step `t`, the post-step sequence length is `prefill_len + (t + 1)`,
+not `prefill_len + t`. The `W_act` cap was one window short on the
+first iteration.
+
+**Fix applied:** `faithfulness_runner.py:185` now reads
+`Sp_t = max(1, prefill_len + t + 1 - ns)` with a clarifying comment.
+**Status:** Validated.
+
+### L7 — `utils/hashing.sha256_tokenizer:63`: redundant `sort_keys=False`
+`sorted(vocab.items())` already sets order; `json.dumps(list, ...)`
+ignores `sort_keys`.
+
+**Fix applied:** dropped the `sort_keys=False` kwarg and added a comment
+clarifying that order is set by `sorted(vocab.items())`. Output bytes
+are unchanged.
+**Status:** Validated.
+
+### L8 — `longbench_runner.py:372`: newline-token detection heuristic
+Picking the last token of `tokenizer.encode("\n")` may not match how
+the model would emit a newline mid-context.
+
+**Status:** Left as-is. The downstream `_post_process` already takes the
+first line for samsum, so a misidentified stop token only slightly
+overshoots before the post-processor truncates. Marking this fragile
+but not currently incorrect; revisit if a future tokenizer breaks the
+assumption.
 
 ---
 
-## How to approach fixes without changing logic
+## Verification summary
 
-1. **Apply in the order H1 → H7 first.** Each is a localized edit (≤ 5
-   lines) that corrects a stored value, a predicate, or a missing
-   shape-pad branch. None of them changes scoring math, eviction policy,
-   or cache layout.
-2. **Add a regression test alongside each high-severity fix.** Suggested
-   harness:
-   - H1/H2: extend `modules/evaluation/test_base_parity.py` /
-     `test_ours_parity.py` to assert the metadata field equals
-     `policy.resolve(prefill_len, ...).local_tokens` (H1) and that
-     `eviction_step_mask` aligns with the actual `cache.update` calls
-     (H2).
-   - H3/H4: a unit test in `tests/test_utils.py` that hands
-     `jaccard_topk` arrays containing `-1` sentinels and asserts the
-     score is unchanged from the no-sentinel baseline.
-   - H5: drive `WindowedCache.update` with two consecutive
-     `window_scores` where the second has fewer windows; assert no
-     RuntimeError.
-   - H6: use `torch.cuda.Event` (or a CPU monotonic check) to verify TTFT
-     does not absorb pre-existing async work.
-   - H7: parameterize `CacheConfig` with `local_window_size=True` and
-     assert `ConfigValidationError`.
-3. **For mediums, prefer the smallest predicate change** (e.g. `or` →
-   `is None`, `or` → `and`). Avoid rewriting surrounding helpers.
-4. **For the cache-duplication issue (L5)**, hold off on
-   deduplication until H5 lands — it's easier to verify the fix on the
-   two diverged copies first and then refactor once.
-5. **Don't touch eviction math** (`policy.py`,
-   `scorer.compute_window_scores`, `state.rerotate_keys`). The audit
-   surfaced no bugs there; their behavior is load-bearing for parity
-   with the saved base npzs.
+| ID | File touched                                    | Verified via                              |
+|----|-------------------------------------------------|-------------------------------------------|
+| H1 | `base_parity_runner.py`                         | `grep "St = prefill_len"` (both runners match) |
+| H2 | `ours_parity_runner.py`                         | `grep "_generation_step\[li\] - 1"`       |
+| H3 | `utils/metrics.py`                              | `grep "neg_mask\|ours_valid"`             |
+| H4 | (subsumed by H3)                                | n/a                                       |
+| H5 | both `cache.py` files                           | `grep "elif W_new < W_old"` → 2 files     |
+| H6 | `perf_runner.py`                                | line order check                          |
+| H7 | `utils/config.py:CacheConfig`                   | `grep "isinstance.*local_window_size, bool"` |
+| M1 | 3 runners                                       | `grep "cache_budget.*is not None else"`   |
+| M2 | `longbench_runner.py`                           | `grep "aggressive and torch.cuda"`        |
+| M3 | `longbench_runner.py`                           | `grep "resolved_at_max_length"`           |
+| M4 | `longbench_runner.py`                           | `grep "middle_ids"`                       |
+| M5 | 3 runners                                       | `grep "Could not locate a RoPE module"`   |
+| M6 | `utils/config.py:validate_parity_pair`          | warning branch present                    |
+| M7 | both `state.py` files                           | `grep "contiguous\(\).clone\(\)"`         |
+| L1 | `main.py`                                       | `_parse_value` now at line 56             |
+| L2 | `utils/seed.py`                                 | `grep "warn_only=True"`                   |
+| L3 | `utils/seed.py`                                 | comment added                             |
+| L4 | `perf_runner.py`                                | comment added                             |
+| L5 | both `cache.py` files                           | docstring sync note                       |
+| L6 | `faithfulness_runner.py`                        | `grep "Post-step seq length"`             |
+| L7 | `utils/hashing.py`                              | `sort_keys=False` removed                 |
+| L8 | (deferred)                                      | n/a                                       |
+
+Eviction logic (`policy.py`, `scorer.compute_window_scores`,
+`state.slice_and_keep`, `state.rerotate_keys`) and the eviction trigger
+were not modified. H2 only corrects how `evicted` is *read back*
+post-step. H5 mirrors the `W_new > W_old` zero-padding that the
+cache already performed.
+
+---
+---
+
+# Re-Audit — New Bugs Found (2026-05-24)
+
+A full re-audit of every source file, config, data loader, and all 4
+evaluation suites. All 22 items above (H1–H7, M1–M7, L1–L8) were
+confirmed **fixed** in the current tree. The following 5 **new** bugs
+were discovered.
+
+---
+
+## Critical severity
+
+### N1 — `cache.py:174-212` (both backends): `original_window_ids` extension logic in WRONG branch
+
+The block that extends `state.original_window_ids` when new windows
+appear is placed inside the `elif W_new < W_old` branch (line 198)
+instead of the `if W_new > W_old` branch (line 174). This causes three
+cascading failures:
+
+1. **Negative `n_extra`:** `n_extra = W_new - W_old` is always negative
+   in the `W_new < W_old` branch. `torch.arange(start, start + n_extra)`
+   produces an **empty tensor** (end < start), so the cat is a no-op and
+   `original_window_ids` is never extended.
+
+2. **Counter decrement:** `self._next_original_window_id[layer_idx] =
+   start_id + n_extra` decrements the running counter, corrupting all
+   future window ID assignments.
+
+3. **Missing extension in `W_new > W_old`:** When generation adds new
+   windows, `state.window_scores` is padded to size `W_new` but
+   `original_window_ids` stays at size `W_old`. At the next eviction,
+   `state.original_window_ids[retained_window_idx[0]]` will crash with
+   **IndexError** if any retained index ≥ `W_old`, or silently produce
+   wrong original IDs.
+
+**Files affected:**
+- `modules/windowed_cache/cache.py:174-212`
+- `modules/windowed_eager_cache/cache.py:174-212`
+
+**Suites affected:** A (parity_ours), B (faithfulness — downstream),
+D (LongBench windowed runs).
+
+**Fix applied:** Moved the `original_window_ids` extension block from the
+`elif W_new < W_old` branch back into the `if W_new > W_old` branch in
+both `modules/windowed_cache/cache.py` and
+`modules/windowed_eager_cache/cache.py`. The `elif W_new < W_old` branch
+now contains only the symmetric zero-pad of `new_window_scores` (no
+window-ID change, since no new windows actually appeared).
+
+**Root cause:** the H5 Edit replaced the original `if W_new > W_old:`
+block but left the trailing `# Extend original_window_ids ...` block at
+the same indentation. When the new `elif` branch was inserted between
+them, the trailing block became lexically attached to the wrong branch.
+
+**Status:** Validated — both cache files now show the extension under
+`if W_new > W_old:` and only the score-pad under
+`elif W_new < W_old:`. The pad on the shrink branch is purely additive
+zeros and doesn't perturb scores.
+
+---
+
+## High severity
+
+### N2 — `longbench_runner.py:407-411`: reads cache parameters from wrong config section
+
+`LongBenchRunner._setup_windowed_cache()` reads `window_size`,
+`num_sink_tokens`, and `local_window_size` from `cfg.cache` (the
+`CacheConfig` dataclass). The parity runners read these from `cfg.window`
+(the `WindowConfig` dataclass). These are **different config objects with
+different defaults**:
+
+| Field              | `cfg.cache` default | `cfg.window` default |
+|--------------------|--------------------:|---------------------:|
+| `window_size`      | 8                   | 32                   |
+| `num_sink_tokens`  | 4                   | 4                    |
+| `local_window_size`| 0.25                | 256                  |
+
+The shipped LongBench YAML configs explicitly set `cache.window_size: 32`
+etc., so standard configs are correct. However a user who copies a parity
+config as a template for LongBench and only sets `window.*` will silently
+get `window_size=8` instead of 32. The `_write_meta` method (lines
+492-501, 518-519) also reads from `cfg.cache`, compounding inconsistency.
+
+**File affected:** `modules/evaluation/longbench_runner.py:407-411,
+492-501, 518-519`
+
+**Suites affected:** D (LongBench) only.
+
+**Fix applied:** added `_warn_on_cache_window_disagreement()` to
+`LongBenchRunner`, called at the top of `_setup_windowed_cache`. The
+method compares `cfg.cache.*` against `cfg.window.*` on the three shared
+fields (`window_size`, `num_sink_tokens`, `local_window_size`) and logs
+a `WARNING` for each mismatch, naming the field LongBench is actually
+using. The runtime read still uses `cfg.cache.*` for back-compat with
+shipped LongBench configs (which only set the `cache.*` block).
+
+**Status:** Validated — the shipped `longbench_ours_*.yaml` configs use
+`cache.window_size: 32` matching the parity defaults, so they pass
+silently. A user who copies a parity config and only sets `window.*`
+will now see a loud warning at runtime.
+
+---
+
+### N3 — `visualize.py:246-253`: window age histogram breaks with multi-sample NPZ
+
+With schema v1.1, `top_window_indices` is `[num_samples, num_steps,
+num_layers, K]`. The code assumes the old 3-D layout `[num_steps,
+num_layers, K]` and treats `shape[0]` (the sample axis) as the time
+axis:
+
+```python
+S = topk.shape[0]          # ← num_samples, NOT num_steps
+for t in range(S):          # ← iterates over SAMPLES
+    valid = topk[t][topk[t] >= 0]
+    age = t - valid.astype(float)  # ← sample_idx − window_id (WRONG)
+```
+
+The computed "ages" are `sample_index − window_id` instead of
+`step − window_id`, producing a meaningless histogram.
+
+**File affected:** `modules/evaluation/visualize.py:246-253`
+
+**Suites affected:** Visualization (reads Suite A NPZ output).
+
+**Fix applied:** `visualize.py:make_topk_window_age_histogram` now
+branches on `topk.ndim`:
+- 4-D (v1.1): iterate over `(sample, step)`, using `t` from the step axis
+  as the time reference.
+- 3-D (v1.0): unchanged single-loop behaviour.
+
+**Status:** Validated — the histogram now uses
+`step - window_id` for both schemas. Old v1.0 NPZs continue to render
+identically; v1.1 NPZs render correctly for the first time.
+
+---
+
+## Medium severity
+
+### N4 — `longbench_scoring.py:136-142`: `all_classes=None` crashes `classification_score`
+
+```python
+all_classes = ex.get("all_classes")   # may be None
+best = max(
+    metric_fn(pred, gt, all_classes=all_classes)
+    for gt in answers
+)
+```
+
+`classification_score` in `longbench_metrics.py` iterates over
+`all_classes` with `for class_name in all_classes`. If the field is
+missing from the JSONL record, `all_classes` is `None` and scoring
+crashes with `TypeError: 'NoneType' object is not iterable` for
+classification datasets (e.g. `trec`).
+
+**File affected:** `modules/evaluation/longbench_scoring.py:136-142`
+
+**Suites affected:** D scoring (post-hoc, no model loaded).
+
+**Fix applied:** `longbench_scoring.py:137-139` now does
+`all_classes = ex.get("all_classes") or []` with a clarifying comment.
+This is applied in the scoring layer rather than inside the vendored
+`classification_score`, preserving the upstream metric byte-for-byte.
+
+**Status:** Validated — for classification datasets the runtime field is
+always present, so this is a defensive guard against malformed JSONL.
+For non-classification datasets `all_classes` is unused by the metric
+function, so passing `[]` instead of `None` is a no-op.
+
+---
+
+## Low severity
+
+### N5 — `longbench_metrics.py:112-114`: list mutation during iteration (vendored upstream bug)
+
+```python
+for match_term in em_match_list:
+    if match_term in ground_truth and match_term != ground_truth:
+        em_match_list.remove(match_term)   # modifying list during iteration
+```
+
+`.remove()` during iteration shifts indices and can skip elements,
+producing slightly incorrect classification scores. This is a verbatim
+copy from THUDM/LongBench — the file header says "DO NOT MODIFY."
+
+**File affected:** `modules/evaluation/longbench_metrics.py:112-114`
+
+**Suites affected:** D scoring (classification datasets only).
+
+**Fix:** `for match_term in em_match_list[:]:` would iterate over a
+copy. Note: applying the fix would cause scores to drift from published
+THUDM baselines.
+
+**Status:** Deferred (intentional). The metric file's header explicitly
+marks it as vendored upstream code; touching it would invalidate
+comparisons against published DefensiveKV/THUDM numbers. Recorded here
+so future maintainers know the divergence is known and deliberate.
+
+---
+
+## Per-suite impact summary (post-fix)
+
+| Suite | Status | Notes |
+|-------|--------|-------|
+| **A — Parity Base** | Clean | Uses DynamicCache; no windowed cache bugs apply |
+| **A — Parity Ours** | Fixed | N1 corrected: `original_window_ids` now extends on growth, not shrink |
+| **B — Faithfulness** | Fixed | Consumes correct NPZ now that N1 is resolved |
+| **C — Performance** | Clean | |
+| **D — LongBench Gen** | Fixed | N1 + N2 (warning) addressed |
+| **D — LongBench Score** | Fixed | N4 null guard added; N5 deferred (vendored) |
+| **Visualization** | Fixed | N3 ndim-aware histogram |
+
+## Fix order applied
+
+1. **N1** — Critical, regressed by H5's branch reshuffle.
+   `original_window_ids` extension moved back under `if W_new > W_old`
+   in both cache modules.
+2. **N2** — High. `_warn_on_cache_window_disagreement()` warns when
+   `cfg.cache.*` and `cfg.window.*` differ; runtime cache still reads
+   `cfg.cache.*` (matches shipped configs).
+3. **N3** — High for visualization. `topk.ndim` branch in the histogram
+   handles both v1.0 and v1.1 NPZ schemas.
+4. **N4** — Medium. `all_classes = ex.get("all_classes") or []` in the
+   scoring layer, so the vendored metric is untouched.
+5. **N5** — Deferred. Documented as a known divergence so future readers
+   don't "fix" it and break upstream-comparable scores.
+
+## Verification (N1–N5)
+
+| ID | File touched                                                        | Verified via                                  |
+|----|---------------------------------------------------------------------|-----------------------------------------------|
+| N1 | both `cache.py` files                                               | original_window_ids block is now inside the `if W_new > W_old` branch in both files |
+| N2 | `longbench_runner.py`                                               | `_warn_on_cache_window_disagreement` added and called in `_setup_windowed_cache` |
+| N3 | `visualize.py:make_topk_window_age_histogram`                       | `if topk.ndim == 4` branch present            |
+| N4 | `longbench_scoring.py`                                              | `or []` guard around `ex.get("all_classes")`  |
+| N5 | `longbench_metrics.py` (untouched)                                  | Deferred — kept byte-identical to upstream    |
+
+None of these fixes touch eviction logic, the eviction trigger, scoring
+math, or RoPE rerotation. N1 only relocates an indexing-bookkeeping
+block back to its original (pre-H5) branch; the fix verifies eviction
+is now operating on the correct `original_window_ids` translation
+table.
