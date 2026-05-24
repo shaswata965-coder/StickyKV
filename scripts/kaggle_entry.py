@@ -24,6 +24,10 @@ _SUITE_TO_CONFIG = {
     "faithfulness": "configs/eval_faithfulness.yaml",
     "perf": "configs/eval_perf.yaml",
     "visualize": "configs/eval_visualize.yaml",
+    "longbench_full": "configs/longbench_full_cache.yaml",
+    "longbench_ours": "configs/longbench_ours_eager.yaml",
+    "longbench_ours_eager": "configs/longbench_ours_eager.yaml",
+    "longbench_ours_flash": "configs/longbench_ours_flash_attn.yaml",
 }
 
 def main():
