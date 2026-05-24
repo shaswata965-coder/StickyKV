@@ -53,6 +53,25 @@ def _import_runner(mode: str):
         sys.exit(1)
 
 
+def _parse_value(val: str):
+    """Try to parse a CLI override value as int, float, bool, or string."""
+    if val.lower() == "true":
+        return True
+    if val.lower() == "false":
+        return False
+    if val.lower() == "none":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        return float(val)
+    except ValueError:
+        pass
+    return val
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="StickyKV — Windowed KV-Cache Evaluation Framework",
@@ -100,25 +119,6 @@ def main() -> None:
 
     runner = RunnerClass(config)
     runner.run()
-
-
-def _parse_value(val: str):
-    """Try to parse a CLI override value as int, float, bool, or string."""
-    if val.lower() == "true":
-        return True
-    if val.lower() == "false":
-        return False
-    if val.lower() == "none":
-        return None
-    try:
-        return int(val)
-    except ValueError:
-        pass
-    try:
-        return float(val)
-    except ValueError:
-        pass
-    return val
 
 
 if __name__ == "__main__":

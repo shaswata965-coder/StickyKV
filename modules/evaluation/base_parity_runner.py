@@ -195,8 +195,9 @@ class BaseParityRunner:
         log.info("Done: %d samples, %.1fs (%.1f tok/s overall)",
                  num_samples, elapsed, total_tokens / max(elapsed, 1e-6))
 
-        # Resolve local_window_size
-        St = prefill_len + gen_len - ns
+        # Resolve local_window_size — must match WindowedCacheConfig.resolve(),
+        # which uses prefill_len - num_sink_tokens (NOT including gen_len).
+        St = prefill_len - ns
         if isinstance(w.local_window_size, float):
             lr = math.ceil(w.local_window_size * St)
             r2 = lr % ws_sz

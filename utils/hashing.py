@@ -59,6 +59,8 @@ def sha256_tokenizer(tokenizer: Any) -> str:
         Any HuggingFace tokenizer exposing a ``get_vocab()`` method.
     """
     vocab = tokenizer.get_vocab()
-    # Canonical ordering: sort by token string to ensure determinism
-    canonical = json.dumps(sorted(vocab.items()), ensure_ascii=True, sort_keys=False)
+    # Canonical ordering: sort by token string to ensure determinism.
+    # The input is a sorted list (not a dict), so json's sort_keys has no
+    # effect here — ordering is set by sorted(vocab.items()) above.
+    canonical = json.dumps(sorted(vocab.items()), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

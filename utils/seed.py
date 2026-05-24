@@ -36,6 +36,9 @@ def seed_everything(seed: int) -> None:
     if not isinstance(seed, int) or seed < 0:
         raise ValueError(f"seed must be a non-negative integer, got {seed!r}")
 
+    # NOTE: Setting PYTHONHASHSEED here does not affect this process's hash
+    # randomization (that's fixed at interpreter startup); it only propagates
+    # to subprocesses launched after this point.
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -43,7 +46,13 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.use_deterministic_algorithms(True)
+    # warn_only=True keeps the deterministic intent without crashing on ops
+    # that lack a deterministic implementation (some scatter/index_put paths).
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        # Older torch without warn_only kwarg.
+        torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
     torch.backends.cudnn.benchmark = False  # type: ignore[attr-defined]
 

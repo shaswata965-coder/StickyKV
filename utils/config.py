@@ -55,6 +55,12 @@ class CacheConfig:
                     f"cache_budget must be in (0, 1], got {self.cache_budget}"
                 )
 
+        if isinstance(self.local_window_size, bool):
+            # bool is a subclass of int in Python; explicitly reject it
+            # so True/False can't silently pass as 1/0.
+            raise ConfigValidationError(
+                f"local_window_size must be int or float, got bool {self.local_window_size!r}"
+            )
         if isinstance(self.local_window_size, int):
             if self.local_window_size % self.window_size != 0:
                 raise ConfigValidationError(
@@ -475,7 +481,14 @@ def validate_parity_pair(
             continue
         base_val = base_meta.get(field_name)
         ours_val = ours_flat.get(field_name)
-        if base_val is not None and ours_val is not None and base_val != ours_val:
+        if base_val is None or ours_val is None:
+            log.warning(
+                "Parity identicality field %r missing on one side "
+                "(base=%r, ours=%r) — skipping comparison.",
+                field_name, base_val, ours_val,
+            )
+            continue
+        if base_val != ours_val:
             mismatches.append(
                 f"  {field_name}: base={base_val!r}, ours={ours_val!r}"
             )

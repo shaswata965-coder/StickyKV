@@ -77,8 +77,10 @@ class CacheState:
             Shape ``[N_new]``.  If ``None``, auto-increments from current length.
         """
         if self.key_states is None:
-            self.key_states = key
-            self.value_states = value
+            # Take ownership: a contiguous clone prevents the cache from
+            # aliasing caller-owned tensors that may be mutated later.
+            self.key_states = key.contiguous().clone()
+            self.value_states = value.contiguous().clone()
         else:
             self.key_states = torch.cat([self.key_states, key], dim=2)
             self.value_states = torch.cat([self.value_states, value], dim=2)

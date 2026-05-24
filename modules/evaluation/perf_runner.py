@@ -127,14 +127,20 @@ class PerfRunner:
             w = cfg.window
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
-                      cache_budget=budget or 0.5)
+                      cache_budget=budget if budget is not None else 0.5)
             rope = None
             for nm, mod in model.named_modules():
                 if hasattr(mod, "rotary_emb"):
                     rope = mod.rotary_emb; break
+            if rope is None:
+                from utils.config import ConfigValidationError
+                raise ConfigValidationError(
+                    "Could not locate a RoPE module on the model. WindowedCache "
+                    "requires a rotary embedding module for key rerotation."
+                )
             cache = WC(config=cc, prefill_len=prefill_len,
                        model_config=model.config, kv_dtype=torch_dtype,
-                       rope_module=rope or torch.nn.Identity(),
+                       rope_module=rope,
                        num_layers=model.config.num_hidden_layers)
             hooks = install_hooks(model, cache, cc)
         gen_kwargs = {}
@@ -148,7 +154,7 @@ class PerfRunner:
                     # Re-create cache for each warmup
                     pkv_w = WC(config=cc, prefill_len=prefill_len,
                                model_config=model.config, kv_dtype=torch_dtype,
-                               rope_module=rope or torch.nn.Identity(),
+                               rope_module=rope,
                                num_layers=model.config.num_hidden_layers)
                     model(input_ids=input_ids, past_key_values=pkv_w, use_cache=True, return_dict=True, **gen_kwargs)
                 else:
@@ -162,15 +168,16 @@ class PerfRunner:
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
                 torch.cuda.synchronize()
-            # TTFT
-            t0 = time.perf_counter()
+            # TTFT — synchronize BEFORE t0 so prior async work doesn't taint
+            # the measurement and the sync's own latency isn't timed.
             if torch.cuda.is_available(): torch.cuda.synchronize()
+            t0 = time.perf_counter()
             with torch.no_grad():
                 pkv = DynamicCache() if cache_backend == "dynamic" else None
                 if cache_backend == "windowed" and cache_pkg:
                     pkv = WC(config=cc, prefill_len=prefill_len,
                              model_config=model.config, kv_dtype=torch_dtype,
-                             rope_module=rope or torch.nn.Identity(),
+                             rope_module=rope,
                              num_layers=model.config.num_hidden_layers)
                 out = model(input_ids=input_ids, past_key_values=pkv, use_cache=True, return_dict=True, **gen_kwargs)
             if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -190,6 +197,8 @@ class PerfRunner:
             t3 = time.perf_counter()
             gen_time = t3 - t2
             tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
+            # End-to-end throughput includes prefill (TTFT) + decode time; this
+            # mirrors the legacy field name but is NOT decode-only.
             throughput_tokps = gen_len / max(gen_time + (t1-t0), 1e-9)
             peak_mb = 0.0
             if torch.cuda.is_available():

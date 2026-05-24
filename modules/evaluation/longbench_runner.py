@@ -313,10 +313,11 @@ class LongBenchRunner:
 
         if len(tokenized) > max_length:
             half = max_length // 2
-            # Middle truncation: keep first half + last half
-            prompt = tokenizer.decode(
-                tokenized[:half], skip_special_tokens=True
-            ) + tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
+            # Middle truncation on TOKEN IDs (not strings) to keep the length
+            # invariant exact and avoid BPE-seam re-merging when decoding then
+            # re-encoding two halves.
+            middle_ids = torch.cat([tokenized[:half], tokenized[-half:]])
+            prompt = tokenizer.decode(middle_ids, skip_special_tokens=True)
 
         # 3. Apply chat template for LLaMA-3-8B-Instruct
         model_name = cfg.model.name.lower()
@@ -402,7 +403,7 @@ class LongBenchRunner:
         cfg = self.config
         model = self.model
 
-        budget = cfg.cache.cache_budget or 0.20
+        budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.20
         cache_config = self.WindowedCacheConfig(
             window_size=cfg.cache.window_size,
             num_sink_tokens=cfg.cache.num_sink_tokens,
@@ -421,6 +422,12 @@ class LongBenchRunner:
                 if hasattr(mod, "rotary_emb"):
                     rope = mod.rotary_emb
                     break
+        if rope is None:
+            from utils.config import ConfigValidationError
+            raise ConfigValidationError(
+                "Could not locate a RoPE module on the model. WindowedCache "
+                "requires a rotary embedding module for key rerotation."
+            )
 
         dtypes = {
             "float16": torch.float16,
@@ -433,7 +440,7 @@ class LongBenchRunner:
             prefill_len=input_ids.shape[-1],
             model_config=model.config,
             kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
-            rope_module=rope or torch.nn.Identity(),
+            rope_module=rope,
             num_layers=model.config.num_hidden_layers,
         )
 
@@ -460,9 +467,8 @@ class LongBenchRunner:
         if cache is not None:
             del cache
         aggressive = getattr(self.lb, "aggressive_cache_clear", False)
-        if aggressive or torch.cuda.is_available():
+        if aggressive and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if aggressive:
             gc.collect()
 
     def _write_meta(
@@ -511,7 +517,11 @@ class LongBenchRunner:
             "compression_ratio": compression_ratio,
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
-            "local_window_size_resolved": lws_resolved,
+            "local_window_size": lws,
+            # NOTE: resolved against `max_length` (upper bound), not the
+            # per-example truncated prefill; the actual policy resolves
+            # against each example's own prefill length at runtime.
+            "local_window_size_resolved_at_max_length": lws_resolved,
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,

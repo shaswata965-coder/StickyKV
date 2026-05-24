@@ -36,16 +36,20 @@ def jaccard_topk(ours_topk: Tensor, base_topk: Tensor) -> Tensor:
     ours_exp = ours_topk.unsqueeze(-1)  # [S, L, H, K, 1]
     base_exp = base_topk.unsqueeze(-2)  # [S, L, H, 1, K]
 
-    # matches[..., i, j] = True iff ours[i] == base[j]
-    matches = ours_exp == base_exp  # [S, L, H, K, K]
+    # Mask out -1 sentinel padding so it doesn't pairwise-match itself.
+    neg_mask = (ours_exp < 0) | (base_exp < 0)
+    # matches[..., i, j] = True iff ours[i] == base[j] (and neither is padding)
+    matches = (ours_exp == base_exp) & ~neg_mask  # [S, L, H, K, K]
 
     # Intersection: count of ours elements that appear in base
     # For each ours element (dim -2), check if any base element matches (dim -1)
     intersection = matches.any(dim=-1).sum(dim=-1).float()  # [S, L, H]
 
-    # Union = |A| + |B| - |A ∩ B|
-    K = ours_topk.shape[-1]
-    union = 2.0 * K - intersection  # [S, L, H]
+    # Union = |A| + |B| - |A ∩ B|, accounting for sentinel-padded entries
+    # which contribute 0 to either set.
+    ours_valid = (ours_topk >= 0).sum(dim=-1).float()  # [S, L, H]
+    base_valid = (base_topk >= 0).sum(dim=-1).float()  # [S, L, H]
+    union = ours_valid + base_valid - intersection  # [S, L, H]
 
     # Avoid division by zero (both sets empty — shouldn't happen with K > 0)
     jaccard = torch.where(

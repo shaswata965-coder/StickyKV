@@ -2,6 +2,10 @@
 
 Orchestration only.  No scoring math, no Top-K math, no attention computation,
 no RoPE math — only calls into :mod:`state` and :mod:`policy`.
+
+NOTE: This module is byte-identical to ``modules/windowed_eager_cache/cache.py``
+(backends only differ in their ``hooks.py``). Any change here MUST be mirrored
+to the eager twin until the duplication is refactored away.
 """
 
 from __future__ import annotations
@@ -177,6 +181,19 @@ class WindowedCache(_HFCacheBase):
                     )
                     state.window_scores = torch.cat(
                         [state.window_scores, pad], dim=-1
+                    )
+                elif W_new < W_old:
+                    # Symmetric pad on the incoming scores so in-place += works
+                    # without changing accumulate's contract.
+                    pad = torch.zeros(
+                        new_window_scores.shape[0],
+                        new_window_scores.shape[1],
+                        W_old - W_new,
+                        device=new_window_scores.device,
+                        dtype=new_window_scores.dtype,
+                    )
+                    new_window_scores = torch.cat(
+                        [new_window_scores, pad], dim=-1
                     )
                     # Extend original_window_ids for new windows using the
                     # running original-sequence counter, not compact-space

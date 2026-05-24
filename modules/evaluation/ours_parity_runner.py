@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
 from utils.cache_factory import get_cache_classes, validate_backend_attn_pairing
-from utils.config import ExperimentConfig, ParityValidationError
+from utils.config import ConfigValidationError, ExperimentConfig, ParityValidationError
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_string, sha256_tokenizer
 from utils.logger import get_logger
@@ -152,13 +152,20 @@ class OursParityRunner:
             for name, mod in model.named_modules():
                 if hasattr(mod, "rotary_emb"):
                     rope = mod.rotary_emb; break
+        if rope is None:
+            raise ConfigValidationError(
+                "Could not locate a RoPE module on the model. WindowedCache "
+                "requires a rotary embedding module for key rerotation; "
+                "expected a submodule named '*rotary*'/'*rope*' or any "
+                "module exposing a `.rotary_emb` attribute."
+            )
 
         # H2O-style cumulative scoring: no observation window — every query row contributes.
         # top_k_windows is derived from cache.cache_budget so the Jaccard signal slices
         # at exactly the K the production eviction policy actually keeps.
         tk = w.resolved_top_k(cfg.cache.cache_budget, prefill_len)
         ns, ws_sz = w.num_sink_tokens, w.window_size
-        budget = cfg.cache.cache_budget or 0.5
+        budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.5
 
         # Per-sample storage
         samples_topk: List[np.ndarray] = []
@@ -187,7 +194,7 @@ class OursParityRunner:
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
-                       rope_module=rope or torch.nn.Identity(),
+                       rope_module=rope,
                        num_layers=n_layers)
             hooks = install_hooks(model, cache, cache_config)
 
@@ -210,8 +217,11 @@ class OursParityRunner:
                             inp = torch.tensor([[forced_tok]], device=model.device)
                         out = model(input_ids=inp, past_key_values=cache, use_cache=True,
                                     return_dict=True, **gen_kwargs)
-                        evicted = any(cache._generation_step[li] > 0 and
-                                      cache._generation_step[li] % ws_sz == 0
+                        # cache.update() increments _generation_step AFTER the
+                        # eviction check, so to read "did this step evict" we
+                        # have to look at (step - 1) modulo ws_sz.
+                        evicted = any((cache._generation_step[li] - 1) > 0 and
+                                      (cache._generation_step[li] - 1) % ws_sz == 0
                                       for li in range(n_layers))
                         all_evict.append(evicted)
                         if getattr(out, "attentions", None):

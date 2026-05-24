@@ -179,7 +179,8 @@ class FaithfulnessRunner:
 
             for t in range(T):
                 bws   = b_ws_s[t]    # [L, H, W_pad]
-                Sp_t  = max(1, prefill_len + t - ns)
+                # Post-step seq length is prefill_len + (t+1); subtract sinks.
+                Sp_t  = max(1, prefill_len + t + 1 - ns)
                 W_act = min(math.ceil(Sp_t / ws_sz), W_pad)
 
                 for li in range(L):
