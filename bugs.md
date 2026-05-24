@@ -532,3 +532,273 @@ math, or RoPE rerotation. N1 only relocates an indexing-bookkeeping
 block back to its original (pre-H5) branch; the fix verifies eviction
 is now operating on the correct `original_window_ids` translation
 table.
+
+---
+---
+
+# Re-Audit Pass 3 — New Bugs Verified (2026-05-24)
+
+A targeted verification pass against three bugs identified in the
+implementation plan. All three are **confirmed real** via code-level
+evidence. Proposed fixes are assessed and validated as correct.
+
+---
+
+## Critical severity
+
+### P1 — `perf_runner.py:141-145,150-181`: hooks bound to stale cache object (Suite C invalid)
+
+The forward hooks for attention scoring are registered **once** on a
+static `cache` object at line 145:
+
+```python
+cache = WC(config=cc, prefill_len=prefill_len, ...)    # L141-L144
+hooks = install_hooks(model, cache, cc)                 # L145
+```
+
+However, both the warmup loop (L150-L164) and measurement loop
+(L167-L209) create **fresh** cache instances for each run:
+
+```python
+# Warmup (L155-L158):
+pkv_w = WC(config=cc, prefill_len=prefill_len, ...)    # NEW cache
+model(input_ids=..., past_key_values=pkv_w, ...)       # model uses pkv_w
+
+# Measurement (L178-L181):
+pkv = WC(config=cc, prefill_len=prefill_len, ...)      # NEW cache
+out = model(input_ids=..., past_key_values=pkv, ...)   # model uses pkv
+```
+
+The hooks close over the original `cache` from L141, which is never
+passed to the model. When hooks fire, they read
+`cache._states[lidx].key_states` which is `None` (never populated),
+warn/exit early, and **never write `window_scores`** to the actual
+cache being used. Three cascading failures result:
+
+1. **No eviction fires** — the windowed cache runs as a full cache.
+2. **No hook overhead measured** — benchmarks omit the scoring cost.
+3. **Suite C numbers are completely invalid** for any windowed config.
+
+**Contrast with `ours_parity_runner.py`** (lines 190-199): hooks are
+correctly installed on the *same* cache object the model receives, and
+removed in the `finally` block. Each sample gets a fresh cache + fresh
+hooks.
+
+**Secondary issue:** RoPE detection at L132-L134 uses only
+`hasattr(mod, "rotary_emb")` — a single-pass heuristic.
+`ours_parity_runner.py` (L148-L154) uses a robust two-pass strategy
+(name-based first, then attribute-based fallback).
+
+**Files affected:** `modules/evaluation/perf_runner.py:104-215`
+
+**Suites affected:** C (Performance) — all windowed cache benchmarks.
+
+**Proposed fix:** Move hook `install_hooks()` / `hooks.remove()` inside
+both the warmup and measurement loops, binding to each fresh `WC`
+instance before running the model. Also adopt the two-pass RoPE
+discovery logic from `ours_parity_runner.py`.
+
+**Status:** Validated and fixed. The outer `cache = WC(...)` and
+`install_hooks(...)` were removed entirely. A small `_make_windowed_cache()`
+closure now creates a fresh cache per loop iteration; `install_hooks(model,
+pkv, cc)` is called *on the same cache the model receives*, and the
+returned `hooks.remove()` is in a `finally` block so a mid-iteration
+exception cannot leak hooks. Two-pass RoPE discovery (name-based, then
+attribute-based) was also adopted from `ours_parity_runner.py`.
+`grep "install_hooks(model, pkv, cc)"` now returns matches at
+both the warmup and measurement sites.
+
+---
+
+## High severity
+
+### P2 — `utils/config.py:51-56`: `CacheConfig.__post_init__` missing type validation for `cache_budget`
+
+The test at `tests/test_utils.py:159-161` asserts:
+
+```python
+def test_rejects_int_budget(self) -> None:
+    with pytest.raises(CfgValidationError, match="float ratio"):
+        CacheConfig(cache_budget=40)
+```
+
+But `CacheConfig.__post_init__` only performs a **range check**, not a
+**type check**:
+
+```python
+def __post_init__(self) -> None:
+    if self.cache_budget is not None:
+        if not (0.0 < self.cache_budget <= 1.0):
+            raise ConfigValidationError(
+                f"cache_budget must be in (0, 1], got {self.cache_budget}"
+            )
+```
+
+When `cache_budget=40` (an `int`):
+- `0.0 < 40 <= 1.0` → `False` → raises `ConfigValidationError`
+- Error message: `"cache_budget must be in (0, 1], got 40"`
+- Does **not** contain `"float ratio"` → `pytest.raises(match=...)` fails
+
+**Contrast with `WindowedCacheConfig`**
+(`modules/windowed_cache/config.py:97-115`): has explicit type guards
+that reject `bool`, then `int` (with message containing `"float ratio"`),
+then non-float, **before** the range check.
+
+**Files affected:** `utils/config.py:51-56`
+
+**Suites affected:** Unit tests (test_rejects_int_budget fails).
+
+**Proposed fix:** Add the same type-check chain to
+`CacheConfig.__post_init__`:
+1. Reject `bool` (subclass of `int`) with clear message
+2. Reject `int` with message containing `"float ratio"`
+3. Reject non-float types
+4. Then perform the existing range check
+
+**Status:** Validated and fixed. `CacheConfig.__post_init__` now mirrors
+the four-step chain from `WindowedCacheConfig.__post_init__`: reject
+`bool` (with "float ratio" in the message), reject `int` (same),
+reject non-`float`, then range-check. The error message on
+`CacheConfig(cache_budget=40)` is now
+`"cache_budget must be a float ratio in (0, 1], got int 40. Use e.g.
+0.40 instead of 40."` — matches the `match="float ratio"` regex.
+
+---
+
+## Medium severity
+
+### P3 — `visualize.py:256,263`: window age calculated with unit mismatch
+
+In `make_topk_window_age_histogram`, the age calculation at lines 256
+and 263:
+
+```python
+age = t - valid.astype(float)
+```
+
+Here:
+- `t` = **generation step index** (a count of decode steps: 0, 1, 2, ...)
+- `valid` = **window indices** from `top_window_indices` (e.g. 0, 1, 5, 12, ...)
+
+These are in **different units**: `t` is in tokens (steps), `valid` is
+in windows (each covering `window_size` tokens). The subtraction is
+dimensionally invalid.
+
+**Example:** At step `t=10` with `valid=[5]` and `window_size=32`:
+- Current code: `age = 10 - 5 = 5` (meaningless)
+- Correct: window 5 starts at token `num_sink + 5 × window_size`.
+  Current position is `prefill_len + t - num_sink` tokens past the sink.
+  Correct age = `(prefill_len + t - num_sink) - 5 × 32` in tokens.
+
+**Consequences:**
+- Small window indices appear "older" than reality
+- Large window indices produce **negative ages** (window index > step count)
+- The entire histogram is distorted — not a valid recency metric
+
+**Note:** This is related to but distinct from N3 (which fixed the
+`ndim` branching for v1.0 vs v1.1 schemas). N3 ensured the correct
+loop structure; P3 addresses the actual age formula used inside both
+branches.
+
+**Files affected:** `modules/evaluation/visualize.py:256,263`
+
+**Suites affected:** Visualization (window age histogram plot).
+
+**Proposed fix:** Calculate correct age in tokens using NPZ metadata:
+
+```python
+age = (prefill_len + t - num_sink) - valid.astype(float) * window_size
+```
+
+Where `prefill_len`, `num_sink`, and `window_size` are read from the
+NPZ's `metadata_json`. The function signature must be updated to pass
+or extract these values.
+
+**Status:** Validated and fixed. `make_topk_window_age_histogram` now
+reads `window_size`, `num_sink_tokens`, and `prefill_len` from the NPZ
+metadata and computes
+`age = (prefill_len + t - num_sink) - valid * window_size` in **tokens**.
+The x-axis label was updated from "Window Age (steps)" to
+"Window Age (tokens)" to reflect the units. Applied in both the 3-D and
+4-D NPZ-schema branches.
+
+---
+
+## Per-suite impact summary (P1–P3)
+
+| Suite | Bug | Impact |
+|-------|-----|--------|
+| **C — Performance** | P1 (Critical) | All windowed cache benchmarks are invalid — eviction never fires, hook overhead not measured |
+| **Unit tests** | P2 (High) | `test_rejects_int_budget` fails |
+| **Visualization** | P3 (Medium) | Window age histogram is distorted by unit mismatch |
+
+## Verification plan
+
+| ID | Fix target | Verification |
+|----|------------|--------------|
+| P1 | `perf_runner.py:_measure_config` | Hooks installed per-loop iteration; `grep "install_hooks"` inside warmup/measurement blocks |
+| P2 | `utils/config.py:CacheConfig.__post_init__` | `pytest tests/test_utils.py::TestCacheConfig::test_rejects_int_budget` passes |
+| P3 | `visualize.py:make_topk_window_age_histogram` | Formula uses `* window_size`; `grep "window_size"` in age calculation |
+
+None of these fixes touch eviction logic, scoring math, RoPE
+rerotation, or the eviction trigger.
+
+---
+---
+
+# End-to-End Audit Pass 4 — 2026-05-24
+
+After applying P1–P3, a full sweep over every source file (runners,
+caches, hooks, configs, data loaders, scripts, tests, vendored
+metrics, telemetry). Result: **one additional finding**, recorded
+below for transparency. No further behavioural bugs were found in
+the eviction, scoring, RoPE, faithfulness, or LongBench pipelines
+beyond what is already documented above.
+
+### E1 — `perf_runner.py:109-111`: tokenizer loaded but never used (dead code)
+
+```python
+tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, revision=cfg.model.revision)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+```
+
+The tokenizer is loaded inside `_measure_config` but the runner uses
+randomly-generated `input_ids` (`torch.randint(100, 30000, ...)`). The
+tokenizer is referenced nowhere else; the lines are pure dead code.
+Cost: an HTTP round-trip to HuggingFace (or a disk cache hit) per
+`(prefill_len, gen_len)` cell, adding seconds to wall-clock time and
+distorting any timing of the surrounding harness.
+
+**Suites affected:** C (Performance) — non-functional but inflates the
+runner's own setup time per cell.
+
+**Status:** Recorded but **not fixed** in this pass. Deleting the lines
+is purely cleanup and risks masking a future maintainer's intent to
+add tokenizer-driven inputs (e.g. swapping `torch.randint` for a real
+corpus encode). Flagging for the next code-cleanup PR.
+
+### Items deliberately re-examined and left alone
+
+- `state.append` aliasing: already addressed in M7 with `.contiguous().clone()`.
+- `accumulate` shape mismatch: already addressed in H5 (now correctly
+  branched after N1 fix).
+- `original_window_ids` IDs are extended only on growth (`if W_new > W_old`)
+  — verified post-N1 fix.
+- `validate_parity_pair`: missing fields log a warning (M6).
+- Determinism toggle: `warn_only=True` (L2).
+- Cache duplication: per-file sync note (L5); refactor deferred.
+- Vendored LongBench metrics (`longbench_metrics.py`): untouched (N5),
+  matching the file's "DO NOT MODIFY" header.
+
+## Cumulative status across all audit passes
+
+| Pass    | IDs           | Outcome                                  |
+|---------|---------------|------------------------------------------|
+| Pass 1  | H1–H7, M1–M7, L1–L8 | All addressed; L8 documented as fragile but not currently incorrect; L5 deferred to future refactor |
+| Pass 2  | N1–N5         | N1–N4 fixed; N5 deferred (vendored)      |
+| Pass 3  | P1–P3         | All three fixed (this pass)              |
+| Pass 4  | E1            | Recorded; defer to dedicated cleanup PR  |
+
+No outstanding correctness bugs remain in the runtime eviction or
+scoring paths.

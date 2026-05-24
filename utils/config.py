@@ -50,6 +50,25 @@ class CacheConfig:
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
+            # Type guards mirror WindowedCacheConfig.__post_init__: reject
+            # bool before int (bool subclasses int) and reject non-float
+            # types up-front so users don't pass 40 meaning 40%.
+            if isinstance(self.cache_budget, bool):
+                raise ConfigValidationError(
+                    f"cache_budget must be a float ratio in (0, 1], got bool "
+                    f"{self.cache_budget!r}. bool is rejected because it "
+                    f"subclasses int."
+                )
+            if isinstance(self.cache_budget, int):
+                raise ConfigValidationError(
+                    f"cache_budget must be a float ratio in (0, 1], got int "
+                    f"{self.cache_budget}. Use e.g. 0.40 instead of 40."
+                )
+            if not isinstance(self.cache_budget, float):
+                raise ConfigValidationError(
+                    f"cache_budget must be a float ratio in (0, 1], got "
+                    f"{type(self.cache_budget).__name__}"
+                )
             if not (0.0 < self.cache_budget <= 1.0):
                 raise ConfigValidationError(
                     f"cache_budget must be in (0, 1], got {self.cache_budget}"

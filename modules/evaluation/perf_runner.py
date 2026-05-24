@@ -120,7 +120,13 @@ class PerfRunner:
         cache_backend = c.get("cache_backend", "dynamic")
         cache_pkg = c.get("cache_package")
         budget = c.get("cache_budget")
-        hooks = None
+        # Windowed-cache setup: resolve classes + RoPE once, but DO NOT install
+        # hooks here. Each warmup/measurement iteration creates a fresh cache,
+        # so hooks must be (re)installed on the cache the model actually
+        # receives, then removed before the next iteration.
+        WC = WCC = install_hooks = None
+        cc = None
+        rope = None
         if cache_backend == "windowed" and cache_pkg:
             from utils.cache_factory import get_cache_classes
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
@@ -128,87 +134,100 @@ class PerfRunner:
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
                       cache_budget=budget if budget is not None else 0.5)
-            rope = None
+            # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
-                if hasattr(mod, "rotary_emb"):
-                    rope = mod.rotary_emb; break
+                if "rotary" in nm.lower() or "rope" in nm.lower():
+                    rope = mod; break
+            if rope is None:
+                for nm, mod in model.named_modules():
+                    if hasattr(mod, "rotary_emb"):
+                        rope = mod.rotary_emb; break
             if rope is None:
                 from utils.config import ConfigValidationError
                 raise ConfigValidationError(
                     "Could not locate a RoPE module on the model. WindowedCache "
                     "requires a rotary embedding module for key rerotation."
                 )
-            cache = WC(config=cc, prefill_len=prefill_len,
-                       model_config=model.config, kv_dtype=torch_dtype,
-                       rope_module=rope,
-                       num_layers=model.config.num_hidden_layers)
-            hooks = install_hooks(model, cache, cc)
+
+        def _make_windowed_cache():
+            return WC(config=cc, prefill_len=prefill_len,
+                      model_config=model.config, kv_dtype=torch_dtype,
+                      rope_module=rope,
+                      num_layers=model.config.num_hidden_layers)
+
         gen_kwargs = {}
         if attn_impl == "eager" and c.get("install_hooks_for_measurement"):
             gen_kwargs["output_attentions"] = True
         # Warmup
         for _ in range(pc.num_warmup_runs):
-            with torch.no_grad():
-                pkv = DynamicCache() if cache_backend == "dynamic" else None
-                if cache_backend == "windowed" and cache_pkg:
-                    # Re-create cache for each warmup
-                    pkv_w = WC(config=cc, prefill_len=prefill_len,
-                               model_config=model.config, kv_dtype=torch_dtype,
-                               rope_module=rope,
-                               num_layers=model.config.num_hidden_layers)
-                    model(input_ids=input_ids, past_key_values=pkv_w, use_cache=True, return_dict=True, **gen_kwargs)
-                else:
-                    model(input_ids=input_ids, past_key_values=pkv, use_cache=True, return_dict=True, **gen_kwargs)
+            hooks = None
+            try:
+                with torch.no_grad():
+                    if cache_backend == "windowed" and cache_pkg:
+                        pkv = _make_windowed_cache()
+                        hooks = install_hooks(model, pkv, cc)
+                    else:
+                        pkv = DynamicCache() if cache_backend == "dynamic" else None
+                    model(input_ids=input_ids, past_key_values=pkv,
+                          use_cache=True, return_dict=True, **gen_kwargs)
+            finally:
+                if hooks is not None:
+                    hooks.remove()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         # Measurement runs
         measurements = []
         for ri in range(pc.num_measurement_runs):
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.synchronize()
-            # TTFT — synchronize BEFORE t0 so prior async work doesn't taint
-            # the measurement and the sync's own latency isn't timed.
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                pkv = DynamicCache() if cache_backend == "dynamic" else None
-                if cache_backend == "windowed" and cache_pkg:
-                    pkv = WC(config=cc, prefill_len=prefill_len,
-                             model_config=model.config, kv_dtype=torch_dtype,
-                             rope_module=rope,
-                             num_layers=model.config.num_hidden_layers)
-                out = model(input_ids=input_ids, past_key_values=pkv, use_cache=True, return_dict=True, **gen_kwargs)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            ttft_ms = (t1 - t0) * 1000
-            # Generate tokens for TPOT
-            pkv = out.past_key_values
-            next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t2 = time.perf_counter()
-            with torch.no_grad():
-                for _ in range(gen_len - 1):
-                    out = model(input_ids=next_tok, past_key_values=pkv, use_cache=True, return_dict=True, **gen_kwargs)
-                    pkv = out.past_key_values
-                    next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t3 = time.perf_counter()
-            gen_time = t3 - t2
-            tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
-            # End-to-end throughput includes prefill (TTFT) + decode time; this
-            # mirrors the legacy field name but is NOT decode-only.
-            throughput_tokps = gen_len / max(gen_time + (t1-t0), 1e-9)
-            peak_mb = 0.0
-            if torch.cuda.is_available():
-                peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-            measurements.append({"ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
-                                 "tpot_ms": tpot_ms, "peak_memory_mb": peak_mb})
+            hooks = None
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.synchronize()
+                # TTFT — synchronize BEFORE t0 so prior async work doesn't taint
+                # the measurement and the sync's own latency isn't timed.
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    if cache_backend == "windowed" and cache_pkg:
+                        pkv = _make_windowed_cache()
+                        hooks = install_hooks(model, pkv, cc)
+                    else:
+                        pkv = DynamicCache() if cache_backend == "dynamic" else None
+                    out = model(input_ids=input_ids, past_key_values=pkv,
+                                use_cache=True, return_dict=True, **gen_kwargs)
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                ttft_ms = (t1 - t0) * 1000
+                # Generate tokens for TPOT
+                pkv = out.past_key_values
+                next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t2 = time.perf_counter()
+                with torch.no_grad():
+                    for _ in range(gen_len - 1):
+                        out = model(input_ids=next_tok, past_key_values=pkv,
+                                    use_cache=True, return_dict=True, **gen_kwargs)
+                        pkv = out.past_key_values
+                        next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                t3 = time.perf_counter()
+                gen_time = t3 - t2
+                tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
+                # End-to-end throughput includes prefill (TTFT) + decode time; this
+                # mirrors the legacy field name but is NOT decode-only.
+                throughput_tokps = gen_len / max(gen_time + (t1-t0), 1e-9)
+                peak_mb = 0.0
+                if torch.cuda.is_available():
+                    peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                measurements.append({"ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
+                                     "tpot_ms": tpot_ms, "peak_memory_mb": peak_mb})
+            finally:
+                if hooks is not None:
+                    hooks.remove()
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
         # Cleanup
-        if hooks: hooks.remove()
         del model
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()

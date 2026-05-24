@@ -243,6 +243,14 @@ def make_topk_window_age_histogram(npz_paths: List[Path], out_dir: Path,
         d = _load_npz(str(p))
         topk = d["arrays"].get("top_window_indices")
         if topk is None: continue
+        # Pull units from metadata: a window covers `window_size` tokens,
+        # and the first `num_sink` tokens are not represented in the
+        # window grid. Without these, `t - window_id` is a unit-mismatched
+        # quantity (steps minus windows).
+        meta = d.get("metadata", {}) or {}
+        window_size = int(meta.get("window_size", 1))
+        num_sink = int(meta.get("num_sink_tokens", 0))
+        prefill_len = int(meta.get("prefill_len", 0))
         ages = []
         # Schema v1.0: [num_steps, num_layers, K]
         # Schema v1.1: [num_samples, num_steps, num_layers, K]
@@ -252,19 +260,20 @@ def make_topk_window_age_histogram(npz_paths: List[Path], out_dir: Path,
                 for t in range(num_steps):
                     valid = topk[s, t][topk[s, t] >= 0]
                     if len(valid) > 0:
-                        # Age = current step - window index (proxy)
-                        age = t - valid.astype(float)
+                        # Age in TOKENS = current absolute token position
+                        # (post-sink) minus the window's first-token position.
+                        age = (prefill_len + t - num_sink) - valid.astype(float) * window_size
                         ages.extend(age.tolist())
         else:
             num_steps = topk.shape[0]
             for t in range(num_steps):
                 valid = topk[t][topk[t] >= 0]
                 if len(valid) > 0:
-                    age = t - valid.astype(float)
+                    age = (prefill_len + t - num_sink) - valid.astype(float) * window_size
                     ages.extend(age.tolist())
         if ages:
             ax.hist(ages, bins=50, alpha=0.6, label=Path(str(p)).stem)
-    ax.set_xlabel("Window Age (steps)"); ax.set_ylabel("Count")
+    ax.set_xlabel("Window Age (tokens)"); ax.set_ylabel("Count")
     ax.set_title("Retained Window Age Distribution"); ax.legend()
     _save_fig(fig, out_dir, "topk_window_age", dpi, save_pdf)
 
