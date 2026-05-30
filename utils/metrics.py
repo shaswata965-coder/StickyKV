@@ -71,5 +71,11 @@ def aggregate_global(j: Tensor) -> Tensor:
 
 
 def final_step_heterogeneity(j: Tensor) -> Tensor:
-    """Std of Jaccard across heads at the last step → ``[num_layers]``."""
-    return j[-1].std(dim=-1)
+    """Std of Jaccard across heads at the last step → ``[num_layers]``.
+
+    Uses population std (``correction=0``) so the result is well-defined even
+    when there is only one query head (H=1) — the common case in the
+    faithfulness runner where the head axis is a dummy dimension of size 1
+    added around the already-head-pooled top-K indices.
+    """
+    return j[-1].std(dim=-1, correction=0)
