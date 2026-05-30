@@ -257,6 +257,64 @@ mr = b_sc.sum() / o_sc.sum().clamp(min=1e-8)
 Ratio of total attention mass base assigned to the retained windows vs what ours
 assigned. `≈1` means ours and base agree on total importance of the retained set.
 
+#### Metric 7 — Global LIR (Lazy Insertion Rescue)
+
+**File:** `utils/sticky_metrics.py`
+**Functions:** `flush_geometry`, `simulate_policy`, `lir_counts`, `compute_sticky_metrics`
+
+This is a **policy-simulation** metric, not a pairwise comparison. It runs the
+production Sticky-K eviction policy over the **base run's window scores** (the
+ground-truth attention masses, since base never evicts) and asks: *how often does
+the policy drop a window and then re-admit it later?*
+
+```
+A "flush" is one decode step t. At flush t there are w_act = ceil((prefill_len
++ t + 1 - sink) / window_size) history windows; the last `local_windows` are an
+always-kept recency tail, the rest are evictable candidates competing for
+`top_k_windows` slots via a sticky set (one best-swap per flush, on strict
+improvement) — exactly policy.compute_retain_window_indices.
+
+selection_matrix[t, k] = 1 if window k is retained at flush t.
+
+A (flush r, window k) pair is ELIGIBLE when:
+  - the lookback [r-m+1, r] is in range,            (default m = 3)
+  - window k existed at the lookback start,
+  - window k was NOT retained in any of those m flushes.
+It is RESCUED if window k is retained at some later flush > r.
+
+global_lir = total_rescued / total_eligible     (ratio of summed counts)
+```
+
+High LIR ⇒ the policy thrashes (drops then re-admits the same windows);
+low LIR ⇒ stable selection. Aggregations (ratio-of-summed-counts):
+- `global_lir`    — scalar over all layers and heads (head-mean simulation).
+- `lir_per_layer` — `[L]`, per layer (head-mean simulation, matches the cache).
+- `lir_per_head`  — `[L, H]`, each head simulated independently.
+
+#### Metric 8 — Absolute missed mass
+
+**File:** `utils/sticky_metrics.py:simulate_policy`
+
+The same Sticky-K simulation also records, per flush, the raw ground-truth
+attention mass sitting on evictable windows the policy did **not** retain:
+
+```
+missed[t] = Σ  truth_mass[t, w]   for evictable windows w not in the retained set
+```
+
+The local recency tail is always kept, so it never contributes missed mass.
+A **Fresh-K** baseline (re-pick the top-K every flush, no memory) is computed
+alongside as a lower bound — Fresh-K is greedy-optimal per flush, so
+`missed_mass_fresh ≤ missed_mass` always. Outputs:
+- `missed_mass`           — `[T]`, Sticky-K trajectory (mean over layers/samples).
+- `missed_mass_per_layer` — `[T, L]`.
+- `missed_mass_fresh`     — `[T]`, Fresh-K baseline.
+- `missed_mass_total`     — scalar, per-flush mean of `missed_mass`.
+
+`history_budget_K` = `top_k_windows`, `local_windows` = `local_window_size_resolved
+// window_size`, and `m` = metadata `lir_ignore_threshold` (default 3) — all read
+from the ours npz metadata.
+
 ### Output
 
 ```
@@ -270,7 +328,14 @@ np.savez_compressed("outputs/faithfulness_results.npz",
     spearman          [T, L]         Spearman rank correlation
     kl_ours_base      [T, L]         KL(ours ‖ base)
     mass_ratio        [T, L]         base_mass / ours_mass
-    metadata_json     JSON string    provenance + SHA checksums
+    global_lir            scalar     Sticky-K rescue rate (global)
+    lir_per_layer        [L]         rescue rate per layer
+    lir_per_head         [L, H]      rescue rate per (layer, head)
+    missed_mass          [T]         Sticky-K absolute missed-mass trajectory
+    missed_mass_per_layer[T, L]      missed mass per layer
+    missed_mass_fresh    [T]         Fresh-K baseline missed-mass trajectory
+    missed_mass_total    scalar      per-flush mean of missed_mass
+    metadata_json     JSON string    provenance + SHA checksums  (schema v2.1)
 )
 ```
 
@@ -363,6 +428,8 @@ f1_score(prediction.split(), ground_truth.split())
 | B | Spearman rank correlation | [-1, 1] | Higher |
 | B | KL(ours ‖ base) | [0, ∞) | Lower |
 | B | Mass ratio (base/ours) | (0, ∞) | ≈ 1 |
+| B | Global LIR (rescue rate) | [0, 1] | Lower (stable) |
+| B | Absolute missed mass | [0, ∞) | Lower |
 | D | Dataset-specific (F1/ROUGE/exact) | [0, 100] | Higher |
 
 ---

@@ -314,6 +314,41 @@ for r in range(rows):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 6b. Sticky-K policy analytics — Global LIR + absolute missed mass
+# ══════════════════════════════════════════════════════════════════════
+if "global_lir" in data.files:
+    _hdr("  STICKY-K ANALYTICS  —  Global LIR (rescue rate ↓ = stable)  +  Missed Mass (↓ = better)")
+
+    global_lir    = float(data["global_lir"])
+    lir_per_layer = data["lir_per_layer"]          # [L]
+    lir_per_head  = data["lir_per_head"]           # [L, H]
+    missed_mass   = data["missed_mass"]            # [T]
+    missed_layer  = data["missed_mass_per_layer"]  # [T, L]
+    missed_total  = float(data["missed_mass_total"])
+    missed_fresh  = data.get("missed_mass_fresh")  # [T] or None
+
+    print()
+    print(f"  Global LIR (Lazy Insertion Rescue) : {global_lir:.4f}   "
+          f"(fraction of windows ignored for m flushes that are later rescued)")
+    fresh_str = ""
+    if missed_fresh is not None:
+        fresh_str = (f"   Fresh-K baseline: {float(np.asarray(missed_fresh).mean()):.4f}"
+                     f"   Sticky overhead: {missed_total - float(np.asarray(missed_fresh).mean()):+.4f}")
+    print(f"  Missed mass (Sticky-K, per-flush mean): {missed_total:.4f}{fresh_str}")
+
+    print()
+    print(f"  {'Lyr':>4}  {'LIR':>7}  {'MissedMass(gen)':>15}  {'Head LIR (min/mean/max)':>26}  Bar(LIR)")
+    print(f"  {'─'*4}  {'─'*7}  {'─'*15}  {'─'*26}  {'─'*8}")
+    for li in range(L):
+        mm_gen = missed_layer[GEN_START:GEN_END, li].mean() if N_GEN else missed_layer[:, li].mean()
+        hl = lir_per_head[li]
+        print(f"  {li:>4d}  {lir_per_layer[li]:>7.4f}  {mm_gen:>15.4f}  "
+              f"{hl.min():>7.4f} /{hl.mean():>7.4f} /{hl.max():>7.4f}  {_bar(lir_per_layer[li], 0, 1)}")
+    print(f"  {'─'*4}  {'─'*7}  {'─'*15}")
+    print(f"  {'avg':>4s}  {lir_per_layer.mean():>7.4f}  {missed_layer.mean():>15.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 7. Per-sample breakdown
 # ══════════════════════════════════════════════════════════════════════
 if "per_sample_jaccard_global" in data.files:

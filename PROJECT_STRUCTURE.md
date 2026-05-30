@@ -74,7 +74,8 @@ C:\StickyKV/
 └── utils/                           # Shared utilities
     ├── config.py                    # Typed config dataclasses + load_config() + validate_parity_pair()
     ├── cache_factory.py             # get_cache_classes() — backend selection + pairing validation
-    ├── metrics.py                   # Jaccard similarity + aggregation helpers
+    ├── metrics.py                   # Jaccard similarity + aggregation helpers (vectorized, loop-free)
+    ├── sticky_metrics.py            # Sticky-K policy analytics — Global LIR + absolute missed mass
     ├── hashing.py                   # sha256_file(), sha256_string()
     ├── logger.py                    # get_logger() — structured logging setup
     └── seed.py                      # seed_everything() — Python + NumPy + PyTorch seeding
@@ -460,6 +461,19 @@ score_longbench.sh           (post-hoc, reads jsonl outputs only)
 - `jaccard_topk()` — vectorized Jaccard similarity of top-K window sets
 - `aggregate_per_layer()`, `aggregate_global()` — aggregation helpers
 - `final_step_heterogeneity()` — std across heads at last step
+
+### `utils/sticky_metrics.py` — Sticky-K policy analytics (sequential, loop-based)
+
+Simulates the production Sticky-K eviction policy over the base run's
+ground-truth window scores. Kept separate from `metrics.py` because the
+simulation is inherently sequential (each flush depends on the previous
+retained set) and `test_faithfulness.py` requires `metrics.py` to be loop-free.
+
+- `flush_geometry()` — per-flush valid/evictable window counts + window creation flush
+- `simulate_policy()` — Sticky-K / Fresh-K retention → selection matrix + missed mass
+- `lir_counts()` — eligible ("ignored for m flushes") vs rescued pair counts
+- `compute_sticky_metrics()` — driver → `global_lir` (scalar), `lir_per_layer` `[L]`,
+  `lir_per_head` `[L, H]`, `missed_mass*` trajectories
 
 ### `utils/hashing.py` — Reproducibility fingerprints
 

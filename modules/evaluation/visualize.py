@@ -101,39 +101,72 @@ def make_jaccard_trajectory(npz_paths: List[Path], out_dir: Path,
     fig.tight_layout()
     _save_fig(fig, out_dir, "jaccard_trajectory", dpi, save_pdf)
 
-# --- Plot 2: LIR trajectory ---
+# --- Plot 2: LIR (Lazy Insertion Rescue) ---
 def make_lir_trajectory(npz_paths: List[Path], out_dir: Path,
                         dpi: int = 300, save_pdf: bool = False) -> None:
+    """Global LIR (bar) + per-layer LIR (line) + per-(layer,head) LIR heatmap.
+
+    ``global_lir`` is a scalar, ``lir_per_layer`` is ``[L]`` and
+    ``lir_per_head`` is ``[L, H]`` — the Sticky-K rescue-rate granularities
+    emitted by the faithfulness runner (schema ≥ v2.1).
+    """
+    if not HAS_MPL: return
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for p in npz_paths:
+        d = _load_npz(str(p))
+        gl = d["arrays"].get("global_lir")
+        lpl = d["arrays"].get("lir_per_layer")
+        lph = d["arrays"].get("lir_per_head")
+        if gl is None and lpl is None: continue
+        label = Path(str(p)).stem
+        # Panel 1: global LIR scalar as a bar
+        if gl is not None:
+            axes[0].bar(label, float(gl), alpha=0.8)
+        axes[0].set_ylabel("Global LIR"); axes[0].set_ylim(0, 1)
+        axes[0].set_title("Global LIR (rescue rate)")
+        axes[0].tick_params(axis="x", rotation=45)
+        # Panel 2: per-layer LIR
+        if lpl is not None and lpl.ndim == 1:
+            axes[1].plot(lpl, marker="o", markersize=3, linewidth=1.2, label=label)
+            axes[1].set_xlabel("Layer"); axes[1].set_ylabel("LIR")
+            axes[1].set_title("Per-Layer LIR"); axes[1].legend(fontsize=7)
+            axes[1].set_ylim(0, 1)
+        # Panel 3: per-(layer, head) LIR heatmap (last file wins)
+        if lph is not None and lph.ndim == 2:
+            im = axes[2].imshow(lph.T, aspect="auto", cmap="magma", vmin=0, vmax=1)
+            axes[2].set_xlabel("Layer"); axes[2].set_ylabel("Head")
+            axes[2].set_title("Per-Head LIR"); plt.colorbar(im, ax=axes[2])
+    fig.tight_layout()
+    _save_fig(fig, out_dir, "lir_trajectory", dpi, save_pdf)
+
+# --- Plot 3: Missed mass trajectory ---
+def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
+                                   dpi: int = 300, save_pdf: bool = False) -> None:
+    """Sticky-K vs Fresh-K absolute missed-mass trajectories over flushes.
+
+    ``missed_mass`` / ``missed_mass_fresh`` are ``[T]`` (lower = the retained
+    set captures more of the true attention); ``missed_mass_per_layer`` is
+    ``[T, L]`` and is shown as a heatmap.
+    """
     if not HAS_MPL: return
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     for p in npz_paths:
         d = _load_npz(str(p))
-        gl = d["arrays"].get("global_lir")
-        if gl is None: continue
-        axes[0].plot(gl, label=Path(str(p)).stem, linewidth=1.5)
-        axes[0].set_xlabel("Step"); axes[0].set_ylabel("Global LIR")
-        axes[0].set_title("Global LIR Trajectory"); axes[0].legend(fontsize=7)
-        lp = d["arrays"].get("lir_proxy")
-        if lp is not None:
-            axes[1].plot(lp, alpha=0.7, linewidth=1)
-            axes[1].set_xlabel("Step"); axes[1].set_ylabel("LIR Proxy")
-            axes[1].set_title("LIR Proxy Over Time")
-    fig.tight_layout()
-    _save_fig(fig, out_dir, "lir_trajectory", dpi, save_pdf)
-
-# --- Plot 3: Missed mass distribution ---
-def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
-                                   dpi: int = 300, save_pdf: bool = False) -> None:
-    if not HAS_MPL: return
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for p in npz_paths:
-        d = _load_npz(str(p))
-        gl = d["arrays"].get("global_lir")
-        if gl is not None:
-            mm = 1.0 - gl
-            ax.hist(mm, bins=50, alpha=0.6, label=Path(str(p)).stem)
-    ax.set_xlabel("Missed Mass"); ax.set_ylabel("Count")
-    ax.set_title("Missed Mass Distribution"); ax.legend()
+        mm = d["arrays"].get("missed_mass")
+        mmf = d["arrays"].get("missed_mass_fresh")
+        mmpl = d["arrays"].get("missed_mass_per_layer")
+        if mm is None: continue
+        stem = Path(str(p)).stem
+        axes[0].plot(mm, linewidth=1.5, label=f"{stem} (Sticky-K)")
+        if mmf is not None:
+            axes[0].plot(mmf, linewidth=1.0, linestyle="--", alpha=0.7,
+                         label=f"{stem} (Fresh-K)")
+        if mmpl is not None and mmpl.ndim == 2:
+            im = axes[1].imshow(mmpl.T, aspect="auto", cmap="viridis")
+            axes[1].set_xlabel("Flush (step)"); axes[1].set_ylabel("Layer")
+            axes[1].set_title("Per-Layer Missed Mass"); plt.colorbar(im, ax=axes[1])
+    axes[0].set_xlabel("Flush (step)"); axes[0].set_ylabel("Missed Mass")
+    axes[0].set_title("Absolute Missed Mass Trajectory"); axes[0].legend(fontsize=7)
     _save_fig(fig, out_dir, "missed_mass_distribution", dpi, save_pdf)
 
 # --- Plot 4: KL divergence heatmap ---

@@ -10,7 +10,14 @@ vector over the *retained* window set:
     kl_ours_base — KL divergence KL(ours ‖ base) ≥ 0        (lower  = better)
     mass_ratio   — base_mass / ours_mass                    (≈1 = well-matched)
 
-No model loaded — pure tensor ops.
+It also runs the Sticky-K policy analytics (utils/sticky_metrics.py) over the
+base run's window scores — the ground-truth attention masses — producing:
+
+    global_lir            — Lazy Insertion Rescue rate (scalar, [L], [L, H])
+    missed_mass           — Sticky-K absolute missed mass trajectory ([T], [T, L])
+    missed_mass_fresh     — Fresh-K baseline missed-mass trajectory ([T])
+
+No model loaded — pure tensor / numpy ops.
 """
 from __future__ import annotations
 import json, math, time
@@ -23,6 +30,7 @@ from utils.config import ExperimentConfig, ParityValidationError
 from utils.hashing import sha256_file
 from utils.logger import get_logger
 from utils import metrics as M
+from utils import sticky_metrics as SM
 
 log = get_logger(__name__)
 
@@ -240,6 +248,29 @@ class FaithfulnessRunner:
         jaccard_global    = M.aggregate_global(jaccard)      # [T]
         heterogeneity     = M.final_step_heterogeneity(jaccard)  # [L]
 
+        # ── Sticky-K policy analytics — Global LIR & absolute missed mass ──
+        # Simulated on the base run's window scores (the ground-truth attention
+        # masses, since base never evicts) over the same sample/step set used
+        # above.  See utils/sticky_metrics.py.
+        lr            = int(om.get("local_window_size_resolved", 0))
+        local_windows = lr // ws_sz if ws_sz > 0 else 0
+        history_K     = int(om.get("top_k_windows", 0))
+        lir_m         = int(om.get("lir_ignore_threshold", 3))
+        sticky = SM.compute_sticky_metrics(
+            base_ws[:num_samples].numpy(),
+            prefill_len=prefill_len,
+            num_sink=ns,
+            window_size=ws_sz,
+            local_windows=local_windows,
+            history_budget_K=history_K,
+            m=lir_m,
+        )
+        log.info(
+            "Sticky-K: global_LIR=%.4f  missed_mass(total)=%.4f  K=%d local=%d m=%d",
+            float(sticky["global_lir"]), float(sticky["missed_mass_total"]),
+            history_K, local_windows, lir_m,
+        )
+
         return {
             "jaccard":           jaccard.numpy(),
             "jaccard_per_layer": jaccard_per_layer.numpy(),
@@ -250,6 +281,13 @@ class FaithfulnessRunner:
             "spearman":          spearman.numpy(),    # [T, L]
             "kl_ours_base":      kl.numpy(),          # [T, L]
             "mass_ratio":        mass_ratio.numpy(),  # [T, L]
+            "global_lir":           sticky["global_lir"],            # scalar
+            "lir_per_layer":        sticky["lir_per_layer"],         # [L]
+            "lir_per_head":         sticky["lir_per_head"],          # [L, H]
+            "missed_mass":          sticky["missed_mass"],           # [T]
+            "missed_mass_per_layer": sticky["missed_mass_per_layer"], # [T, L]
+            "missed_mass_fresh":    sticky["missed_mass_fresh"],     # [T]
+            "missed_mass_total":    sticky["missed_mass_total"],     # scalar
             "num_samples":       np.array([num_samples], dtype=np.int64),
             "per_sample_jaccard_global": jaccard_stack.mean(dim=(2, 3)).numpy(),  # [S, T]
         }
@@ -260,7 +298,7 @@ class FaithfulnessRunner:
         od = Path(cfg.telemetry.output_dir)
         od.mkdir(parents=True, exist_ok=True)
         meta = {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "base_npz_path":   base["path"],
             "base_npz_sha256": sha256_file(base["path"]),
             "ours_npz_path":   ours["path"],
@@ -282,6 +320,13 @@ class FaithfulnessRunner:
             "spearman":          results["spearman"],
             "kl_ours_base":      results["kl_ours_base"],
             "mass_ratio":        results["mass_ratio"],
+            "global_lir":            results["global_lir"],
+            "lir_per_layer":         results["lir_per_layer"],
+            "lir_per_head":          results["lir_per_head"],
+            "missed_mass":           results["missed_mass"],
+            "missed_mass_per_layer": results["missed_mass_per_layer"],
+            "missed_mass_fresh":     results["missed_mass_fresh"],
+            "missed_mass_total":     results["missed_mass_total"],
             "metadata_json":     np.array([json.dumps(meta)], dtype=object),
         }
         for opt in ("num_samples", "per_sample_jaccard_global"):
