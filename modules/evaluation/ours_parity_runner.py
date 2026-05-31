@@ -163,7 +163,7 @@ class OursParityRunner:
         # H2O-style cumulative scoring: no observation window — every query row contributes.
         # top_k_windows is derived from cache.cache_budget so the Jaccard signal slices
         # at exactly the K the production eviction policy actually keeps.
-        tk = w.resolved_top_k(cfg.cache.cache_budget, prefill_len)
+        tk = w.resolved_top_k(cfg.cache.cache_budget, prefill_len, gen_len)
         ns, ws_sz = w.num_sink_tokens, w.window_size
         budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.5
 
@@ -195,7 +195,8 @@ class OursParityRunner:
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
                        rope_module=rope,
-                       num_layers=n_layers)
+                       num_layers=n_layers,
+                       max_tokens=gen_len)
             hooks = install_hooks(model, cache, cache_config)
 
             sample_gen_tokens = base_gen_tokens[sample_idx]   # [num_steps]

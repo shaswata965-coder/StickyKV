@@ -186,7 +186,9 @@ class WindowConfig:
     local_window_size: Union[int, float] = 256
     top_k_windows: Optional[int] = None
 
-    def resolved_top_k(self, cache_budget: Optional[float], prefill_len: int) -> int:
+    def resolved_top_k(
+        self, cache_budget: Optional[float], prefill_len: int, max_tokens: int
+    ) -> int:
         if self.top_k_windows is not None:
             return int(self.top_k_windows)
 
@@ -211,14 +213,17 @@ class WindowConfig:
         else:
             local_tokens = int(lws)
 
-        budget_tokens = int(cache_budget * prefill_len)
+        # Budget is sized against the full expected sequence (prefill + generation),
+        # mirroring WindowedCacheConfig.resolve(), so the derived K matches the K the
+        # production eviction policy actually keeps.
+        budget_tokens = int(cache_budget * (prefill_len + max_tokens))
         remaining = budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
             raise ConfigValidationError(
-                f"cache_budget={cache_budget} on prefill_len={prefill_len} yields "
-                f"budget_tokens={budget_tokens}, which is less than num_sink_tokens "
-                f"({self.num_sink_tokens}) + local_tokens ({local_tokens}). "
-                f"Increase cache_budget or reduce sink/local sizes."
+                f"cache_budget={cache_budget} on prefill_len={prefill_len} + "
+                f"max_tokens={max_tokens} yields budget_tokens={budget_tokens}, which is "
+                f"less than num_sink_tokens ({self.num_sink_tokens}) + local_tokens "
+                f"({local_tokens}). Increase cache_budget or reduce sink/local sizes."
             )
         return remaining // self.window_size
 

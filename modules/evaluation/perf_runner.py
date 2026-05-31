@@ -150,10 +150,13 @@ class PerfRunner:
                 )
 
         def _make_windowed_cache():
+            # Prefill-only perf measurement (single forward pass, no generation),
+            # so no generation budget is needed.
             return WC(config=cc, prefill_len=prefill_len,
                       model_config=model.config, kv_dtype=torch_dtype,
                       rope_module=rope,
-                      num_layers=model.config.num_hidden_layers)
+                      num_layers=model.config.num_hidden_layers,
+                      max_tokens=0)
 
         gen_kwargs = {}
         if attn_impl == "eager" and c.get("install_hooks_for_measurement"):
