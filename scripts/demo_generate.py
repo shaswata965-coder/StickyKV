@@ -86,10 +86,8 @@ def main() -> None:
         MODEL_NAME,
         torch_dtype=DTYPE,
         attn_implementation="eager",
-        device_map="auto" if DEVICE == "cuda" else None,
     )
-    if DEVICE != "cuda":
-        model = model.to(DEVICE)
+    model = model.to(DEVICE)
     model.eval()
 
     n_layers = model.config.num_hidden_layers
