@@ -116,7 +116,13 @@ def simulate_policy(
         ``True`` where window ``w`` is retained at flush ``t`` — the evictable
         Sticky-K set together with the always-kept local recency tail.
     missed : np.ndarray[float] ``[T]``
-        Raw truth mass sitting on evictable, *non-retained* windows per flush.
+        Fraction of total valid-window truth mass sitting on evictable,
+        *non-retained* windows per flush.  Range ``[0, 1]``; 0 = all
+        important mass retained, 1 = nothing retained.
+
+        Normalised by the sum of scores over all valid windows at each flush
+        (evictable + local tail) so the value is independent of the raw score
+        magnitude, which grows over time as H2O scores accumulate.
     """
     T, W = truth_masses.shape
     selection = np.zeros((T, W), dtype=bool)
@@ -170,10 +176,16 @@ def simulate_policy(
         for w in selected:
             selection[t, w] = True
 
-        # Missed mass = ground-truth mass on evictable windows we did not keep.
-        missed[t] = float(
-            sum(scores[w] for w in candidates if w not in selected)
-        )
+        # Missed mass = fraction of total valid-window mass on evictable windows
+        # we did not keep.  Normalise by the sum over ALL valid windows (not
+        # just evictable) so the value is in [0, 1] and independent of how
+        # large the raw H2O cumulative scores happen to be at this flush.
+        total_mass = float(scores[:wv].sum())
+        if total_mass > 1e-12:
+            missed[t] = float(
+                sum(scores[w] for w in candidates if w not in selected)
+            ) / total_mass
+        # else: all scores are zero — leave missed[t] = 0.0
 
     return selection, missed
 
