@@ -359,6 +359,7 @@ class LongBenchRunner:
                 "temperature": 1.0,
                 "pad_token_id": tokenizer.pad_token_id
                 or tokenizer.eos_token_id,
+                "repetition_penalty": getattr(self.lb, "repetition_penalty", 1.05),
             }
 
             # output_attentions only for eager backend
