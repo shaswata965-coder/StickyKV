@@ -348,7 +348,7 @@ class LongBenchRunner:
         hooks = None
 
         if self.is_windowed:
-            cache, hooks = self._setup_windowed_cache(input_ids)
+            cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
 
         # 6. Generate
         try:
@@ -398,7 +398,7 @@ class LongBenchRunner:
 
         return pred
 
-    def _setup_windowed_cache(self, input_ids: torch.Tensor):
+    def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
         cfg = self.config
         model = self.model
@@ -447,6 +447,7 @@ class LongBenchRunner:
             kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
             rope_module=rope,
             num_layers=model.config.num_hidden_layers,
+            max_tokens=max_gen_len,
         )
 
         hooks = self.install_score_hooks(model, cache, cache_config)

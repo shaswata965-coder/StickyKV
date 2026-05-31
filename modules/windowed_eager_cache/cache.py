@@ -56,6 +56,7 @@ class WindowedCache(_HFCacheBase):
         kv_dtype: torch.dtype,
         rope_module: torch.nn.Module,
         num_layers: int,
+        max_tokens: int,
         telemetry: Optional[Telemetry] = None,
     ) -> None:
         if isinstance(_HFCacheBase, type) and _HFCacheBase is not object:
@@ -69,7 +70,7 @@ class WindowedCache(_HFCacheBase):
                 pass
 
         self.config = config
-        self.resolved = config.resolve(prefill_len, model_config, kv_dtype)
+        self.resolved = config.resolve(prefill_len, model_config, kv_dtype, max_tokens)
         self.rope_module = rope_module
         self.num_layers = num_layers
         self.telemetry = telemetry if telemetry is not None else NullTelemetry()

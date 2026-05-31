@@ -84,12 +84,12 @@ class TestConfig:
     def test_percentage_rounding_snaps_up_to_window_multiple(self):
         cfg = _make_config(window_size=8, num_sink_tokens=4, local_window_size=0.25, cache_budget=0.50)
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=128)
         assert resolved.local_tokens == 24
         assert resolved.local_tokens % resolved.window_size == 0
 
         cfg2 = _make_config(window_size=8, num_sink_tokens=4, local_window_size=0.10, cache_budget=0.50)
-        resolved2 = cfg2.resolve(100, model_cfg, torch.float16)
+        resolved2 = cfg2.resolve(100, model_cfg, torch.float16, max_tokens=128)
         assert resolved2.local_tokens == 16
         assert resolved2.local_tokens % resolved2.window_size == 0
 
@@ -97,11 +97,14 @@ class TestConfig:
     def test_worked_example_prefill(self):
         cfg = _make_config(window_size=8, num_sink_tokens=4, local_window_size=16, cache_budget=0.40)
         model_cfg = _FakeModelConfig(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, head_dim=128)
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=100)
         assert resolved.bytes_per_token == 4096
-        assert resolved.total_budget_bytes == 163840
-        assert resolved.total_budget_tokens == 40
-        assert resolved.top_k_windows == 2
+        # total_budget_bytes = int(0.40 * (100+100) * 4096) = 327680
+        assert resolved.total_budget_bytes == 327680
+        # total_budget_tokens = 327680 // 4096 = 80
+        assert resolved.total_budget_tokens == 80
+        # remaining = 80 - 4 - 16 = 60, top_k = 60 // 8 = 7
+        assert resolved.top_k_windows == 7
 
     # 3
     @pytest.mark.parametrize("budget", [0.20, 0.40, 0.60, 0.80, 1.0])
@@ -109,7 +112,7 @@ class TestConfig:
     def test_retained_cache_never_exceeds_byte_budget(self, budget, dtype):
         cfg = _make_config(cache_budget=budget, local_window_size=8)
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(200, model_cfg, dtype)
+        resolved = cfg.resolve(200, model_cfg, dtype, max_tokens=128)
         retained = resolved.num_sink_tokens + resolved.top_k_windows * resolved.window_size + resolved.local_tokens
         assert retained * resolved.bytes_per_token <= resolved.total_budget_bytes
 
@@ -117,15 +120,15 @@ class TestConfig:
     def test_dtype_invariance_of_ratio(self):
         cfg = _make_config(cache_budget=0.50, local_window_size=8)
         model_cfg = _FakeModelConfig()
-        r16 = cfg.resolve(200, model_cfg, torch.float16)
-        r32 = cfg.resolve(200, model_cfg, torch.float32)
+        r16 = cfg.resolve(200, model_cfg, torch.float16, max_tokens=128)
+        r32 = cfg.resolve(200, model_cfg, torch.float32, max_tokens=128)
         assert r16.total_budget_tokens == r32.total_budget_tokens
 
     # 5
     def test_gqa_byte_accounting(self):
         cfg = _make_config(cache_budget=0.50, local_window_size=8)
         model_cfg = _FakeModelConfig(num_attention_heads=32, num_key_value_heads=8)
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=128)
         assert resolved.bytes_per_token == 8 * 128 * 2 * 2
 
     # 6
@@ -140,13 +143,13 @@ class TestConfig:
         cfg = _make_config(cache_budget=0.05, num_sink_tokens=10, local_window_size=40)
         model_cfg = _FakeModelConfig()
         with pytest.raises(ValueError, match="total_budget_tokens"):
-            cfg.resolve(100, model_cfg, torch.float16)
+            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
 
     # 8
     def test_cache_budget_zero_evictable_is_legal(self):
         cfg = _make_config(window_size=8, num_sink_tokens=4, local_window_size=8, cache_budget=0.12)
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=128)
         assert resolved.top_k_windows >= 0
 
 

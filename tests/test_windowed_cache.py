@@ -80,7 +80,7 @@ class TestConfig:
             cache_budget=0.50,
         )
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16)
+        resolved = cfg.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16, max_tokens=128)
         # post_sink = 96, 0.25 * 96 = 24.0, ceil=24, 24 % 8 == 0 → 24
         assert resolved.local_tokens == 24
         assert resolved.local_tokens % resolved.window_size == 0
@@ -92,7 +92,7 @@ class TestConfig:
             local_window_size=0.10,
             cache_budget=0.50,
         )
-        resolved2 = cfg2.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16)
+        resolved2 = cfg2.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16, max_tokens=128)
         assert resolved2.local_tokens == 16
         assert resolved2.local_tokens % resolved2.window_size == 0
 
@@ -114,16 +114,16 @@ class TestConfig:
             hidden_size=4096,
             head_dim=128,
         )
-        resolved = cfg.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16)
+        resolved = cfg.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16, max_tokens=100)
 
         # bytes_per_token = 8 * 128 * 2 * 2 = 4096
         assert resolved.bytes_per_token == 4096
-        # total_budget_bytes = int(0.40 * 100 * 4096) = 163840
-        assert resolved.total_budget_bytes == 163840
-        # total_budget_tokens = 163840 // 4096 = 40
-        assert resolved.total_budget_tokens == 40
-        # remaining = 40 - 4 - 16 = 20, top_k = 20 // 8 = 2
-        assert resolved.top_k_windows == 2
+        # total_budget_bytes = int(0.40 * (100+100) * 4096) = 327680
+        assert resolved.total_budget_bytes == 327680
+        # total_budget_tokens = 327680 // 4096 = 80
+        assert resolved.total_budget_tokens == 80
+        # remaining = 80 - 4 - 16 = 60, top_k = 60 // 8 = 7
+        assert resolved.top_k_windows == 7
 
     # -------------------------------------------------------------------
     # 3. test_retained_cache_never_exceeds_byte_budget
@@ -135,7 +135,7 @@ class TestConfig:
         """Retained token count * bytes_per_token <= total_budget_bytes."""
         cfg = _make_config(cache_budget=budget, local_window_size=8)
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(prefill_len=200, model_config=model_cfg, kv_dtype=dtype)
+        resolved = cfg.resolve(prefill_len=200, model_config=model_cfg, kv_dtype=dtype, max_tokens=128)
 
         retained = (
             resolved.num_sink_tokens
@@ -152,9 +152,9 @@ class TestConfig:
         """Token budget should be same ratio regardless of dtype."""
         cfg = _make_config(cache_budget=0.50, local_window_size=8)
         model_cfg = _FakeModelConfig()
-        r16 = cfg.resolve(200, model_cfg, torch.float16)
-        r32 = cfg.resolve(200, model_cfg, torch.float32)
-        # Token budget should be identical (budget * prefill_len)
+        r16 = cfg.resolve(200, model_cfg, torch.float16, max_tokens=128)
+        r32 = cfg.resolve(200, model_cfg, torch.float32, max_tokens=128)
+        # Token budget should be identical (budget * (prefill_len + max_tokens))
         assert r16.total_budget_tokens == r32.total_budget_tokens
 
     # -------------------------------------------------------------------
@@ -165,7 +165,7 @@ class TestConfig:
         """GQA: bytes_per_token uses num_kv_heads, not num_attention_heads."""
         cfg = _make_config(cache_budget=0.50, local_window_size=8)
         model_cfg = _FakeModelConfig(num_attention_heads=32, num_key_value_heads=8)
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=128)
         # 8 * 128 * 2 * 2 = 4096 (not 32 * 128 * 2 * 2 = 16384)
         assert resolved.bytes_per_token == 8 * 128 * 2 * 2
 
@@ -193,7 +193,7 @@ class TestConfig:
         )
         model_cfg = _FakeModelConfig()
         with pytest.raises(ValueError, match="total_budget_tokens"):
-            cfg.resolve(100, model_cfg, torch.float16)
+            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
 
     # -------------------------------------------------------------------
     # 8. test_cache_budget_zero_evictable_is_legal
@@ -208,7 +208,7 @@ class TestConfig:
             cache_budget=0.12,  # just enough for sink + local = 12 tokens
         )
         model_cfg = _FakeModelConfig()
-        resolved = cfg.resolve(100, model_cfg, torch.float16)
+        resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
         assert resolved.top_k_windows >= 0
 
 

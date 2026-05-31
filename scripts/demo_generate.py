@@ -29,7 +29,9 @@ from modules.windowed_eager_cache import (
 )
 
 # ── Configuration ─────────────────────────────────────────────────────
-MODEL_NAME    = "/kaggle/input/models/metaresearch/llama-3.2/transformers/1b-instruct/1"
+MODEL_NAME     = os.getenv("DEMO_MODEL",      "/kaggle/input/models/metaresearch/llama-3.2/transformers/1b-instruct/1")
+CACHE_BUDGET   = float(os.getenv("DEMO_BUDGET",    "0.2"))
+MAX_NEW_TOKENS = int(os.getenv("DEMO_MAX_TOKENS", "128"))
 PROMPT        = (
     "The future of artificial intelligence is one of the most debated topics "
     "in modern science and technology. Researchers across the globe are working "
@@ -49,10 +51,8 @@ PROMPT        = (
     "and deploy these powerful technologies will shape the trajectory of "
     "human civilization for generations to come. In this essay, we explore"
 )
-MAX_NEW_TOKENS = 128
 WINDOW_SIZE   = 8
 LOCAL_WINDOW  = 32          # tokens (must be multiple of WINDOW_SIZE)
-CACHE_BUDGET  = 0.2         # retain 20% of prefill KV cache
 NUM_SINK      = 4           # always-retained leading tokens
 DTYPE         = torch.float16
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
@@ -138,6 +138,7 @@ def main() -> None:
         kv_dtype=DTYPE,
         rope_module=rope,
         num_layers=n_layers,
+        max_tokens=MAX_NEW_TOKENS,
     )
     hooks = install_score_hooks(model, cache, cache_config)
     resolved = cache.resolved

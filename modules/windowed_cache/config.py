@@ -148,6 +148,7 @@ class WindowedCacheConfig:
         prefill_len: int,
         model_config: Any,
         kv_dtype: torch.dtype,
+        max_tokens: int,
     ) -> ResolvedConfig:
         """Return a :class:`ResolvedConfig` with concrete int counts.
 
@@ -164,6 +165,10 @@ class WindowedCacheConfig:
             and optionally ``head_dim``.
         kv_dtype : torch.dtype
             Data type of the KV cache tensors (e.g. ``torch.float16``).
+        max_tokens : int
+            Maximum number of tokens to be generated.  The budget is sized
+            against the full expected sequence (prefill + generation) so the
+            cache is not undersized when the output is long.
         """
         num_kv_heads = getattr(
             model_config,
@@ -189,7 +194,7 @@ class WindowedCacheConfig:
         bytes_per_token = num_kv_heads * head_dim * element_size * 2
 
         # Total byte budget and token budget
-        total_budget_bytes = int(self.cache_budget * prefill_len * bytes_per_token)
+        total_budget_bytes = int(self.cache_budget * (prefill_len + max_tokens) * bytes_per_token)
         total_budget_tokens = total_budget_bytes // bytes_per_token
 
         # Resolve local_window_size to concrete int
