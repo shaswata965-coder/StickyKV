@@ -304,6 +304,16 @@ class FaithfulnessRunner:
             "ours_npz_path":   ours["path"],
             "ours_npz_sha256": sha256_file(ours["path"]),
             "run_finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # ── run config propagated from ours npz (for display / auditing) ──
+            "model_name":                 ours["metadata"].get("model_name"),
+            "seed":                       ours["metadata"].get("seed"),
+            "prefill_len":                ours["metadata"].get("prefill_len"),
+            "gen_len":                    ours["metadata"].get("gen_len"),
+            "window_size":                ours["metadata"].get("window_size"),
+            "num_sink_tokens":            ours["metadata"].get("num_sink_tokens"),
+            "local_window_size_resolved": ours["metadata"].get("local_window_size_resolved"),
+            "top_k_windows":              ours["metadata"].get("top_k_windows"),
+            "cache_budget":               ours["metadata"].get("cache_budget"),
         }
         npz_path = od / "faithfulness_results.npz"
         if cfg.output_path:
