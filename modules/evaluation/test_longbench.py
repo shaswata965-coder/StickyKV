@@ -575,9 +575,9 @@ class TestLongBenchConfig:
             mode="w", suffix=".yaml", delete=False
         ) as f:
             yaml.dump(cfg_dict, f)
-            f.flush()
-            cfg = load_config(f.name)
-        os.unlink(f.name)
+            fname = f.name
+        cfg = load_config(fname)
+        os.unlink(fname)
         assert cfg.longbench.datasets == ["narrativeqa"]
         assert cfg.longbench.max_length == 4096
         assert cfg.longbench.aggressive_cache_clear is True

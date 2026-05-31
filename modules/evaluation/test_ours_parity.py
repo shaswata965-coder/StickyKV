@@ -76,17 +76,35 @@ class TestOursParityRunner:
         with pytest.raises(ParityValidationError, match="seed"):
             validate_parity_pair(base_meta, ours_cfg)
 
-    def test_ours_rejects_mismatched_article_sha(self, tmp_path):
-        """Different article_sha → ParityValidationError."""
+    def test_ours_rejects_mismatched_article_id(self, tmp_path):
+        """Different article_index → ParityValidationError on article_id field."""
         from utils.config import validate_parity_pair
         base_npz = _make_base_npz(tmp_path / "base.npz")
         ours_cfg = _make_ours_config(base_npz)
         data = np.load(str(base_npz), allow_pickle=True)
         base_meta = json.loads(str(data["metadata_json"][0]))
-        # Modify parity to have different article_index
         ours_cfg.parity.article_index = 99
         with pytest.raises(ParityValidationError, match="article_id"):
             validate_parity_pair(base_meta, ours_cfg)
+
+    def test_validate_parity_pair_skips_article_sha(self, tmp_path):
+        """article_sha is a runtime-only check — validate_parity_pair skips it.
+
+        The sha is compared at actual run time (after the article is loaded and
+        hashed) so that parity validation works even when the ours config is
+        constructed before the article text is available.  This test documents
+        that a sha difference alone does NOT cause validate_parity_pair to raise,
+        ensuring callers don't rely on it for sha enforcement.
+        """
+        from utils.config import validate_parity_pair
+        base_npz = _make_base_npz(tmp_path / "base.npz", article_sha="sha_from_base")
+        ours_cfg = _make_ours_config(base_npz)
+        data = np.load(str(base_npz), allow_pickle=True)
+        base_meta = json.loads(str(data["metadata_json"][0]))
+        # Inject a different sha into base_meta — validate_parity_pair must not raise.
+        base_meta["article_sha"] = "completely_different_sha"
+        # Should not raise (sha is in runtime_fields, skipped by validate_parity_pair)
+        validate_parity_pair(base_meta, ours_cfg)
 
     def test_ours_validates_attn_implementation_matches_backend(self):
         """flash_attn backend + eager attn → ConfigValidationError."""

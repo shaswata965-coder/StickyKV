@@ -1,4 +1,4 @@
-"""Tests for the flash-attn windowed cache package — 25 tests.
+"""Tests for the flash-attn windowed cache package — 24 tests.
 
 All tests run on CPU with mocked attention modules and synthetic data.
 No real model loads.

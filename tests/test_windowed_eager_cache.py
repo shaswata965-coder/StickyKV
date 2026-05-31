@@ -1,6 +1,6 @@
 """Tests for the eager-attention windowed cache package.
 
-21 inherited from flash + 4 eager-specific replacements + 3 factory tests = 28 tests.
+22 inherited from flash + 3 eager-specific replacements + 3 factory tests = 28 tests.
 All tests run on CPU with mocked modules.
 """
 
@@ -316,7 +316,7 @@ class TestHooksInherited:
         from modules.windowed_eager_cache import policy as policy_mod
         from modules.windowed_eager_cache import scorer as scorer_mod
 
-        forbidden = {"batch", "b", "head", "h", "token", "tok", "window", "w", "n"}
+        forbidden = {"batch", "b", "head", "h", "token", "tok", "t", "window", "w", "n"}
         for mod in [cache_mod, state_mod, policy_mod, scorer_mod]:
             source = inspect.getsource(mod)
             tree = ast.parse(source)
