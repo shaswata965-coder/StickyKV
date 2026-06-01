@@ -48,7 +48,7 @@ dependencies:
 
   # ---------- pip-only packages ----------
   - pip:
-    - transformers>=4.36,<4.46
+    - transformers>=4.47,<4.48
     - accelerate>=0.25
     - sentencepiece
     - protobuf
