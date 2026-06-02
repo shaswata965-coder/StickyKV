@@ -22,7 +22,10 @@ class CacheState:
     value_states : Tensor
         Shape ``[B, H_kv, T, D]``.
     position_ids : Tensor
-        Shape ``[T]``, int64.  Rebased to ``arange(T)`` after eviction.
+        Shape ``[T]``, int64.  After eviction, gathered to the surviving
+        tokens' **original** positions so keys keep their original RoPE phase.
+        Only rebased to ``arange(T)`` when ``rerotate_keys`` runs (the
+        opt-in StreamingLLM-style path).
     window_scores : Tensor
         Shape ``[B, H_q, W]``.  Running cumulative per-window scores.
     original_window_ids : Tensor
@@ -127,10 +130,15 @@ class CacheState:
         self.key_states = torch.gather(self.key_states, dim=2, index=idx_k).contiguous()
         self.value_states = torch.gather(self.value_states, dim=2, index=idx_k).contiguous()
 
-        # Rebase position_ids to contiguous [0..T_retained-1]
-        self.position_ids = torch.arange(
-            T_retained, device=self.key_states.device, dtype=torch.long
-        )
+        # Gather position_ids to the surviving tokens' ORIGINAL positions.
+        # The keys retain the RoPE rotation they were stored with, so their
+        # positions must stay original for the query<->key relative phase to be
+        # correct. (Rebasing to arange is only valid when the keys are *also*
+        # re-rotated and the query position is rebased -- see rerotate_keys.)
+        if self.position_ids is not None:
+            self.position_ids = self.position_ids[
+                retain_token_indices[0].to(self.position_ids.device)
+            ].contiguous()
 
     # -----------------------------------------------------------------
     # rerotate_keys
@@ -186,3 +194,9 @@ class CacheState:
         )
 
         self.key_states = k_rerotated
+        # Keys now live at contiguous positions [0..T_retained-1]; keep the
+        # bookkeeping in sync (slice_and_keep left the *original* positions) so
+        # a subsequent eviction snapshots correct "old" positions.
+        self.position_ids = torch.arange(
+            T_retained, device=device, dtype=torch.long
+        )

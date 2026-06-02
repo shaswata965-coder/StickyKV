@@ -174,18 +174,20 @@ class TestCacheConfig:
 
     def test_resolve_local_window_int(self) -> None:
         cfg = CacheConfig(local_window_size=16, window_size=8)
+        # int local is taken verbatim, independent of the budget argument
         assert cfg.resolve_local_window_size(100) == 16
 
     def test_resolve_local_window_percentage(self) -> None:
-        """Worked example from §5.5: 95 post-sink, 0.25 → ceil(23.75)=24 → snap to 25."""
+        """Float local is a fraction of the cache BUDGET: 95 budget tokens,
+        0.25 → ceil(23.75)=24 → snap to 25 (window_size 5)."""
         cfg = CacheConfig(local_window_size=0.25, window_size=5)
         result = cfg.resolve_local_window_size(95)
         assert result == 25
 
     def test_resolve_local_window_snaps_up(self) -> None:
         cfg = CacheConfig(local_window_size=0.10, window_size=8)
+        # budget_tokens=100: 0.10 * 100 = 10 → ceil=10 → snap to 16
         result = cfg.resolve_local_window_size(100)
-        # 0.10 * 100 = 10 → ceil=10 → snap to 16 (nearest multiple of 8)
         assert result == 16
         assert result % 8 == 0
 

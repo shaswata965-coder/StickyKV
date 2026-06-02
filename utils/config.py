@@ -47,6 +47,7 @@ class CacheConfig:
     window_size: int = 8
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
+    rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -93,11 +94,19 @@ class CacheConfig:
                     f"got {self.local_window_size}"
                 )
 
-    def resolve_local_window_size(self, post_sink_tokens: int) -> int:
+    def resolve_local_window_size(self, budget_tokens: int) -> int:
+        """Resolve local_window_size to a concrete token count.
+
+        A float ``local_window_size`` is a fraction of the CACHE BUDGET (not the
+        full post-sink context), matching ``WindowedCacheConfig.resolve``, so the
+        local region can never exceed the budget.  ``budget_tokens`` is the total
+        token budget (``cache_budget * (prefill_len + max_tokens)``).  An int
+        ``local_window_size`` is returned verbatim.
+        """
         if isinstance(self.local_window_size, int):
             return self.local_window_size
 
-        raw = self.local_window_size * post_sink_tokens
+        raw = self.local_window_size * budget_tokens
         ceiled = math.ceil(raw)
         # Snap upward to nearest multiple of window_size
         remainder = ceiled % self.window_size
@@ -200,11 +209,17 @@ class WindowConfig:
                 "comparison target even though they do not evict."
             )
 
-        # Resolve local_window_size to a concrete int (mirrors WindowedCacheConfig).
-        post_sink = max(1, prefill_len - self.num_sink_tokens)
+        # Budget is sized against the full expected sequence (prefill + generation),
+        # mirroring WindowedCacheConfig.resolve(), so the derived K matches the K the
+        # production eviction policy actually keeps.
+        budget_tokens = int(cache_budget * (prefill_len + max_tokens))
+
+        # Resolve local_window_size to a concrete int (mirrors WindowedCacheConfig):
+        # a float local_window_size is a fraction of the CACHE BUDGET (not the
+        # post-sink context), so the local region can never exceed the budget.
         lws = self.local_window_size
         if isinstance(lws, float):
-            raw = lws * post_sink
+            raw = lws * budget_tokens
             ceiled = math.ceil(raw)
             remainder = ceiled % self.window_size
             if remainder:
@@ -213,10 +228,6 @@ class WindowConfig:
         else:
             local_tokens = int(lws)
 
-        # Budget is sized against the full expected sequence (prefill + generation),
-        # mirroring WindowedCacheConfig.resolve(), so the derived K matches the K the
-        # production eviction policy actually keeps.
-        budget_tokens = int(cache_budget * (prefill_len + max_tokens))
         remaining = budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
             raise ConfigValidationError(

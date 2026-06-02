@@ -34,6 +34,7 @@ class ResolvedConfig:
     bytes_per_token: int
     total_budget_bytes: int
     total_budget_tokens: int
+    rerotate_on_evict: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +54,25 @@ class WindowedCacheConfig:
         Number of sink tokens always retained at the start.  Must be >= 0.
     local_window_size : int | float
         If int: number of local tokens (must be a multiple of *window_size*).
-        If float: ratio in (0, 1] of post-sink tokens — ``ceil`` then snap up
-        to the nearest *window_size* multiple.
+        If float: ratio in (0, 1] of the **cache budget** (not the full
+        context) -- ``local ~= ratio * total_budget_tokens``, ``ceil`` then
+        snap up to the nearest *window_size* multiple.  Guarantees the local
+        region can never exceed the cache budget.
     cache_budget : float
         Fraction of full-cache memory to retain, in (0, 1].
         Must be ``float`` — ``int`` and ``bool`` are rejected with clear errors.
     track_scores : bool
         Enable telemetry recording.  Default ``False``.
+    rerotate_on_evict : bool
+        If ``True``, re-rotate surviving keys to contiguous positions after
+        each eviction (StreamingLLM-style).  **Default ``False``.**  Re-rotation
+        is only correct if the model also rebases the query's RoPE position to
+        the compacted cache length every step; HuggingFace ``generate``
+        (transformers <= 4.47) advances ``cache_position`` monotonically
+        instead, so re-rotating keys while the query keeps its original absolute
+        position corrupts RoPE phase after the first eviction.  Leaving this off
+        keeps original key positions (KVPress / H2O behaviour), correct on any
+        version.
 
     Notes
     -----
@@ -72,6 +85,7 @@ class WindowedCacheConfig:
     local_window_size: Union[int, float]
     cache_budget: float
     track_scores: bool = False
+    rerotate_on_evict: bool = False
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -197,10 +211,15 @@ class WindowedCacheConfig:
         total_budget_bytes = int(self.cache_budget * (prefill_len + max_tokens) * bytes_per_token)
         total_budget_tokens = total_budget_bytes // bytes_per_token
 
-        # Resolve local_window_size to concrete int
-        post_sink_tokens = prefill_len - self.num_sink_tokens
+        # Resolve local_window_size to concrete int.
+        # Float local_window_size is a fraction of the CACHE BUDGET (not the
+        # full post-sink context): local ~= ratio * total_budget_tokens, then
+        # ceil and snap up to a window_size multiple. This guarantees the local
+        # region can never exceed the budget. (The previous post-sink-relative
+        # formula could make the local region alone larger than the whole
+        # budget, which either crashed resolve() or starved top-K retention.)
         if isinstance(self.local_window_size, float):
-            raw = self.local_window_size * post_sink_tokens
+            raw = self.local_window_size * total_budget_tokens
             ceiled = math.ceil(raw)
             remainder = ceiled % self.window_size
             if remainder != 0:
@@ -227,4 +246,5 @@ class WindowedCacheConfig:
             bytes_per_token=bytes_per_token,
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
+            rerotate_on_evict=self.rerotate_on_evict,
         )

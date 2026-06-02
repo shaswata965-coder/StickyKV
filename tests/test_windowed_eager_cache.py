@@ -85,7 +85,9 @@ class TestConfig:
         cfg = _make_config(window_size=8, num_sink_tokens=4, local_window_size=0.25, cache_budget=0.50)
         model_cfg = _FakeModelConfig()
         resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=128)
-        assert resolved.local_tokens == 24
+        # local is now a fraction of the cache BUDGET: total_budget_tokens=114,
+        # 0.25 * 114 = 28.5 → ceil 29 → snap up to 32
+        assert resolved.local_tokens == 32
         assert resolved.local_tokens % resolved.window_size == 0
 
         cfg2 = _make_config(window_size=8, num_sink_tokens=4, local_window_size=0.10, cache_budget=0.50)
@@ -184,7 +186,7 @@ class TestScoring:
 class TestEviction:
 
     # 11
-    def test_position_ids_contiguous_after_eviction(self):
+    def test_position_ids_preserve_originals_after_eviction(self):
         state = CacheState()
         B, H, T, D = 1, 4, 20, 64
         state.key_states = torch.randn(B, H, T, D)
@@ -192,7 +194,7 @@ class TestEviction:
         state.position_ids = torch.arange(T)
         retain = torch.tensor([[0, 1, 5, 10, 15, 19]])
         state.slice_and_keep(retain)
-        assert torch.equal(state.position_ids, torch.arange(6))
+        assert torch.equal(state.position_ids, torch.tensor([0, 1, 5, 10, 15, 19]))
 
     # 12
     def test_key_rerotation_uses_new_positions(self):

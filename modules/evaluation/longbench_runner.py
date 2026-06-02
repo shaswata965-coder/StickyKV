@@ -415,6 +415,7 @@ class LongBenchRunner:
             num_sink_tokens=cfg.cache.num_sink_tokens,
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
+            rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
         )
 
         # Get RoPE module
@@ -499,9 +500,13 @@ class LongBenchRunner:
         lws = cfg.cache.local_window_size
         if isinstance(lws, float) and budget:
             import math
+            # Mirror WindowedCacheConfig.resolve: a float local_window_size is a
+            # fraction of the cache BUDGET (not the full context), resolved here
+            # at the max_length upper bound (the runtime resolves against each
+            # example's own prefill length).
             max_len = getattr(self.lb, "max_length", 7500)
-            post_sink = max_len - cfg.cache.num_sink_tokens
-            raw = lws * post_sink
+            budget_tokens = int(budget * (max_len + max_gen_len))
+            raw = lws * budget_tokens
             ceiled = math.ceil(raw)
             remainder = ceiled % cfg.cache.window_size
             if remainder:
@@ -524,6 +529,7 @@ class LongBenchRunner:
             "compression_ratio": compression_ratio,
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
+            "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

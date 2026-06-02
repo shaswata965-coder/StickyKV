@@ -41,7 +41,8 @@ class WindowedCache(_HFCacheBase):
     kv_dtype : torch.dtype
         Data type of the KV cache tensors.
     rope_module : nn.Module
-        The model's rotary embedding module for key rerotation.
+        The model's rotary embedding module, used for key re-rotation only
+        when ``config.rerotate_on_evict`` is enabled.
     num_layers : int
         Number of transformer layers.
     telemetry : Telemetry, optional
@@ -120,10 +121,9 @@ class WindowedCache(_HFCacheBase):
         3. Accumulate into ``state.window_scores``.
         4. If ``policy.should_evict(step)``:
            a. Two-step retain: window indices → token indices.
-           b. Snapshot old positions before compaction.
-           c. ``state.slice_and_keep``
-           d. ``state.rerotate_keys``
-           e. Gather ``state.window_scores`` by retained window indices.
+           b. ``state.slice_and_keep`` (surviving keys keep their original RoPE).
+           c. Optionally ``state.rerotate_keys`` when ``rerotate_on_evict``.
+           d. Gather ``state.window_scores`` by retained window indices.
         5. Return ``(state.key_states, state.value_states)``.
         """
         state = self._states[layer_idx]
@@ -233,14 +233,28 @@ class WindowedCache(_HFCacheBase):
                 layer_idx, step, state.window_scores, retain_token_idx
             )
 
-            # b. Snapshot old positions before compaction
-            old_positions = state.position_ids[retain_token_idx[0]].clone()
+            # b. Snapshot old positions before compaction (only needed when
+            #    re-rotating; scoped to the flag to avoid confusion).
+            old_positions = (
+                state.position_ids[retain_token_idx[0]].clone()
+                if self.resolved.rerotate_on_evict
+                else None
+            )
 
-            # c. Compact K/V
+            # c. Compact K/V. Surviving keys keep their original RoPE rotation
+            #    and position_ids are gathered to their original values.
             state.slice_and_keep(retain_token_idx)
 
-            # d. Rerotate keys
-            state.rerotate_keys(self.rope_module, old_positions)
+            # d. Optionally re-rotate keys to contiguous positions
+            #    (StreamingLLM-style). OFF by default: HF generate advances the
+            #    query's cache_position monotonically (it does not re-derive it
+            #    from get_seq_length each step on transformers <= 4.47), so
+            #    re-rotating keys to contiguous positions while the query stays
+            #    at its original absolute position corrupts the RoPE relative
+            #    phase after the first eviction. Keeping original positions
+            #    matches KVPress / H2O and is correct on any version.
+            if self.resolved.rerotate_on_evict:
+                state.rerotate_keys(self.rope_module, old_positions)
 
             # e. Gather window_scores by retained_window_idx
             idx_w = retained_window_idx.unsqueeze(1).expand(B, H_q, -1)

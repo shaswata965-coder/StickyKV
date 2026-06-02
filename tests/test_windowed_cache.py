@@ -81,11 +81,12 @@ class TestConfig:
         )
         model_cfg = _FakeModelConfig()
         resolved = cfg.resolve(prefill_len=100, model_config=model_cfg, kv_dtype=torch.float16, max_tokens=128)
-        # post_sink = 96, 0.25 * 96 = 24.0, ceil=24, 24 % 8 == 0 → 24
-        assert resolved.local_tokens == 24
+        # local is a fraction of the BUDGET: total_budget_tokens =
+        # floor(0.50 * (100 + 128)) = 114; 0.25 * 114 = 28.5 → ceil 29 → snap 32
+        assert resolved.local_tokens == 32
         assert resolved.local_tokens % resolved.window_size == 0
 
-        # Non-exact: 0.10 * 96 = 9.6, ceil=10, 10 % 8 = 2 → snap up to 16
+        # Non-exact: 0.10 * 114 = 11.4, ceil=12, 12 % 8 = 4 → snap up to 16
         cfg2 = _make_config(
             window_size=8,
             num_sink_tokens=4,
@@ -292,11 +293,12 @@ class TestScoring:
 class TestEviction:
 
     # -------------------------------------------------------------------
-    # 11. test_position_ids_contiguous_after_eviction
+    # 11. test_position_ids_preserve_originals_after_eviction
     # -------------------------------------------------------------------
 
-    def test_position_ids_contiguous_after_eviction(self):
-        """After slice_and_keep, position_ids = arange(retained_len)."""
+    def test_position_ids_preserve_originals_after_eviction(self):
+        """After slice_and_keep, position_ids = the surviving tokens' ORIGINAL
+        positions (no rebasing) so keys keep their original RoPE phase."""
         state = CacheState()
         B, H, T, D = 1, 4, 20, 64
         state.key_states = torch.randn(B, H, T, D)
@@ -306,7 +308,7 @@ class TestEviction:
         retain = torch.tensor([[0, 1, 5, 10, 15, 19]])
         state.slice_and_keep(retain)
 
-        expected = torch.arange(6)
+        expected = torch.tensor([0, 1, 5, 10, 15, 19])
         assert torch.equal(state.position_ids, expected)
 
     # -------------------------------------------------------------------
