@@ -19,6 +19,50 @@ in **int4** (hand-rolled KIVI-style), with **pre-RoPE** key quantization and
 challenge analysis lives in the plan file
 (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
 
+> ## ⚠️ AMENDMENT — rerotation removed; contiguous-only, original positions (commit `f80326b`)
+>
+> The cache no longer re-rotates keys on eviction. `rerotate_on_evict` now defaults
+> to **`False`**: `slice_and_keep` gathers survivors **contiguous in memory** but
+> keeps their **ORIGINAL `position_ids`** (no rebasing to `arange`), and keys retain
+> the RoPE rotation they were stored with. This matches **KVPress / H2O** and is
+> correct on any transformers version (rebasing corrupts the query↔key relative
+> phase since HF advances the query `cache_position` monotonically). Several
+> resolutions below change as a result:
+>
+> - **The original-prompt goal "RoPE does not accumulate quantization error" is now
+>   met by the architecture itself.** With no strip/re-apply cycle, RoPE is applied
+>   **exactly once** (at prefill/gen) and never re-applied to cached keys → no
+>   rope-driven error accumulation for *either* tier, quantized or not. So the
+>   *accumulation* motivation for pre-RoPE is **moot**.
+> - **#2 reframed — Q-tier RoPE is now a fork, defaulting to POST-RoPE.** There is no
+>   free "strip gap" to quantize inside anymore. **Default (recommended): quantize the
+>   already-rotated surviving keys as-is** (post-RoPE); at read **dequantize only — no
+>   rotation**; demotion needs **no strip**; promotion is a plain dequant. This drops
+>   the per-step rotation cost and simplifies #2/#7/#10 substantially. **Pre-RoPE
+>   becomes an OPTIONAL quality lever** (KVQuant per-channel outliers only — *not*
+>   accumulation): it now costs an **explicit un-rotate at demotion** (reuse
+>   `rerotate_keys`' un-rotate half) + a **per-step re-rotate at read** to the window's
+>   original positions. The old "quantize between strip and re-rotate" piggyback
+>   returns **only** if someone sets `rerotate_on_evict=True` (StreamingLLM-style).
+> - **#3 collapses.** Positions are **never rebased** — each window keeps its true
+>   original positions forever. No merged-`arange`, no per-tier slice reassignment, no
+>   "positions change at compaction." The "one logical axis" is simply the **true
+>   original positions** carried per window; relative distances are now **exact**, not
+>   the old compaction approximation. The collision/independent-`arange` risk is gone.
+> - **#7 cost drops** under the default post-RoPE Q tier: per step it's **dequant only**
+>   (no RoPE), roughly halving the Q-tier read cost and removing the per-step-rotation
+>   concern. (Pre-RoPE option re-adds rotation + the demotion strip.)
+> - **#8 / #9 simplify.** `q_positions` never change ⇒ grids are trivially
+>   position-invariant; the per-window record's position-slot is a **fixed original
+>   range**, not a reassigned slice.
+> - **G5 is moot** — the fp tier no longer re-rotates either, so neither tier has
+>   rotation-compounding. (Removed.)
+> - **Both backends already mirror this** (commit touched `windowed_cache` and
+>   `windowed_eager_cache` symmetrically), consistent with #10.
+>
+> The affected resolutions below (#1, #2, #3, #7, #8, #9, #10) have been updated
+> inline to match this amendment; no conflicting guidance remains.
+
 1. **Quantization granularity.** Keys quantized **per-channel at the window-index
    level** (one scale/zero per `(head, channel, window)`); values **per-token**.
 2. **No compounding from re-quant.** Each window's **scale + zero-point are pinned
@@ -55,34 +99,41 @@ challenge analysis lives in the plan file
    (`[B,H_kv,T_fp,D]` + `position_ids`) and a separate **Q store** (int4 codes +
    scales/zeros + `position_ids`), both **gap-free**. *Rejected:* a full-length fp
    tensor with zeros in Q slots — wastes memory and zero keys aren't softmax-neutral
-   (`exp(q·0)=1`). RoPE needs only `position_id`, not co-location: rotate each tier
-   independently and **concatenate `[fp ‖ Q]`** (order-free during decode). Shared
+   (`exp(q·0)=1`). RoPE needs only `position_id`, not co-location: each key
+   carries its true original position (post-RoPE default ⇒ both tiers already rotated),
+   so just **concatenate `[fp ‖ Q]`** (order-free during decode). Shared
    layout is a **logical index/tier map** (the per-window record, #9), not a tensor.
-8. **#2 — Quantize between the strip and the re-rotate (reuse KVPress).** Does *not*
-   break HF RoPE (pure function of `position_ids`; `update()` returns one normal
-   rotated fp tensor). At eviction: **strip RoPE off all retained keys once**, then
-   branch — top-K re-rotate→fp; top-Q **quantize the un-rotated pre-RoPE keys there**
-   + store codes/position. Clean pre-RoPE grids (KVQuant). *Caveat:* still must
-   **dequantize + rotate the Q tier at read each step** (the #7 cost). Values carry
-   no RoPE (asymmetric store).
-9. **#3 — One logical position axis, stored as per-tier slices.** Positions change
-   **only at compaction**. *Rejected:* independent `arange`s per store (collide). At
-   each eviction assign **one merged `arange(T_fp + T_q)`** over all retained tokens
-   in chronological order, then slice into `fp_positions` / `q_positions`
-   (interleaved, not contiguous). The fp tier is post-RoPE so needs no read-time
-   positions; only the Q tier carries `q_positions`. New tokens append at running
-   length; query position = current total length.
-10. **#7 — Per-step Q-tier dequant cost: accepted, mitigated, measured.** Recent/
-    local + sink + top-K stay fp, so the most-attended tokens skip the slow path;
-    only the lower-weight Q tier is dequant+rotated per step. A **benchmark gate**:
-    Suite C (`perf_runner.py`) must confirm peak-memory savings aren't eaten by
-    throughput/TPOT loss. Fuse unpack+dequant+RoPE. (SKVQ-style recent-window-in-fp.)
-11. **#8 — Gather is a non-issue; grids are position-invariant.** Start with
-    **unpacked int8 codes** → `torch.gather` works token-wise; when packing to
-    nibbles later, switch the Q store to **whole-window block selection**. The grid
-    is computed from **pre-RoPE** keys (position-invariant), so position rebasing at
-    eviction leaves codes + scale/zero valid; **only `q_positions` update**. Key the
-    grid to window identity, never position.
+8. **#2 — Q-tier RoPE is a fork; default POST-RoPE (per AMENDMENT).** Rerotation is
+   off by default, so there is no free strip gap. **Default: quantize the already-
+   rotated surviving keys as-is** (post-RoPE) at demotion — **no strip**; at read
+   **dequantize only, no rotation** (positions never change); promotion is a plain
+   dequant. **Pre-RoPE is an OPTIONAL quality lever** (KVQuant per-channel outliers
+   only — accumulation is already avoided by the no-rerotation architecture): it costs
+   an **explicit un-rotate at demotion** (reuse `rerotate_keys`' un-rotate half) + a
+   **per-step re-rotate at read** to the window's original positions. The old
+   "quantize between strip and re-rotate" piggyback applies **only** under
+   `rerotate_on_evict=True`. `update()` still returns one normal fp tensor; values
+   carry no RoPE (asymmetric store).
+9. **#3 — Original positions, never rebased (per AMENDMENT).** Rerotation off ⇒
+   `slice_and_keep` keeps each surviving token's **true original `position_id`**;
+   positions are **never** rebased to `arange` and never reassigned. So there is **no
+   merged-`arange`, no per-tier slice juggling, no collision risk** — both tiers carry
+   true positions, relative distances are **exact** (not the old compaction
+   approximation), and the query keeps its absolute `cache_position`. The Q store
+   records each window's fixed original position range (only needed at read **if** the
+   pre-RoPE option is used). New tokens append at their natural absolute position.
+10. **#7 — Per-step Q-tier cost: accepted, mitigated, measured.** Recent/local + sink
+    + top-K stay fp, so the most-attended tokens skip the slow path. **Under the
+    default post-RoPE Q tier the per-step cost is dequant-only (no RoPE)** — roughly
+    half of the original estimate; the pre-RoPE option re-adds per-step rotation. A
+    **benchmark gate**: Suite C (`perf_runner.py`) must confirm peak-memory savings
+    aren't eaten by throughput/TPOT loss. (SKVQ-style recent-window-in-fp.)
+11. **#8 — Gather is a non-issue; grids are stable.** Start with **unpacked int8
+    codes** → `torch.gather` works token-wise; when packing to nibbles later, switch
+    the Q store to **whole-window block selection**. Since positions are **never
+    rebased** (AMENDMENT), a window's codes + scale/zero stay valid across evictions
+    unconditionally — nothing about a window changes at compaction except that it may
+    be dropped. Key the grid to window identity.
 12. **#9 — Tier flag is implicit; the per-window record is lightweight.** Tier *is*
     which store holds a window. A small record keyed by `original_window_id` carries
     each surviving Q window's **pinned grid `(codes, scale, zero)` across evictions**
@@ -99,8 +150,9 @@ challenge analysis lives in the plan file
     byte-identical `cache.py`/`state.py` (+ new shared quant module), **not**
     `hooks.py` (flash recomputes via aux SDPA; eager reads materialized weights — we
     do **not** add aux SDPA to eager). Shared `update()` returns effective K/V
-    `[fp ‖ dequant+rotated Q]`, so eager scoring needs no change; the flash aux SDPA
-    sources the same effective K via a shared `materialize_effective_kv` helper.
+    `[fp ‖ dequant Q]` (post-RoPE default — dequant only; `+rotate` only under the
+    pre-RoPE option), so eager scoring needs no change; the flash aux SDPA sources the
+    same effective K via a shared `materialize_effective_kv` helper.
     Transient dequant is **per-layer** (modest, ~`(Q-fp size)/num_layers`).
 
 ### Locked decisions (bigger-picture review)
