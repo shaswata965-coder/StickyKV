@@ -81,14 +81,10 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
    largest outlier and obliterates small/median values. So group finely (keys
    per-channel per-window, values per-token) to localize range — but not
    arbitrarily: each group costs a scale+zero, so too-fine groups eat the int4
-   savings. Fine grouping still can't kill **intra-group** outliers; preferred
-   solution at int4 is a **Hadamard rotation** (SAW-INT4: *"single most important
-   ingredient for effective int4 KV"* — redistributes outlier energy across all
-   channels in a block, making the distribution uniform and easy to quantize;
-   composes cleanly with the Triton tile kernel by fusing rotation into the
-   dequant step at zero extra memory traffic). Dense-and-sparse retention (KVQuant:
-   top ~1% outlier channels kept in fp) is the fallback for cases where a rotation
-   transform cannot be applied. Use **asymmetric** quant for the skewed
+   savings. Fine grouping still can't kill **intra-group** outliers; at int4 add
+   optional **dense-and-sparse** outlier retention (top ~1% channels in fp, KVQuant)
+   or a **Hadamard rotation** to spread them (RotateKV/QuaRot). Outlier strategy
+   TBD — to be decided separately. Use **asymmetric** quant for the skewed
    distributions; validate **int8 first**, then int4.
 6. **#11 — Tier-aware budget via a quant ratio.** Add a `quant_ratio` knob `q`
    that splits the **memory** budget (not the window count) between tiers:
