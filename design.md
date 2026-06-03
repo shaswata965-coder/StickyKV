@@ -81,10 +81,15 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
    largest outlier and obliterates small/median values. So group finely (keys
    per-channel per-window, values per-token) to localize range — but not
    arbitrarily: each group costs a scale+zero, so too-fine groups eat the int4
-   savings. Fine grouping still can't kill **intra-group** outliers; at int4 add
-   optional **dense-and-sparse** outlier retention (top ~1% channels in fp, KVQuant)
-   or a **Hadamard rotation** to spread them (RotateKV/QuaRot). Use **asymmetric**
-   quant for the skewed distributions; validate **int8 first**, then int4.
+   savings. Fine grouping still can't kill **intra-group** outliers; preferred
+   solution at int4 is a **Hadamard rotation** (SAW-INT4: *"single most important
+   ingredient for effective int4 KV"* — redistributes outlier energy across all
+   channels in a block, making the distribution uniform and easy to quantize;
+   composes cleanly with the Triton tile kernel by fusing rotation into the
+   dequant step at zero extra memory traffic). Dense-and-sparse retention (KVQuant:
+   top ~1% outlier channels kept in fp) is the fallback for cases where a rotation
+   transform cannot be applied. Use **asymmetric** quant for the skewed
+   distributions; validate **int8 first**, then int4.
 6. **#11 — Tier-aware budget via a quant ratio.** Add a `quant_ratio` knob `q`
    that splits the **memory** budget (not the window count) between tiers:
    `M_budget = β·M_full`, `M_fp = (1−q)·M_budget`, `M_q = q·M_budget`. Convert each
@@ -187,6 +192,40 @@ round-trip error, pinned-grid idempotence, position-invariance, flash/eager pari
 Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift), LongBench
 (quality at int8 then int4).
 
+## Considered and explicitly rejected optimizations
+
+The following were analysed and dropped before v1. Recorded here so they are not
+re-debated during implementation.
+
+- **Async eviction** (overlap RoPE strip + quantize with FFN via CUDA streams):
+  with rerotation off the eviction-time work is now just gather + quantize a few
+  newly-demoted windows — essentially nothing to hide. Even with rerotation on, it
+  requires decoupling this step's attention from the compaction (Suite A parity
+  break), raises peak memory during overlap (pre- and post-eviction buffers
+  coexist), is GPU-only, and adds stream/determinism risk. **Dropped.**
+
+- **Deferred memory movement** (flag migrations, batch copies every N steps):
+  movement already happens only at eviction cadence, batched, boundary-crossers
+  only. Pushing N beyond `window_size` overshoots the memory budget during deferral
+  and splits logical tier from physical store (ambiguous precision in read/score
+  paths). Safe substitute: hysteresis (see below). **Dropped.**
+
+- **Prefetch next-layer Q-tier dequant during FFN** (overlap dequant with the
+  adjacent layer's FFN): decode is memory-bandwidth-bound on weight loading already;
+  FFN weight traffic saturates HBM, leaving no free bandwidth shadow. Running dequant
+  concurrently on a second stream adds bytes moved rather than hiding them. Q-tier
+  dequant is ~1% of step bandwidth — real but unhideable by scheduling. The right
+  lever is eliminating the write-back (Phase 2 fused kernel), not prefetching it.
+  **Dropped.**
+
+- **Hysteresis at the K/Q boundary** (require a score margin before migrating):
+  with rerotation off, demotion costs one quantize call and promotion one dequant —
+  both cheap. With the pinned grid, re-quantizing an oscillating window is already
+  idempotent (zero error). Hysteresis adds a tunable margin knob for marginal
+  migration savings. Its only remaining value is damping the G4 score-feedback drift,
+  which is already instrumented via Suite A Jaccard. **Dropped as a v1 concern;**
+  revisit if Suite A shows measurable boundary churn.
+
 ## Kernel roadmap (three phases)
 
 ### Phase 1 — v1: materialize-then-concat (ship first)
@@ -195,10 +234,15 @@ Dequantize the entire Q store to fp16, concatenate with the fp store
 No custom kernels; fully CPU-testable; correctness is the only goal here.
 - **Q-tier RoPE:** post-RoPE default — keys are stored already-rotated, so the
   dequantized tensor is immediately ready for attention with no further rotation.
-- **Memory:** one transient fp16 copy of the Q tier per layer per step (freed after
-  attention). Per-layer scope means peak impact ≈ `(Q-fp size)/num_layers` — modest.
-- **Exit criterion:** Suite C confirms memory savings; Suite A Jaccard holds; LongBench
-  quality acceptable at int8, then int4. Only then move to Phase 2.
+- **Memory peak (the materialization concern):** yes, this creates a transient fp16
+  copy of the Q tier. But attention runs **layer-by-layer**, so only one layer's Q
+  tier is live in fp16 at any moment — peak impact ≈ `(Q-fp size)/num_layers`.
+  At 32 layers that is ~1–2% of the full cache, not a showstopper. The transient is
+  freed immediately after each layer's attention. The fp16 **write-back** is the
+  real bandwidth cost (~4× the int4 read); that is what Phase 2 eliminates.
+- **Exit criterion:** Suite C confirms net memory savings (steady-state int4 storage
+  outweighs the per-layer transient); Suite A Jaccard holds; LongBench quality
+  acceptable at int8, then int4. Only then move to Phase 2.
 
 ### Phase 2 — Triton GEMV tile: fused dequant-inside-attention (future work)
 A Triton decode kernel that loads int4 codes tile-by-tile, dequantizes to fp16
