@@ -181,3 +181,47 @@ tier-aware budget resolver; mirrored into both backends. CPU unit tests:
 round-trip error, pinned-grid idempotence, position-invariance, flash/eager parity.
 Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift), LongBench
 (quality at int8 then int4).
+
+## Kernel roadmap (three phases)
+
+### Phase 1 — v1: materialize-then-concat (ship first)
+Dequantize the entire Q store to fp16, concatenate with the fp store
+`[fp ‖ dequant-Q]`, and pass the result to the standard attention path unchanged.
+No custom kernels; fully CPU-testable; correctness is the only goal here.
+- **Q-tier RoPE:** post-RoPE default — keys are stored already-rotated, so the
+  dequantized tensor is immediately ready for attention with no further rotation.
+- **Memory:** one transient fp16 copy of the Q tier per layer per step (freed after
+  attention). Per-layer scope means peak impact ≈ `(Q-fp size)/num_layers` — modest.
+- **Exit criterion:** Suite C confirms memory savings; Suite A Jaccard holds; LongBench
+  quality acceptable at int8, then int4. Only then move to Phase 2.
+
+### Phase 2 — Triton GEMV tile: fused dequant-inside-attention (future work)
+A Triton decode kernel that loads int4 codes tile-by-tile, dequantizes to fp16
+**in registers**, and runs `Q·K^T` before any write-back to global memory. The
+fp16 materialization is eliminated entirely — only int4 codes are read from HBM.
+- **Default: post-RoPE.** Keys are stored post-RoPE (same as Phase 1), so the tile
+  kernel is: `load int4 → unpack → scale → MAC`. No in-kernel rotation. Straightforward
+  to write (~150–200 lines Triton); directly removes the fp16 write-back cost.
+- **Optional: pre-RoPE.** As a quality lever (KVQuant per-channel outlier benefit),
+  keys can be stored pre-RoPE (un-rotated at demotion once; original positions cached
+  as fixed `cos/sin` tables). The tile kernel becomes: `load int4 → unpack → scale →
+  apply RoPE from cached cos/sin → MAC`. RoPE is pure arithmetic on already-loaded
+  data — **zero extra memory traffic** in the bandwidth-bound decode regime; the
+  arithmetic overhead is negligible. Pre-computed `cos/sin` tables are valid forever
+  (positions never rebased). This option is **not in the initial kernel** — add only
+  after the post-RoPE tile is validated and profiled.
+- **Scope:** decode path only (GEMV, one query token at a time). Prefill continues
+  on the Phase 1 materialize path. That is fine — the Q tier is a decode-phase
+  construct (windows are demoted during generation, not prefill).
+- **Layout fit:** tile boundary = window boundary = scale group boundary. One tile
+  reads one window's codes and one pinned `(scale, zero)` — clean, no cross-tile
+  scale bookkeeping.
+
+### Phase 3 — FlashInfer integration (production ceiling, not in scope)
+Replace the custom GEMV tile with FlashInfer's paged quantized decode attention,
+which handles the full FlashAttention tile loop (online softmax, GQA, paged blocks)
+with int4/fp8 natively. Requires aligning `QuantizedStore`'s block layout with
+FlashInfer's paged KV convention. Strictly better than Phase 2 (handles both prefill
+and decode, production-tested), but introduces a significant dependency and layout
+constraint. Deferred until Phase 2 is profiled and the layout migration cost is
+justified.
