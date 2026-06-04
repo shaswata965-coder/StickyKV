@@ -162,10 +162,16 @@ class WindowedCache(_HFCacheBase):
         if new_window_scores is not None:
             if state.window_scores is None:
                 state.window_scores = new_window_scores.clone()
-                # Initialize identity mapping: compact index i == original window i
+                # Initialize identity mapping: compact index i == original window i.
+                # Stored per row ([B, W]) so divergent per-row eviction keeps each
+                # row's surviving window identities independently.
                 W = new_window_scores.shape[-1]
-                state.original_window_ids = torch.arange(
-                    W, device=new_window_scores.device, dtype=torch.long
+                B_w = new_window_scores.shape[0]
+                state.original_window_ids = (
+                    torch.arange(W, device=new_window_scores.device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(B_w, -1)
+                    .contiguous()
                 )
                 self._next_original_window_id[layer_idx] = W
             else:
@@ -189,13 +195,18 @@ class WindowedCache(_HFCacheBase):
                     if state.original_window_ids is not None:
                         n_extra = W_new - W_old
                         start_id = self._next_original_window_id[layer_idx]
-                        extra = torch.arange(
-                            start_id, start_id + n_extra,
-                            device=state.original_window_ids.device,
-                            dtype=torch.long,
+                        B_w = state.original_window_ids.shape[0]
+                        extra = (
+                            torch.arange(
+                                start_id, start_id + n_extra,
+                                device=state.original_window_ids.device,
+                                dtype=torch.long,
+                            )
+                            .unsqueeze(0)
+                            .expand(B_w, -1)
                         )
                         state.original_window_ids = torch.cat(
-                            [state.original_window_ids, extra]
+                            [state.original_window_ids, extra], dim=1
                         )
                         self._next_original_window_id[layer_idx] = start_id + n_extra
                 elif W_new < W_old:
@@ -235,8 +246,13 @@ class WindowedCache(_HFCacheBase):
 
             # b. Snapshot old positions before compaction (only needed when
             #    re-rotating; scoped to the flag to avoid confusion).
+            #    position_ids is [B, T]; gather per row so each row's snapshot
+            #    matches the tokens it actually keeps.
             old_positions = (
-                state.position_ids[retain_token_idx[0]].clone()
+                torch.gather(
+                    state.position_ids, 1,
+                    retain_token_idx.to(state.position_ids.device),
+                ).clone()
                 if self.resolved.rerotate_on_evict
                 else None
             )
@@ -262,11 +278,13 @@ class WindowedCache(_HFCacheBase):
                 state.window_scores, dim=-1, index=idx_w
             ).contiguous()
 
-            # f. Keep original_window_ids in sync with the surviving windows
+            # f. Keep original_window_ids in sync with the surviving windows.
+            #    Gather per row ([B, W]) because rows may retain different windows.
             if state.original_window_ids is not None:
-                state.original_window_ids = state.original_window_ids[
-                    retained_window_idx[0]
-                ].contiguous()
+                state.original_window_ids = torch.gather(
+                    state.original_window_ids, 1,
+                    retained_window_idx.to(state.original_window_ids.device),
+                ).contiguous()
 
             # Update policy
             policy.set_total_after_compaction(state.seq_length)

@@ -114,8 +114,13 @@ class PerfRunner:
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")
         model.eval()
-        # Create input
-        input_ids = torch.randint(100, 30000, (1, prefill_len), device=model.device)
+        # Create input. batch_size>1 measures batched throughput; the windowed
+        # cache evicts each row independently (synthetic inputs are equal-length,
+        # so no padding is involved).
+        batch_size = max(1, int(getattr(pc, "batch_size", 1)))
+        input_ids = torch.randint(
+            100, 30000, (batch_size, prefill_len), device=model.device
+        )
         # Setup cache
         cache_backend = c.get("cache_backend", "dynamic")
         cache_pkg = c.get("cache_package")
@@ -218,8 +223,9 @@ class PerfRunner:
                 gen_time = t3 - t2
                 tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
                 # End-to-end throughput includes prefill (TTFT) + decode time; this
-                # mirrors the legacy field name but is NOT decode-only.
-                throughput_tokps = gen_len / max(gen_time + (t1-t0), 1e-9)
+                # mirrors the legacy field name but is NOT decode-only. Counts all
+                # batch_size rows (B=1 ⇒ identical to the legacy value).
+                throughput_tokps = (batch_size * gen_len) / max(gen_time + (t1-t0), 1e-9)
                 peak_mb = 0.0
                 if torch.cuda.is_available():
                     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)

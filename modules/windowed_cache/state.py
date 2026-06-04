@@ -22,16 +22,17 @@ class CacheState:
     value_states : Tensor
         Shape ``[B, H_kv, T, D]``.
     position_ids : Tensor
-        Shape ``[T]``, int64.  After eviction, gathered to the surviving
-        tokens' **original** positions so keys keep their original RoPE phase.
-        Only rebased to ``arange(T)`` when ``rerotate_keys`` runs (the
-        opt-in StreamingLLM-style path).
+        Shape ``[B, T]``, int64.  After eviction, gathered **per row** to the
+        surviving tokens' **original** positions so keys keep their original
+        RoPE phase.  Each batch row may evict different windows, so rows can
+        carry different surviving positions.  Only rebased to ``arange(T)``
+        (per row) when ``rerotate_keys`` runs (the opt-in StreamingLLM path).
     window_scores : Tensor
         Shape ``[B, H_q, W]``.  Running cumulative per-window scores.
     original_window_ids : Tensor
-        Shape ``[W]``, int64.  Maps each surviving compact window index to
-        its original sequence window index (0-based after sinks).  Stays
-        identity before the first eviction; gathered alongside
+        Shape ``[B, W]``, int64.  Maps each surviving compact window index to
+        its original sequence window index (0-based after sinks), **per row**.
+        Stays identity before the first eviction; gathered per row alongside
         ``window_scores`` at every subsequent eviction so that compact
         top-K indices can be translated back to original positions for
         faithful Jaccard comparison.
@@ -77,7 +78,10 @@ class CacheState:
         value : Tensor
             Shape ``[B, H_kv, N_new, D]``.
         position_ids : Tensor, optional
-            Shape ``[N_new]``.  If ``None``, auto-increments from current length.
+            Shape ``[N_new]`` (shared across the batch, e.g. HF's
+            ``cache_position``) or ``[B, N_new]`` (per row).  If ``None``,
+            auto-increments from the current length.  Stored canonically as
+            ``[B, N_new]``.
         """
         if self.key_states is None:
             # Take ownership: a contiguous clone prevents the cache from
@@ -89,17 +93,28 @@ class CacheState:
             self.value_states = torch.cat([self.value_states, value], dim=2)
 
         n_new = key.shape[2]
+        B = key.shape[0]
         device = key.device
+        # position_ids is canonical as [B, N_new]. A 1-D input is shared across
+        # the batch and broadcast; a [B, N_new] input is used as-is.
         if position_ids is not None:
             new_pos = position_ids
+            if new_pos.dim() == 1:
+                new_pos = new_pos.unsqueeze(0).expand(B, -1)
         else:
-            start = 0 if self.position_ids is None else self.position_ids.shape[0]
-            new_pos = torch.arange(start, start + n_new, device=device, dtype=torch.long)
+            start = 0 if self.position_ids is None else self.position_ids.shape[1]
+            new_pos = (
+                torch.arange(start, start + n_new, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(B, -1)
+            )
 
         if self.position_ids is None:
-            self.position_ids = new_pos
+            self.position_ids = new_pos.contiguous()
         else:
-            self.position_ids = torch.cat([self.position_ids, new_pos])
+            self.position_ids = torch.cat(
+                [self.position_ids, new_pos.to(self.position_ids.device)], dim=1
+            )
 
     # -----------------------------------------------------------------
     # slice_and_keep
@@ -135,10 +150,12 @@ class CacheState:
         # positions must stay original for the query<->key relative phase to be
         # correct. (Rebasing to arange is only valid when the keys are *also*
         # re-rotated and the query position is rebased -- see rerotate_keys.)
+        # position_ids is [B, T]; gather each row independently because rows
+        # may evict different windows and thus keep different positions.
         if self.position_ids is not None:
-            self.position_ids = self.position_ids[
-                retain_token_indices[0].to(self.position_ids.device)
-            ].contiguous()
+            self.position_ids = torch.gather(
+                self.position_ids, 1, retain_token_indices.to(self.position_ids.device)
+            ).contiguous()
 
     # -----------------------------------------------------------------
     # rerotate_keys
@@ -160,7 +177,9 @@ class CacheState:
         rope_module : nn.Module
             The model's rotary embedding module (e.g. ``model.model.rotary_emb``).
         old_position_ids : Tensor
-            Shape ``[T_retained]``, the original positions before compaction.
+            Shape ``[B, T_retained]`` (per row), or ``[T_retained]`` (shared
+            across the batch, broadcast).  The original positions before
+            compaction.
         """
         # Lazy import to avoid circular deps at module level
         try:
@@ -172,11 +191,14 @@ class CacheState:
                 apply_rotary_pos_emb,
             )
 
+        B = self.key_states.shape[0]
         T_retained = self.key_states.shape[2]
         device = self.key_states.device
 
-        # Old positions → cos/sin
-        old_pos = old_position_ids.unsqueeze(0)  # [1, T]
+        # Old positions → cos/sin.  Accept a shared 1-D vector or per-row [B, T].
+        old_pos = old_position_ids
+        if old_pos.dim() == 1:
+            old_pos = old_pos.unsqueeze(0).expand(B, -1)
         cos_old, sin_old = rope_module(self.value_states, old_pos)
 
         # Undo old rotation: cos(-θ)=cos(θ), sin(-θ)=-sin(θ)
@@ -184,8 +206,12 @@ class CacheState:
             self.key_states, self.key_states, cos_old, -sin_old
         )
 
-        # New contiguous positions
-        new_pos = torch.arange(T_retained, device=device, dtype=torch.long).unsqueeze(0)
+        # New contiguous positions (same for every row)
+        new_pos = (
+            torch.arange(T_retained, device=device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(B, -1)
+        )
         cos_new, sin_new = rope_module(self.value_states, new_pos)
 
         # Apply new rotation
@@ -197,6 +223,9 @@ class CacheState:
         # Keys now live at contiguous positions [0..T_retained-1]; keep the
         # bookkeeping in sync (slice_and_keep left the *original* positions) so
         # a subsequent eviction snapshots correct "old" positions.
-        self.position_ids = torch.arange(
-            T_retained, device=device, dtype=torch.long
+        self.position_ids = (
+            torch.arange(T_retained, device=device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
         )

@@ -19,6 +19,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from modules.windowed_eager_cache.cache import WindowedCache
 from modules.windowed_eager_cache.config import ResolvedConfig, WindowedCacheConfig
 from modules.windowed_eager_cache.policy import EvictionPolicy
 from modules.windowed_eager_cache.scorer import accumulate, compute_window_scores
@@ -191,10 +192,10 @@ class TestEviction:
         B, H, T, D = 1, 4, 20, 64
         state.key_states = torch.randn(B, H, T, D)
         state.value_states = torch.randn(B, H, T, D)
-        state.position_ids = torch.arange(T)
+        state.position_ids = torch.arange(T).unsqueeze(0)  # [B, T]
         retain = torch.tensor([[0, 1, 5, 10, 15, 19]])
         state.slice_and_keep(retain)
-        assert torch.equal(state.position_ids, torch.tensor([0, 1, 5, 10, 15, 19]))
+        assert torch.equal(state.position_ids, torch.tensor([[0, 1, 5, 10, 15, 19]]))
 
     # 12
     def test_key_rerotation_uses_new_positions(self):
@@ -420,3 +421,84 @@ class TestFactory:
         assert CacheClass is not None
         assert ConfigClass is not None
         assert hook_fn is not None
+
+
+# ===========================================================================
+# Batching — per-row independence under divergent eviction (mirrors flash twin)
+# ===========================================================================
+
+
+def _make_pos_keys(B, H_kv, T, D, start=0):
+    idx = torch.arange(start, start + T, dtype=torch.float32).view(1, 1, T, 1)
+    return idx.expand(B, H_kv, T, D).clone()
+
+
+def _divergent_scores(B, H_q):
+    s0 = torch.zeros(B, H_q, 8)
+    s0[0, :, [1, 3]] = 100.0
+    if B > 1:
+        s0[1, :, [5, 7]] = 100.0
+    return [s0, torch.zeros(B, H_q, 9), torch.zeros(B, H_q, 10)]
+
+
+def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
+    model_cfg = _FakeModelConfig()
+    cfg = WindowedCacheConfig(
+        window_size=1, num_sink_tokens=0, local_window_size=1, cache_budget=0.375,
+    )
+    cache = WindowedCache(
+        config=cfg, prefill_len=8, model_config=model_cfg,
+        kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+        num_layers=1, max_tokens=0,
+    )
+    k = _make_pos_keys(B, H_kv, 8, D)
+    cache.update(k, k.clone(), 0, cache_kwargs={
+        "cache_position": torch.arange(8),
+        "window_scores": scores_per_call[0],
+    })
+    for i, pos in enumerate((8, 9)):
+        k1 = _make_pos_keys(B, H_kv, 1, D, start=pos)
+        cache.update(k1, k1.clone(), 0, cache_kwargs={
+            "cache_position": torch.arange(pos, pos + 1),
+            "window_scores": scores_per_call[i + 1],
+        })
+    return cache._states[0]
+
+
+class TestBatching:
+    """Batch>1 must evict each row independently with no cross-contamination."""
+
+    def test_divergent_eviction_keeps_per_row_windows(self):
+        H_q = 4
+        state = _drive_divergent_cache(_divergent_scores(2, H_q), B=2)
+        assert state.original_window_ids.shape == (2, 3)
+        assert state.original_window_ids[0].tolist() == [1, 3, 9]
+        assert state.original_window_ids[1].tolist() == [5, 7, 9]
+        assert state.position_ids.shape == (2, 3)
+        assert state.position_ids[0].tolist() == [1, 3, 9]
+        assert state.position_ids[1].tolist() == [5, 7, 9]
+        kept = state.key_states[:, 0, :, 0]
+        assert kept[0].tolist() == [1.0, 3.0, 9.0]
+        assert kept[1].tolist() == [5.0, 7.0, 9.0]
+
+    def test_batch_row_matches_standalone_b1(self):
+        H_q = 4
+        state2 = _drive_divergent_cache(_divergent_scores(2, H_q), B=2)
+        state1 = _drive_divergent_cache(_divergent_scores(1, H_q), B=1)
+        assert state1.original_window_ids.shape == (1, 3)
+        assert torch.equal(
+            state1.original_window_ids[0], state2.original_window_ids[0]
+        )
+        assert torch.equal(state1.position_ids[0], state2.position_ids[0])
+        assert torch.equal(state1.key_states[0], state2.key_states[0])
+
+    def test_slice_and_keep_gathers_positions_per_row(self):
+        state = CacheState()
+        B, H, T, D = 2, 2, 6, 4
+        state.key_states = torch.randn(B, H, T, D)
+        state.value_states = torch.randn(B, H, T, D)
+        state.position_ids = torch.stack([torch.arange(T), torch.arange(T) + 100])
+        retain = torch.tensor([[0, 2, 5], [1, 3, 4]])
+        state.slice_and_keep(retain)
+        assert state.position_ids[0].tolist() == [0, 2, 5]
+        assert state.position_ids[1].tolist() == [101, 103, 104]

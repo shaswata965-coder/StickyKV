@@ -124,6 +124,10 @@ class DataConfig:
     gen_len: int = 50
     # Global knobs (apply to parity runners; LongBench has its own num_samples).
     num_samples: int = 1
+    # Samples per teacher-forced forward pass. 1 (default) ⇒ sequential, which
+    # is byte-identical to the legacy single-sample path. >1 batches that many
+    # equal-length samples through one cache/forward for speed.
+    batch_size: int = 1
     max_tokens: Optional[int] = None
     ratio: float = 1.0   # prefill fraction of max_tokens; 1-ratio is gen
 
@@ -139,6 +143,10 @@ class DataConfig:
         if self.num_samples < 1:
             raise ConfigValidationError(
                 f"data.num_samples must be >= 1, got {self.num_samples!r}"
+            )
+        if self.batch_size < 1:
+            raise ConfigValidationError(
+                f"data.batch_size must be >= 1, got {self.batch_size!r}"
             )
 
     def resolved_lengths(
@@ -254,6 +262,7 @@ class PerfConfig:
     grid: List[Dict[str, int]] = field(default_factory=list)
     prefill_lengths: List[int] = field(default_factory=lambda: [2048, 4096])
     gen_len: int = 256
+    batch_size: int = 1            # sequences per forward; >1 measures batched throughput
     num_warmup_runs: int = 2
     num_measurement_runs: int = 10
     allow_shared_gpu: bool = True

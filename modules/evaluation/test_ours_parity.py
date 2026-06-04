@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import numpy as np
 import pytest
+import torch
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from utils.config import (
@@ -164,3 +165,61 @@ class TestOursParityRunner:
         required = {"top_window_indices", "window_scores",
                     "eviction_step_mask", "generated_tokens", "metadata_json"}
         assert required.issubset(set(data.files))
+
+
+class TestExtractRowRetained:
+    """Unit tests for the per-row extraction helper (the batched hot-path math).
+
+    This is the function the batched generation loop calls once per
+    sample-in-chunk; B=1 routes through it with row 0, so it must reproduce the
+    legacy single-sample selection exactly.
+    """
+
+    def test_identity_orig_topk_and_local(self):
+        from modules.evaluation.ours_parity_runner import _extract_row_retained
+        # H_q=2, W=5, ws_sz=1, local=1 (int) → eW=4. Windows 0 and 3 dominate.
+        ws_row = torch.zeros(2, 5)
+        ws_row[:, 0] = 10.0
+        ws_row[:, 3] = 8.0
+        tk_arr, ws_arr, ret_ids, ret_sc = _extract_row_retained(
+            ws_row, None, tk=2, ws_sz=1, lws=1)
+        assert tk_arr.tolist() == [0, 3]          # topk score order
+        assert ret_ids.tolist() == [0, 3, 4]       # evictable ∪ local, sorted
+        assert ws_arr.shape == (2, 5)
+        assert ret_sc.shape == (2, 3)
+
+    def test_orig_ids_remap(self):
+        from modules.evaluation.ours_parity_runner import _extract_row_retained
+        ws_row = torch.zeros(2, 5)
+        ws_row[:, 0] = 10.0
+        ws_row[:, 3] = 8.0
+        orig = torch.tensor([10, 11, 12, 13, 14])
+        tk_arr, _, ret_ids, _ = _extract_row_retained(
+            ws_row, orig, tk=2, ws_sz=1, lws=1)
+        assert tk_arr.tolist() == [10, 13]
+        assert ret_ids.tolist() == [10, 13, 14]
+
+    def test_per_row_independence(self):
+        """Two rows of one [B,H,W] tensor extract their own selections."""
+        from modules.evaluation.ours_parity_runner import _extract_row_retained
+        ws = torch.zeros(2, 2, 5)
+        ws[0, :, 1] = 10.0; ws[0, :, 0] = 5.0   # row 0 → windows 1,0
+        ws[1, :, 2] = 10.0; ws[1, :, 3] = 5.0   # row 1 → windows 2,3
+        orig = torch.arange(5)
+        tk0, _, rid0, _ = _extract_row_retained(ws[0], orig, tk=2, ws_sz=1, lws=1)
+        tk1, _, rid1, _ = _extract_row_retained(ws[1], orig, tk=2, ws_sz=1, lws=1)
+        assert tk0.tolist() == [1, 0]
+        assert rid0.tolist() == [0, 1, 4]
+        assert tk1.tolist() == [2, 3]
+        assert rid1.tolist() == [2, 3, 4]
+
+    def test_float_local_window_size(self):
+        from modules.evaluation.ours_parity_runner import _extract_row_retained
+        # W=5, ws_sz=1, lws=0.5 → lt=ceil(0.5*5)=3 → lnw=3 → eW=2.
+        ws_row = torch.zeros(2, 5)
+        ws_row[:, 0] = 10.0
+        ws_row[:, 1] = 8.0
+        tk_arr, _, ret_ids, _ = _extract_row_retained(
+            ws_row, None, tk=2, ws_sz=1, lws=0.5)
+        assert tk_arr.tolist() == [0, 1]
+        assert ret_ids.tolist() == [0, 1, 2, 3, 4]

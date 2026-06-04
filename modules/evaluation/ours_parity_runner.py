@@ -31,6 +31,75 @@ def _load_base_npz(path: str) -> dict:
     arrays = {k: data[k] for k in data.files if k != "metadata_json"}
     return {"arrays": arrays, "metadata": meta}
 
+
+def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
+                          tk: int, ws_sz: int, lws):
+    """Extract one (sample, layer)'s parity arrays from a single row's scores.
+
+    This is the per-row generalisation of the original single-sample extraction
+    (which hard-coded ``ws_v[0]``).  For a B=1 batch with ``orig_row`` taken
+    from row 0 it is byte-identical to the legacy path.
+
+    Parameters
+    ----------
+    ws_row : Tensor
+        Shape ``[H_q, W]`` — cumulative per-window scores for this row/layer.
+    orig_row : Tensor or None
+        Shape ``[W]`` — original window ids for this row (``None`` ⇒ identity,
+        used for the attention-fallback path where ids aren't tracked).
+    tk, ws_sz, lws
+        top-K windows, window size, and ``local_window_size`` (int or float).
+
+    Returns
+    -------
+    (tk_arr, ws_arr, ret_ids_arr, ret_sc_arr) : numpy arrays
+        Mirrors ``step_tk``/``step_ws``/``step_ret_ids``/``step_ret_scores``.
+    """
+    dev = ws_row.device
+    W = ws_row.shape[-1]
+
+    # local windows (always retained, compact eW..W-1)
+    if isinstance(lws, float):
+        Sp = max(W * ws_sz, 1)
+        lt = math.ceil(lws * Sp)
+        r2 = lt % ws_sz
+        if r2:
+            lt += ws_sz - r2
+        lnw = lt // ws_sz
+    else:
+        lnw = lws // ws_sz
+    lnw = min(lnw, W)
+    eW = W - lnw
+
+    # ── evictable top-K ──────────────────────────────────────────────
+    if eW > 0 and tk > 0:
+        ev = ws_row[:, :eW].mean(dim=0)              # [eW] (mean across heads)
+        k = min(tk, eW)
+        compact_ev = ev.topk(k).indices.cpu()        # [k] (topk score order)
+        orig_ev = (orig_row[compact_ev.to(dev)].cpu()
+                   if orig_row is not None else compact_ev)
+        tk_arr = orig_ev.numpy()
+    else:
+        compact_ev = torch.zeros(0, dtype=torch.long)
+        orig_ev = torch.zeros(0, dtype=torch.long)
+        tk_arr = np.zeros(min(tk, max(W, 1)), dtype=np.int64)
+
+    ws_arr = ws_row.cpu().to(torch.float16).numpy()  # [H_q, W]
+
+    # ── local windows ────────────────────────────────────────────────
+    compact_loc = torch.arange(eW, W, dtype=torch.long, device=dev)
+    orig_loc = (orig_row[compact_loc].cpu()
+                if orig_row is not None else compact_loc.cpu())
+
+    # ── all retained: evictable ∪ local, sorted by original position ──
+    all_compact = torch.cat([compact_ev, compact_loc.cpu()])
+    all_orig = torch.cat([orig_ev.long(), orig_loc.long()])
+    order = torch.argsort(all_orig)
+    ret_ids_arr = all_orig[order].numpy()            # [M]
+    ret_compact = all_compact[order].to(dev)         # [M]
+    ret_sc_arr = ws_row[:, ret_compact].cpu().to(torch.float16).numpy()  # [H_q, M]
+    return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr
+
 class OursParityRunner:
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
@@ -176,18 +245,37 @@ class OursParityRunner:
 
         t0 = time.time()
 
-        for sample_idx in range(num_samples):
-            article_idx = p.article_index + sample_idx
-            article_text = articles[article_idx]
+        batch_size = max(1, int(getattr(cfg.data, "batch_size", 1)))
+
+        for chunk_start in range(0, num_samples, batch_size):
+            chunk = list(range(chunk_start, min(chunk_start + batch_size, num_samples)))
+            Bc = len(chunk)
+
+            # Build the equal-length batched prefill. Each article is truncated
+            # to prefill_len; batching requires they all reach that length.
+            tok_list = []
+            for sample_idx in chunk:
+                article_idx = p.article_index + sample_idx
+                t = tokenizer.encode(articles[article_idx], return_tensors="pt",
+                                     add_special_tokens=True)[:, :prefill_len]
+                tok_list.append(t)
+            lengths = {t.shape[1] for t in tok_list}
+            if len(lengths) > 1:
+                raise ParityValidationError(
+                    f"Batched parity (data.batch_size={batch_size}) requires "
+                    f"equal-length prefills, but samples {chunk} tokenized to "
+                    f"lengths {sorted(lengths)}. Use data.batch_size=1 for "
+                    f"corpora with articles shorter than prefill_len."
+                )
+            tokens = torch.cat(tok_list, dim=0).to(model.device)   # [Bc, L]
+
             log.info(
-                "── Sample %d/%d (article %d, sha=%s) ──",
-                sample_idx + 1, num_samples, article_idx, samples_shas[sample_idx][:8],
+                "── Chunk samples %d–%d/%d (articles %d–%d) ──",
+                chunk[0] + 1, chunk[-1] + 1, num_samples,
+                p.article_index + chunk[0], p.article_index + chunk[-1],
             )
 
-            tokens = tokenizer.encode(article_text, return_tensors="pt",
-                                      add_special_tokens=True)[:, :prefill_len].to(model.device)
-
-            # Fresh cache + hooks per sample (cache state must reset).
+            # Fresh cache + hooks per chunk (cache state must reset).
             cache_config = WCC(
                 window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                 local_window_size=w.local_window_size, cache_budget=budget)
@@ -199,11 +287,15 @@ class OursParityRunner:
                        max_tokens=gen_len)
             hooks = install_hooks(model, cache, cache_config)
 
-            sample_gen_tokens = base_gen_tokens[sample_idx]   # [num_steps]
+            # Per-row forced-token streams: [Bc, num_steps].
+            chunk_forced = base_gen_tokens[chunk]
             acc_scores: List[Optional[Tensor]] = [None] * n_layers
-            all_topk, all_ws, all_evict = [], [], []
-            all_ret_ids: List[np.ndarray] = []    # per step: [n_layers, M_step]
-            all_ret_scores: List[np.ndarray] = [] # per step: [n_layers, H_q, M_step]
+            # Per-row, per-step accumulators (one list per sample in the chunk).
+            all_topk       = [[] for _ in range(Bc)]
+            all_ws         = [[] for _ in range(Bc)]
+            all_evict      = [[] for _ in range(Bc)]
+            all_ret_ids    = [[] for _ in range(Bc)]
+            all_ret_scores = [[] for _ in range(Bc)]
             gen_kwargs: Dict[str, Any] = {}
             if cfg.cache.backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
@@ -214,17 +306,19 @@ class OursParityRunner:
                         if step == 0:
                             inp = tokens.clone()
                         else:
-                            forced_tok = int(sample_gen_tokens[step - 1])
-                            inp = torch.tensor([[forced_tok]], device=model.device)
+                            inp = torch.tensor(
+                                [[int(chunk_forced[bi, step - 1])] for bi in range(Bc)],
+                                device=model.device,
+                            )   # [Bc, 1]
                         out = model(input_ids=inp, past_key_values=cache, use_cache=True,
                                     return_dict=True, **gen_kwargs)
                         # cache.update() increments _generation_step AFTER the
                         # eviction check, so to read "did this step evict" we
-                        # have to look at (step - 1) modulo ws_sz.
+                        # have to look at (step - 1) modulo ws_sz. The generation
+                        # step is shared across the batch.
                         evicted = any((cache._generation_step[li] - 1) > 0 and
                                       (cache._generation_step[li] - 1) % ws_sz == 0
                                       for li in range(n_layers))
-                        all_evict.append(evicted)
                         if getattr(out, "attentions", None):
                             for li in range(n_layers):
                                 a = out.attentions[li]
@@ -242,117 +336,98 @@ class OursParityRunner:
                                     elif nS < oS:
                                         ts = torch.nn.functional.pad(ts, (0, oS-nS))
                                     acc_scores[li][..., :max(nS,oS)] += ts[..., :max(nS,oS)]
-                        step_tk, step_ws, step_ret_ids, step_ret_scores = [], [], [], []
+
+                        # Precompute per-layer effective scores once (shared across
+                        # the batch); None marks "no scores yet" for this layer.
+                        layer_wsv: List[Optional[Tensor]] = []
+                        layer_orig: List[Optional[Tensor]] = []
                         for li in range(n_layers):
                             cs = cache._states[li]
                             if cs.window_scores is not None:
-                                ws_v     = cs.window_scores
-                                orig_ids = cs.original_window_ids  # [W] or None
+                                layer_wsv.append(cs.window_scores)            # [B, H_q, W]
+                                layer_orig.append(cs.original_window_ids)     # [B, W] or None
                             elif acc_scores[li] is not None:
                                 ac  = acc_scores[li]
                                 ps  = ac[..., ns:]
-                                Sp  = ps.shape[-1]
-                                rem = Sp % ws_sz
+                                rem = ps.shape[-1] % ws_sz
                                 if rem: ps = torch.nn.functional.pad(ps, (0, ws_sz - rem))
                                 W_tmp = ps.shape[-1] // ws_sz
-                                ws_v     = ps.reshape(ps.shape[0], ps.shape[1], W_tmp, ws_sz).sum(-1)
-                                orig_ids = None
+                                layer_wsv.append(
+                                    ps.reshape(ps.shape[0], ps.shape[1], W_tmp, ws_sz).sum(-1))
+                                layer_orig.append(None)
                             else:
-                                step_tk.append(np.zeros(min(tk, 1), dtype=np.int64))
-                                step_ws.append(np.zeros((1, 1), dtype=np.float16))
-                                step_ret_ids.append(np.zeros(0, dtype=np.int64))
-                                step_ret_scores.append(np.zeros((1, 0), dtype=np.float16))
-                                continue
+                                layer_wsv.append(None)
+                                layer_orig.append(None)
 
-                            dev = ws_v.device
-                            W   = ws_v.shape[-1]
-                            lws = w.local_window_size
-                            if isinstance(lws, float):
-                                Sp  = max(W * ws_sz, 1)
-                                lt  = math.ceil(lws * Sp)
-                                r2  = lt % ws_sz
-                                if r2: lt += ws_sz - r2
-                                lnw = lt // ws_sz
-                            else:
-                                lnw = lws // ws_sz
-                            lnw = min(lnw, W)
-                            eW  = W - lnw
+                        # Extract per sample-in-chunk, per layer (runner loops are
+                        # fine — only cache/state/policy/scorer are loop-free).
+                        for bi in range(Bc):
+                            all_evict[bi].append(evicted)
+                            step_tk, step_ws, step_ret_ids, step_ret_scores = [], [], [], []
+                            for li in range(n_layers):
+                                ws_v = layer_wsv[li]
+                                if ws_v is None:
+                                    step_tk.append(np.zeros(min(tk, 1), dtype=np.int64))
+                                    step_ws.append(np.zeros((1, 1), dtype=np.float16))
+                                    step_ret_ids.append(np.zeros(0, dtype=np.int64))
+                                    step_ret_scores.append(np.zeros((1, 0), dtype=np.float16))
+                                    continue
+                                orig_full = layer_orig[li]
+                                orig_row = orig_full[bi] if orig_full is not None else None
+                                a_tk, a_ws, a_rid, a_rsc = _extract_row_retained(
+                                    ws_v[bi], orig_row, tk, ws_sz, w.local_window_size)
+                                step_tk.append(a_tk)
+                                step_ws.append(a_ws)
+                                step_ret_ids.append(a_rid)
+                                step_ret_scores.append(a_rsc)
 
-                            # ── evictable top-K ──────────────────────────────
-                            if eW > 0 and tk > 0:
-                                ev           = ws_v[..., :eW].mean(dim=1)    # [B, eW]
-                                k            = min(tk, eW)
-                                compact_ev   = ev.topk(k, dim=-1).indices[0].cpu()  # [k]
-                                orig_ev      = (orig_ids[compact_ev.to(dev)].cpu()
-                                                if orig_ids is not None else compact_ev)
-                                step_tk.append(orig_ev.numpy())
-                            else:
-                                compact_ev = torch.zeros(0, dtype=torch.long)
-                                orig_ev    = torch.zeros(0, dtype=torch.long)
-                                step_tk.append(np.zeros(min(tk, max(W, 1)), dtype=np.int64))
+                            # ── stack per-layer results for this step/sample ──
+                            all_topk[bi].append(np.stack(step_tk, 0))
+                            all_ws[bi].append(np.stack(step_ws, 0))
+                            mM_s = max(len(x) for x in step_ret_ids)
+                            mH_s = max(x.shape[0] for x in step_ret_scores)
+                            p_rid = [np.pad(x, [(0, mM_s - len(x))], constant_values=-1)
+                                     for x in step_ret_ids]
+                            p_rsc = [np.pad(x, [(0, mH_s - x.shape[0]),
+                                                (0, mM_s - x.shape[1])])
+                                     for x in step_ret_scores]
+                            all_ret_ids[bi].append(np.stack(p_rid, 0))    # [n_layers, mM_s]
+                            all_ret_scores[bi].append(np.stack(p_rsc, 0)) # [n_layers, mH_s, mM_s]
 
-                            step_ws.append(ws_v[0].cpu().to(torch.float16).numpy())
-
-                            # ── local windows (always retained, compact eW..W-1) ─
-                            compact_loc = torch.arange(eW, W, dtype=torch.long, device=dev)
-                            orig_loc    = (orig_ids[compact_loc].cpu()
-                                           if orig_ids is not None else compact_loc.cpu())
-
-                            # ── all retained: evictable ∪ local, sort by original pos ─
-                            all_compact = torch.cat([compact_ev, compact_loc.cpu()])
-                            all_orig    = torch.cat([orig_ev.long(), orig_loc.long()])
-                            order       = torch.argsort(all_orig)
-                            ret_orig    = all_orig[order].numpy()               # [M]
-                            ret_compact = all_compact[order].to(dev)            # [M]
-
-                            # ours' scores for retained windows: [H_q, M]
-                            ret_sc = ws_v[0, :, ret_compact].cpu().to(torch.float16).numpy()
-                            step_ret_ids.append(ret_orig)
-                            step_ret_scores.append(ret_sc)
-
-                        # ── stack per-layer results for this step ─────────────
-                        all_topk.append(np.stack(step_tk, 0))
-                        all_ws.append(np.stack(step_ws, 0))
-
-                        # pad retained arrays across layers (M and H_q may differ)
-                        mM_s = max(len(x) for x in step_ret_ids)
-                        mH_s = max(x.shape[0] for x in step_ret_scores)
-                        p_rid = [np.pad(x, [(0, mM_s - len(x))], constant_values=-1)
-                                 for x in step_ret_ids]
-                        p_rsc = [np.pad(x, [(0, mH_s - x.shape[0]),
-                                            (0, mM_s - x.shape[1])])
-                                 for x in step_ret_scores]
-                        all_ret_ids.append(np.stack(p_rid, 0))    # [n_layers, mM_s]
-                        all_ret_scores.append(np.stack(p_rsc, 0)) # [n_layers, mH_s, mM_s]
                         if (step+1) % 100 == 0:
                             log.info("  Step %d/%d", step+1, gen_len)
             finally:
                 hooks.remove()
 
-            # Pad per-step arrays within this sample
-            mW = max(x.shape[-1] for x in all_ws)
-            mK = max(x.shape[-1] for x in all_topk)
-            pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in all_ws]
-            ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in all_topk]
-            mH = max(x.shape[-2] for x in pws)
-            pws = [np.pad(x, [(0,0),(0,mH-x.shape[-2]),(0,0)]) if x.shape[-2]<mH else x for x in pws]
+            # Finalize each sample in the chunk (pad per-step, append to samples_*
+            # in global sample order so the leading sample axis stays in order).
+            for bi in range(Bc):
+                s_topk, s_ws, s_evict = all_topk[bi], all_ws[bi], all_evict[bi]
+                s_rid, s_rsc = all_ret_ids[bi], all_ret_scores[bi]
 
-            samples_topk.append(np.stack(ptk, 0))
-            samples_ws.append(np.stack(pws, 0))
-            samples_evict.append(np.array(all_evict, dtype=bool))
+                mW = max(x.shape[-1] for x in s_ws)
+                mK = max(x.shape[-1] for x in s_topk)
+                pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in s_ws]
+                ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in s_topk]
+                mH = max(x.shape[-2] for x in pws)
+                pws = [np.pad(x, [(0,0),(0,mH-x.shape[-2]),(0,0)]) if x.shape[-2]<mH else x for x in pws]
 
-            # Pad retained arrays across steps (M and H_q may grow over time)
-            mM2  = max(x.shape[-1]  for x in all_ret_ids)
-            mH2  = max(x.shape[-2]  for x in all_ret_scores)
-            prid = [np.pad(x, [(0,0),(0, mM2 - x.shape[-1])],   constant_values=-1)
-                    if x.shape[-1] < mM2 else x for x in all_ret_ids]
-            prsc = [np.pad(x, [(0,0),(0, mH2 - x.shape[-2]),(0, mM2 - x.shape[-1])])
-                    if (x.shape[-2] < mH2 or x.shape[-1] < mM2) else x
-                    for x in all_ret_scores]
-            samples_ret_ids.append(np.stack(prid, 0))    # [num_steps, n_layers, mM2]
-            samples_ret_scores.append(np.stack(prsc, 0)) # [num_steps, n_layers, mH2, mM2]
+                samples_topk.append(np.stack(ptk, 0))
+                samples_ws.append(np.stack(pws, 0))
+                samples_evict.append(np.array(s_evict, dtype=bool))
 
-            # Memory hygiene: free per-sample cache, hooks, and tensors before next sample.
+                # Pad retained arrays across steps (M and H_q may grow over time)
+                mM2  = max(x.shape[-1]  for x in s_rid)
+                mH2  = max(x.shape[-2]  for x in s_rsc)
+                prid = [np.pad(x, [(0,0),(0, mM2 - x.shape[-1])],   constant_values=-1)
+                        if x.shape[-1] < mM2 else x for x in s_rid]
+                prsc = [np.pad(x, [(0,0),(0, mH2 - x.shape[-2]),(0, mM2 - x.shape[-1])])
+                        if (x.shape[-2] < mH2 or x.shape[-1] < mM2) else x
+                        for x in s_rsc]
+                samples_ret_ids.append(np.stack(prid, 0))    # [num_steps, n_layers, mM2]
+                samples_ret_scores.append(np.stack(prsc, 0)) # [num_steps, n_layers, mH2, mM2]
+
+            # Memory hygiene: free per-chunk cache, hooks, and tensors.
             del cache, cache_config, acc_scores, all_topk, all_ws, all_evict, tokens
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
