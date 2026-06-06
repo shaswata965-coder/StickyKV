@@ -12,12 +12,48 @@ import numpy as np
 import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
-from utils.config import ExperimentConfig
+from utils.config import ExperimentConfig, ParityValidationError
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_string, sha256_tokenizer
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _base_row_topk(ws_row: Tensor, eW: int, tk: int):
+    """Per-row top-K extraction for the base (full-cache) parity run.
+
+    The per-row generalisation of the original ``ws_v[0]`` extraction; for a
+    B=1 batch it is byte-identical to the legacy path. Window indices are in
+    original space (the base run uses a DynamicCache and never evicts, so
+    compact index == original index).
+
+    Parameters
+    ----------
+    ws_row : Tensor
+        Shape ``[H_q, W]`` — cumulative per-window scores for this row/layer.
+    eW : int
+        Number of evictable windows (``W - local_windows``), computed once per
+        layer because it depends only on the shared geometry.
+    tk : int
+        top-K windows to record.
+
+    Returns
+    -------
+    (tk_arr, ws_arr) : numpy arrays
+        ``tk_arr`` mirrors ``step_tk`` (top-K indices, score order);
+        ``ws_arr`` mirrors ``step_ws`` (full per-window scores, ``[H_q, W]``).
+    """
+    W = ws_row.shape[-1]
+    if eW > 0 and tk > 0:
+        ev = ws_row[:, :eW].mean(dim=0)          # [eW] (mean across heads)
+        k = min(tk, eW)
+        tk_arr = ev.topk(k).indices.cpu().numpy()
+    else:
+        tk_arr = np.zeros(min(tk, W), dtype=np.int64)
+    ws_arr = ws_row.cpu().to(torch.float16).numpy()
+    return tk_arr, ws_arr
+
 
 class BaseParityRunner:
     def __init__(self, config: ExperimentConfig) -> None:
@@ -85,31 +121,55 @@ class BaseParityRunner:
 
         t0 = time.time()
 
-        for sample_idx in range(num_samples):
-            article_idx = p.article_index + sample_idx
-            article_text = articles[article_idx]
-            article_sha = sha256_string(article_text)
-            samples_shas.append(article_sha)
+        batch_size = max(1, int(getattr(cfg.data, "batch_size", 1)))
+
+        for chunk_start in range(0, num_samples, batch_size):
+            chunk = list(range(chunk_start, min(chunk_start + batch_size, num_samples)))
+            Bc = len(chunk)
+
+            # Build the equal-length batched prefill (each article truncated to
+            # prefill_len; batching requires they all reach that length).
+            tok_list = []
+            for sample_idx in chunk:
+                article_idx = p.article_index + sample_idx
+                article_text = articles[article_idx]
+                samples_shas.append(sha256_string(article_text))
+                t = tokenizer.encode(article_text, return_tensors="pt",
+                                     add_special_tokens=True)[:, :prefill_len]
+                tok_list.append(t)
+            lengths = {t.shape[1] for t in tok_list}
+            if len(lengths) > 1:
+                raise ParityValidationError(
+                    f"Batched parity (data.batch_size={batch_size}) requires "
+                    f"equal-length prefills, but samples {chunk} tokenized to "
+                    f"lengths {sorted(lengths)}. Use data.batch_size=1 for "
+                    f"corpora with articles shorter than prefill_len."
+                )
+            tokens = torch.cat(tok_list, dim=0).to(model.device)   # [Bc, L]
+
             log.info(
-                "── Sample %d/%d (article %d, sha=%s) ──",
-                sample_idx + 1, num_samples, article_idx, article_sha[:8],
+                "── Chunk samples %d–%d/%d (articles %d–%d) ──",
+                chunk[0] + 1, chunk[-1] + 1, num_samples,
+                p.article_index + chunk[0], p.article_index + chunk[-1],
             )
 
-            tokens = tokenizer.encode(article_text, return_tensors="pt",
-                                      add_special_tokens=True)[:, :prefill_len].to(model.device)
-
             acc_scores: List[Optional[Tensor]] = [None] * n_layers
-            all_topk, all_ws, gen_toks = [], [], []
+            # Per-row, per-step accumulators (one list per sample in the chunk).
+            all_topk = [[] for _ in range(Bc)]
+            all_ws   = [[] for _ in range(Bc)]
+            gen_toks = [[] for _ in range(Bc)]
             input_ids = tokens.clone()
             pkv = DynamicCache()
             with torch.no_grad():
                 for step in range(gen_len):
-                    inp = input_ids if step == 0 else next_tok.unsqueeze(0)
+                    # Each row generates its own greedy continuation: [Bc, 1].
+                    inp = input_ids if step == 0 else next_tok.unsqueeze(1)
                     out = model(input_ids=inp, past_key_values=pkv, use_cache=True,
                                 output_attentions=True, return_dict=True)
                     pkv = out.past_key_values
-                    next_tok = out.logits[:, -1, :].argmax(dim=-1)
-                    gen_toks.append(next_tok.item())
+                    next_tok = out.logits[:, -1, :].argmax(dim=-1)   # [Bc]
+                    for bi in range(Bc):
+                        gen_toks[bi].append(int(next_tok[bi].item()))
                     for li in range(n_layers):
                         a = out.attentions[li]
                         # Sum over ALL query rows of this step (cumulative across steps via acc_scores).
@@ -124,7 +184,11 @@ class BaseParityRunner:
                                     torch.zeros(ts.shape[0], ts.shape[1], nS-oS,
                                                 device=ts.device, dtype=ts.dtype)], -1)
                             acc_scores[li][..., :nS] += ts
-                    step_tk, step_ws = [], []
+
+                    # Precompute per-layer effective scores + geometry once
+                    # (shared across the batch); extract per row afterwards.
+                    layer_wsv: List[Tensor] = []
+                    layer_eW: List[int] = []
                     for li in range(n_layers):
                         ac = acc_scores[li]
                         ps = ac[..., ns:]
@@ -142,30 +206,35 @@ class BaseParityRunner:
                         else:
                             lnw = lws // ws_sz
                         lnw = min(lnw, W)
-                        eW = W - lnw
-                        if eW > 0 and tk > 0:
-                            ev = ws_v[..., :eW].mean(dim=1)
-                            k = min(tk, eW)
-                            step_tk.append(ev.topk(k, dim=-1).indices[0].cpu().numpy())
-                        else:
-                            step_tk.append(np.zeros(min(tk, W), dtype=np.int64))
-                        step_ws.append(ws_v[0].cpu().to(torch.float16).numpy())
-                    all_topk.append(np.stack(step_tk, 0))
-                    all_ws.append(np.stack(step_ws, 0))
+                        layer_wsv.append(ws_v)
+                        layer_eW.append(W - lnw)
+
+                    for bi in range(Bc):
+                        step_tk, step_ws = [], []
+                        for li in range(n_layers):
+                            a_tk, a_ws = _base_row_topk(
+                                layer_wsv[li][bi], layer_eW[li], tk)
+                            step_tk.append(a_tk)
+                            step_ws.append(a_ws)
+                        all_topk[bi].append(np.stack(step_tk, 0))
+                        all_ws[bi].append(np.stack(step_ws, 0))
+
                     if (step+1) % 100 == 0:
                         log.info("  Step %d/%d", step+1, gen_len)
 
-            # Pad per-step arrays within this sample
-            mW = max(x.shape[-1] for x in all_ws)
-            mK = max(x.shape[-1] for x in all_topk)
-            pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in all_ws]
-            ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in all_topk]
+            # Finalize each sample in the chunk (pad per-step, append in global
+            # sample order so the leading sample axis stays ordered).
+            for bi in range(Bc):
+                s_topk, s_ws, s_gen = all_topk[bi], all_ws[bi], gen_toks[bi]
+                mW = max(x.shape[-1] for x in s_ws)
+                mK = max(x.shape[-1] for x in s_topk)
+                pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in s_ws]
+                ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in s_topk]
+                samples_topk.append(np.stack(ptk, 0))
+                samples_ws.append(np.stack(pws, 0))
+                samples_gen_toks.append(np.array(s_gen, dtype=np.int64))
 
-            samples_topk.append(np.stack(ptk, 0))
-            samples_ws.append(np.stack(pws, 0))
-            samples_gen_toks.append(np.array(gen_toks, dtype=np.int64))
-
-            # Memory hygiene: free per-sample tensors before the next sample.
+            # Memory hygiene: free per-chunk tensors before the next chunk.
             del acc_scores, all_topk, all_ws, gen_toks, pkv, input_ids, tokens
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import numpy as np
 import pytest
+import torch
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from utils.config import ExperimentConfig, load_config
@@ -90,3 +91,40 @@ class TestBaseParityRunner:
                             resolved_top_k=lambda *_a, **_k: 2),
             telemetry=MagicMock(track_scores=True, output_dir=str(tmp_path)),
         )
+
+
+class TestBaseRowTopk:
+    """Unit tests for the per-row top-K helper used by the batched base run.
+
+    B=1 routes through this helper with row 0, so it must reproduce the legacy
+    single-sample selection exactly.
+    """
+
+    def test_basic_topk_and_ws_shape(self):
+        from modules.evaluation.base_parity_runner import _base_row_topk
+        ws_row = torch.zeros(2, 5)
+        ws_row[:, 0] = 10.0
+        ws_row[:, 3] = 8.0
+        tk_arr, ws_arr = _base_row_topk(ws_row, eW=4, tk=2)
+        assert tk_arr.tolist() == [0, 3]      # topk score order
+        assert ws_arr.shape == (2, 5)
+
+    def test_per_row_independence(self):
+        from modules.evaluation.base_parity_runner import _base_row_topk
+        ws = torch.zeros(2, 2, 5)
+        ws[0, :, 1] = 10.0; ws[0, :, 0] = 5.0   # row 0 → windows 1,0
+        ws[1, :, 2] = 10.0; ws[1, :, 3] = 5.0   # row 1 → windows 2,3
+        tk0, _ = _base_row_topk(ws[0], eW=4, tk=2)
+        tk1, _ = _base_row_topk(ws[1], eW=4, tk=2)
+        assert tk0.tolist() == [1, 0]
+        assert tk1.tolist() == [2, 3]
+
+    def test_no_evictable_or_zero_topk(self):
+        from modules.evaluation.base_parity_runner import _base_row_topk
+        ws_row = torch.randn(2, 5)
+        # eW == 0 → no evictable windows: zeros(min(tk, W))
+        tk_arr, _ = _base_row_topk(ws_row, eW=0, tk=2)
+        assert tk_arr.tolist() == [0, 0]
+        # tk == 0 → record nothing
+        tk_arr2, _ = _base_row_topk(ws_row, eW=4, tk=0)
+        assert tk_arr2.shape == (0,)
