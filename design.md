@@ -92,6 +92,8 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
    tier's memory to windows with **its own** bytes-per-window:
    `N_fp = M_fp / b_fp`, `N_q = M_q / b_q` where
    `b_q ≈ ¼·b_fp + per-window key-scale/zero + per-token value-scale overhead`.
+   The scale/zero overhead term depends on the chosen **scale dtype** (fp16, fp8,
+   or int8) — treated as an **empirical knob swept in Suite C**, not a constant.
    The int4 tier holds ~4× the windows of equal fp memory (minus overhead) — the
    resolver **must use `b_q`, not `b_fp`, for the Q tier**. Example (β=0.25, q=0.5):
    12.5% fp + 12.5% int4 ⇒ N_q≈4·N_fp ⇒ ~62.5% of windows at 25% memory. **Sink +
@@ -149,9 +151,9 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
 13. **#12 — Pinned grid by identity kills oscillation.** Retain a window's pinned
     grid **by identity, even through a promotion** → promote→demote re-quantizes
     against the old grid → **idempotent → identical codes → zero added error**.
-    Hysteresis optional. **transformers 4.47.1 target across devices** (env follow-up:
-    bump `environment.yml` pin from `<4.46`). ⚠️ *See "Environment caveat" below — the
-    current dev machine actually runs 5.8.1.*
+    Hysteresis optional. **transformers 4.47.1 target across devices**;
+    `environment.yml` is already pinned to `>=4.47,<4.48`. ⚠️ *See "Environment
+    caveat" below — the current dev machine actually runs 5.8.1.*
 14. **#10 — Mirror the shared twins, keep hooks divergent.** "Mirror" = the
     byte-identical `cache.py`/`state.py` (+ new shared quant module), **not**
     `hooks.py` (flash recomputes via aux SDPA; eager reads materialized weights — we
@@ -166,6 +168,16 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
   #9/#12/#13 bookkeeping and the score-feedback risk (G4); **instrument promotion
   frequency + Suite A Jaccard-vs-fp-only over long sequences**. Documented fallback:
   one-way demotion + frozen Q-scores (not chosen).
+  > **G4 explained — score-feedback loop:** `window_scores` are accumulated from
+  > attention weights computed over the dequantized Q tier. Because int4 is lossy,
+  > those attention weights are slightly wrong, so the score increments for Q-tier
+  > windows are noisy. Windows near the K/Q score boundary are the most exposed —
+  > small noise can flip a demotion decision, causing spurious promotion/demotion
+  > churn. Bounded naturally because the fp tier (sink + local + top-K) dominates
+  > attention mass and anchors most scores. Detected via **Suite A Jaccard**: compare
+  > which windows survive in a two-tier run vs a pure-fp baseline over long sequences;
+  > large divergence flags feedback drift. Hysteresis is the surgical fix if detected,
+  > but is deferred (see "Rejected optimizations").
 - **Quant group = the eviction window** (pins the grid per window, required by
   promotion); `window_size`, bit-width, and scale dtype (fp16/fp8/int8) are
   **empirical knobs swept in Suite C / LongBench** — **no hardcoded floor**; pick by
