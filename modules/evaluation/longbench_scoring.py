@@ -122,9 +122,16 @@ def score_predictions(
                 continue
             ex = json.loads(line)
 
+            # Every example in the split contributes to the denominator (matches
+            # THUDM eval.py, which divides by len(predictions)). A null/failed
+            # prediction (e.g. skip_oom recorded pred=null) scores 0 rather than
+            # being dropped — dropping it would silently inflate the mean and
+            # break comparability with the published numbers.
+            n += 1
             pred = ex.get("pred")
             if pred is None:
                 n_skipped += 1
+                # best = 0.0; nothing to add to `total`.
                 continue
 
             # Apply first-line extraction for specific datasets
@@ -137,17 +144,22 @@ def score_predictions(
             # null field would crash with `'NoneType' is not iterable`.
             all_classes = ex.get("all_classes") or []
 
-            # Per-example score = max over ground truths (THUDM convention)
+            # Per-example score = max over ground truths (THUDM convention).
+            # `default=0.0` guards the (data-malformed) empty-answers case, which
+            # would otherwise raise ValueError on max() of an empty iterable —
+            # THUDM initialises score=0 before the loop, so this matches.
             best = max(
-                metric_fn(pred, gt, all_classes=all_classes)
-                for gt in answers
+                (metric_fn(pred, gt, all_classes=all_classes) for gt in answers),
+                default=0.0,
             )
             total += best
-            n += 1
 
         if n_skipped > 0:
             log.warning(
-                "%s: %d examples skipped (pred=null, likely OOM)", name, n_skipped
+                "%s: %d examples had pred=null (likely OOM) — scored 0 and "
+                "counted in the denominator (matches THUDM eval.py)",
+                name,
+                n_skipped,
             )
 
         score = (total / n) * 100 if n > 0 else float("nan")

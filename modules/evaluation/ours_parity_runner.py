@@ -120,6 +120,12 @@ class OursParityRunner:
         w = cfg.window
         log.info("=== Ours Parity Runner (backend=%s) ===", cfg.cache.backend_package)
 
+        # Fail fast on an unsupported transformers version: the windowed cache's
+        # RoPE handling assumes monotonic cache_position (transformers <= 4.47).
+        from utils.cache_factory import assert_transformers_version_supported
+
+        assert_transformers_version_supported()
+
         # Global knobs from data config (must match base run for parity).
         num_samples_cfg = max(1, int(getattr(cfg.data, "num_samples", 1)))
         max_tokens = getattr(cfg.data, "max_tokens", None)

@@ -133,7 +133,13 @@ class PerfRunner:
         cc = None
         rope = None
         if cache_backend == "windowed" and cache_pkg:
-            from utils.cache_factory import get_cache_classes
+            from utils.cache_factory import (
+                assert_transformers_version_supported,
+                get_cache_classes,
+            )
+            # Fail fast: the windowed cache's RoPE handling assumes monotonic
+            # cache_position (transformers <= 4.47).
+            assert_transformers_version_supported()
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
             w = cfg.window
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,

@@ -38,6 +38,20 @@ class LongBenchRunner:
     (flash_attn / eager), routed via the factory in ``utils/cache_factory.py``.
     """
 
+    # Few-shot in-context-learning datasets whose prompt body IS a series of
+    # worked examples ("input\nanswer\n\ninput\nanswer\n...").  THUDM/LongBench
+    # pred.py (and DefensiveKV) deliberately do NOT wrap these in the chat
+    # template — doing so flips an instruct model out of "continue the format"
+    # mode into chat-assistant mode, so it emits a meta-preamble ("Here are the
+    # summaries:", "Here is the completed code:") instead of imitating the
+    # examples, destroying the score on exact-/edit-match metrics.
+    #   THUDM/LongBench/pred.py:
+    #     if dataset not in ["trec","triviaqa","samsum","lsht","lcc","repobench-p"]:
+    #         prompt = build_chat(...)
+    NO_CHAT_TEMPLATE_DATASETS = frozenset(
+        {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+    )
+
     def __init__(self, config) -> None:
         self._assert_tracking_off(config)
         self.config = config
@@ -168,6 +182,13 @@ class LongBenchRunner:
 
     def run(self) -> None:
         """Run predictions on all configured datasets."""
+        # Fail fast on an unsupported transformers version: the windowed cache's
+        # RoPE handling assumes monotonic cache_position (transformers <= 4.47).
+        if self.is_windowed:
+            from utils.cache_factory import assert_transformers_version_supported
+
+            assert_transformers_version_supported()
+
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
 
@@ -313,15 +334,21 @@ class LongBenchRunner:
 
         if len(tokenized) > max_length:
             half = max_length // 2
-            # Middle truncation on TOKEN IDs (not strings) to keep the length
-            # invariant exact and avoid BPE-seam re-merging when decoding then
-            # re-encoding two halves.
-            middle_ids = torch.cat([tokenized[:half], tokenized[-half:]])
-            prompt = tokenizer.decode(middle_ids, skip_special_tokens=True)
+            # Middle truncation — byte-for-byte identical to THUDM/LongBench
+            # pred.py and DefensiveKV: decode the head and tail halves
+            # SEPARATELY and string-concatenate. (Concatenating token ids and
+            # decoding once produces a different prompt at the head/tail seam,
+            # so it must not be used if results are to match the published
+            # numbers.) The prompt is re-tokenized below regardless.
+            prompt = tokenizer.decode(
+                tokenized[:half], skip_special_tokens=True
+            ) + tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
 
-        # 3. Apply chat template for LLaMA-3-8B-Instruct
-        model_name = cfg.model.name.lower()
-        if "instruct" in model_name or "chat" in model_name:
+        # 3. Apply chat template for LLaMA-3-8B-Instruct.
+        #    Skipped for the few-shot ICL datasets (matches THUDM/LongBench +
+        #    DefensiveKV) — wrapping their worked-example prompts in a chat
+        #    turn breaks few-shot continuation. See NO_CHAT_TEMPLATE_DATASETS.
+        if self._should_apply_chat_template(cfg.model.name, dataset_name):
             # Use the tokenizer's built-in chat template
             messages = [{"role": "user", "content": prompt}]
             try:
@@ -359,8 +386,15 @@ class LongBenchRunner:
                 "temperature": 1.0,
                 "pad_token_id": tokenizer.pad_token_id
                 or tokenizer.eos_token_id,
-                "repetition_penalty": getattr(self.lb, "repetition_penalty", 1.05),
             }
+
+            # THUDM/LongBench + DefensiveKV use PURE greedy with NO repetition
+            # penalty. Only pass one if the user explicitly opted in to a
+            # non-1.0 value; otherwise the default must stay absent so results
+            # match the published protocol exactly.
+            rep_pen = getattr(self.lb, "repetition_penalty", 1.0)
+            if rep_pen is not None and rep_pen != 1.0:
+                gen_kwargs["repetition_penalty"] = rep_pen
 
             # output_attentions only for eager backend
             if self.cache_backend_package == "eager":
@@ -454,6 +488,19 @@ class LongBenchRunner:
 
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks
+
+    @classmethod
+    def _should_apply_chat_template(cls, model_name: str, dataset_name: str) -> bool:
+        """Whether to wrap the prompt in the model's chat template.
+
+        True only for instruct/chat models AND non-few-shot datasets. The
+        few-shot ICL datasets (NO_CHAT_TEMPLATE_DATASETS) must stay raw so the
+        model continues the worked-example format instead of switching into
+        chat-assistant mode. Matches THUDM/LongBench + DefensiveKV.
+        """
+        name = model_name.lower()
+        is_chat_model = "instruct" in name or "chat" in name
+        return is_chat_model and dataset_name not in cls.NO_CHAT_TEMPLATE_DATASETS
 
     @staticmethod
     def _post_process(pred: str, dataset_name: str) -> str:

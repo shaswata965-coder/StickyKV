@@ -385,6 +385,39 @@ class TestScorePredictions:
         assert scores["narrativeqa"] == pytest.approx(100.0, abs=0.1)
         assert scores["passage_count"] == pytest.approx(100.0, abs=0.1)
 
+    def test_null_pred_scored_zero_and_counted(self, tmp_path):
+        """A null prediction (OOM) scores 0 AND stays in the denominator.
+
+        Matches THUDM eval.py (divides by len(predictions)); dropping nulls
+        would silently inflate the mean and break comparability.
+        """
+        from modules.evaluation.longbench_scoring import score_predictions
+
+        p = tmp_path / "narrativeqa.jsonl"
+        p.write_text(
+            json.dumps({"pred": "the cat", "answers": ["the cat"],
+                        "all_classes": None, "length": 100, "_id": "1"}) + "\n"
+            + json.dumps({"pred": None, "answers": ["the dog"],
+                          "all_classes": None, "length": 100, "_id": "2"}) + "\n",
+            encoding="utf-8",
+        )
+        scores = score_predictions(tmp_path)
+        # 1.0 (hit) + 0.0 (null) over 2 examples → 50, not 100.
+        assert scores["narrativeqa"] == pytest.approx(50.0, abs=0.1)
+
+    def test_empty_answers_does_not_crash(self, tmp_path):
+        """Malformed example with empty answers scores 0 instead of raising."""
+        from modules.evaluation.longbench_scoring import score_predictions
+
+        p = tmp_path / "narrativeqa.jsonl"
+        p.write_text(
+            json.dumps({"pred": "anything", "answers": [],
+                        "all_classes": None, "length": 100, "_id": "1"}) + "\n",
+            encoding="utf-8",
+        )
+        scores = score_predictions(tmp_path)
+        assert scores["narrativeqa"] == pytest.approx(0.0, abs=0.1)
+
 
 # ---------------------------------------------------------------------------
 # Test: max over ground truths
@@ -425,6 +458,94 @@ class TestSamsumFirstLine:
         pred = "Just one line"
         result = LongBenchRunner._post_process(pred, "samsum")
         assert result == "Just one line"
+
+
+# ---------------------------------------------------------------------------
+# Test: chat-template applied only to non-few-shot datasets
+# ---------------------------------------------------------------------------
+
+class TestChatTemplateGating:
+    """Few-shot ICL datasets must NOT be wrapped in the chat template.
+
+    Wrapping trec/triviaqa/samsum/lsht/lcc/repobench-p in a chat turn flips an
+    instruct model into chat-assistant mode (meta-preambles), which tanks
+    exact-/edit-match scores. Matches THUDM/LongBench pred.py + DefensiveKV.
+    """
+
+    FEW_SHOT = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
+    CHAT_WRAPPED = [
+        "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa",
+        "musique", "gov_report", "qmsum", "multi_news", "passage_count",
+        "passage_retrieval_en",
+    ]
+
+    def test_few_shot_datasets_skip_chat_template(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        for ds in self.FEW_SHOT:
+            assert not LongBenchRunner._should_apply_chat_template(
+                "meta-llama/Meta-Llama-3-8B-Instruct", ds
+            ), f"{ds} must NOT be chat-wrapped (few-shot ICL)"
+
+    def test_other_datasets_get_chat_template(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        for ds in self.CHAT_WRAPPED:
+            assert LongBenchRunner._should_apply_chat_template(
+                "meta-llama/Meta-Llama-3-8B-Instruct", ds
+            ), f"{ds} should be chat-wrapped"
+
+    def test_base_model_never_wrapped(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        # Non-instruct model: never apply chat template, regardless of dataset.
+        for ds in self.FEW_SHOT + self.CHAT_WRAPPED:
+            assert not LongBenchRunner._should_apply_chat_template(
+                "meta-llama/Meta-Llama-3-8B", ds
+            )
+
+    def test_exclusion_set_matches_official(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        assert LongBenchRunner.NO_CHAT_TEMPLATE_DATASETS == frozenset(
+            {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test: transformers version guard
+# ---------------------------------------------------------------------------
+
+class TestTransformersVersionGuard:
+    """The windowed cache is only correct on transformers <= 4.47.1."""
+
+    def test_supported_boundary_inclusive(self):
+        from utils.cache_factory import is_transformers_version_supported
+        assert is_transformers_version_supported("4.47.1")
+        assert is_transformers_version_supported("4.47.0")
+        assert is_transformers_version_supported("4.46.3")
+        assert is_transformers_version_supported("4.30.0")
+
+    def test_newer_versions_rejected(self):
+        from utils.cache_factory import is_transformers_version_supported
+        assert not is_transformers_version_supported("4.47.2")
+        assert not is_transformers_version_supported("4.48.0")
+        assert not is_transformers_version_supported("5.8.1")
+
+    def test_tolerates_version_suffixes(self):
+        from utils.cache_factory import is_transformers_version_supported
+        assert is_transformers_version_supported("4.47.1.dev0")
+        assert is_transformers_version_supported("4.47.1+cu121")
+        assert not is_transformers_version_supported("4.48.0.dev0")
+
+    def test_assert_raises_on_newer(self):
+        from utils.cache_factory import (
+            assert_transformers_version_supported,
+            ConfigValidationError,
+        )
+        with pytest.raises(ConfigValidationError):
+            assert_transformers_version_supported("5.8.1")
+
+    def test_assert_passes_on_target(self):
+        from utils.cache_factory import assert_transformers_version_supported
+        # Must not raise on the pinned target version.
+        assert_transformers_version_supported("4.47.1")
 
 
 # ---------------------------------------------------------------------------
