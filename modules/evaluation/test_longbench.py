@@ -679,6 +679,22 @@ class TestLongBenchConfig:
         assert lb.max_length == 7500
         assert lb.aggressive_cache_clear is False
 
+    def test_max_length_accepts_null_for_no_truncation(self):
+        """max_length=None is valid and means 'no pre-truncation'."""
+        from utils.config import LongBenchConfig
+        lb = LongBenchConfig(max_length=None)
+        assert lb.max_length is None
+
+    def test_truncation_gate(self):
+        """The truncation gate fires only for a positive max_length below len."""
+        # Mirrors the guard in _predict: `max_length and max_length > 0 and len>ml`.
+        def should_truncate(max_length, n_tokens):
+            return bool(max_length and max_length > 0 and n_tokens > max_length)
+        assert should_truncate(7500, 9000)
+        assert not should_truncate(7500, 5000)
+        assert not should_truncate(None, 9000)   # no truncation
+        assert not should_truncate(0, 9000)      # no truncation
+
     def test_config_loads_longbench_section(self):
         """YAML with longbench section parses correctly."""
         from utils.config import load_config

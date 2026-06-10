@@ -12,7 +12,10 @@ run:
   seed: 42
 
 model:
-  name: meta-llama/Meta-Llama-3-8B-Instruct
+  # Llama-3.1-8B-Instruct (128K context) — matches DefensiveKV, which runs the
+  # full LongBench context with NO pre-truncation. The original Meta-Llama-3-8B
+  # is only 8K and would force middle-truncation (caps passage_retrieval etc.).
+  name: meta-llama/Llama-3.1-8B-Instruct
   revision: main
   dtype: float16
   attn_implementation: eager                # MUST match cache.backend_package
@@ -48,7 +51,7 @@ longbench:
     - repobench-p
   include_chinese: false
   use_e_variants: false
-  max_length: 7500
+  max_length: null   # no pre-truncation — full context (Llama-3.1 128K fits all LongBench prompts). Matches DefensiveKV.
   output_dir: outputs/longbench/ours_eager_compression_0.8
   seed: 42
   resume: true                              # essential on Kaggle (9-hour limit)

@@ -10,7 +10,9 @@ run:
   seed: 42
 
 model:
-  name: meta-llama/Meta-Llama-3-8B-Instruct
+  # Llama-3.1-8B-Instruct (128K) — matches DefensiveKV; full context, no
+  # pre-truncation. (Original Meta-Llama-3-8B is 8K and would truncate.)
+  name: meta-llama/Llama-3.1-8B-Instruct
   revision: main
   dtype: float16
   attn_implementation: flash_attention_2
@@ -43,7 +45,7 @@ longbench:
     - repobench-p
   include_chinese: false
   use_e_variants: false                 # _e length-stratified variants off by default
-  max_length: 7500                      # per-dataset overrides come from dataset2maxlen.json
+  max_length: null                      # no pre-truncation — full context (Llama-3.1 128K). Matches DefensiveKV.
   output_dir: outputs/longbench/full_cache
   seed: 42
   resume: false

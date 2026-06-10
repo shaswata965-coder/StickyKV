@@ -323,7 +323,12 @@ class LongBenchConfig:
     )
     include_chinese: bool = False
     use_e_variants: bool = False    # LongBench-E length-stratified variants
-    max_length: int = 7500          # per-dataset overrides from dataset2maxlen.json
+    # Prompt truncation budget. A positive int reproduces official LongBench
+    # middle-truncation for short-context models. None / 0 disables truncation
+    # (full-context runs — matches DefensiveKV, which uses Llama-3.1-8B's 128K
+    # window and does NOT pre-truncate). Generation lengths are separate and
+    # come per-dataset from dataset2maxlen.json.
+    max_length: Optional[int] = 7500
     output_dir: str = "outputs/longbench/full_cache"
     seed: int = 42
     resume: bool = False            # skip datasets whose jsonl already exists

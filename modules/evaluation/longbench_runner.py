@@ -2,8 +2,9 @@
 
 Follows DefensiveKV's exact protocol:
 - LongBench v1 (THUDM/LongBench), 16 English datasets
-- LLaMA-3-8B-Instruct fp16
-- Greedy decoding, middle truncation, per-dataset max gen length
+- Llama-3.1-8B-Instruct (128K) fp16, full context (no pre-truncation)
+- Greedy decoding, per-dataset max gen length
+- Optional middle truncation (longbench.max_length) for short-context models
 - Output jsonl schema matches THUDM/LongBench/pred.py exactly
 
 Backend routing via ``utils/cache_factory.py``.
@@ -113,6 +114,7 @@ class LongBenchRunner:
 
         self.model = None
         self.tokenizer = None
+        self._over_context_warned = False
 
     @staticmethod
     def _compute_metrics_sha() -> str:
@@ -328,11 +330,15 @@ class LongBenchRunner:
             context=ex["context"], input=ex.get("input", "")
         )
 
-        # 2. Tokenize and middle-truncate if needed
-        max_length = getattr(self.lb, "max_length", 7500)
+        # 2. Tokenize and (optionally) middle-truncate.
+        #    max_length None / 0 / negative  -> NO truncation (full-context run;
+        #    matches DefensiveKV, which uses Llama-3.1-8B's 128K window and does
+        #    not pre-truncate). A positive value reproduces official
+        #    THUDM/LongBench middle-truncation for short-context models.
+        max_length = getattr(self.lb, "max_length", None)
         tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
 
-        if len(tokenized) > max_length:
+        if max_length and max_length > 0 and len(tokenized) > max_length:
             half = max_length // 2
             # Middle truncation — byte-for-byte identical to THUDM/LongBench
             # pred.py and DefensiveKV: decode the head and tail halves
@@ -369,6 +375,14 @@ class LongBenchRunner:
         inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
         context_length = input_ids.shape[-1]
+
+        # Guard: a prompt longer than the model's positional range yields
+        # out-of-distribution RoPE positions (garbage / errors). Surface it
+        # loudly instead of silently scoring noise — almost always means
+        # truncation was disabled (max_length null) on a SHORT-context model.
+        # Llama-3.1-8B (128K) fits every LongBench prompt; the original
+        # Llama-3-8B (8K) does not.
+        self._warn_if_over_context(context_length, max_gen_len)
 
         # 5. Set up cache
         cache = None
@@ -489,6 +503,30 @@ class LongBenchRunner:
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks
 
+    def _warn_if_over_context(self, context_length: int, max_gen_len: int) -> None:
+        """Warn (once) if prompt + generation exceeds the model's context window.
+
+        A prompt beyond ``max_position_embeddings`` produces out-of-distribution
+        RoPE positions: the run won't crash but scores become noise. The usual
+        cause is disabling truncation (``max_length: null``) on a short-context
+        model. Warn rather than raise so a long run isn't aborted by one example.
+        """
+        model_max = getattr(getattr(self.model, "config", None),
+                            "max_position_embeddings", None)
+        if not model_max:
+            return
+        needed = context_length + max_gen_len
+        if needed > model_max and not self._over_context_warned:
+            log.warning(
+                "Prompt+generation = %d tokens exceeds the model's context "
+                "window (%d). Positions beyond the window are out-of-distribution "
+                "and scores will be unreliable. Either set longbench.max_length "
+                "to truncate, or use a longer-context model (e.g. "
+                "Llama-3.1-8B-Instruct, 128K). Suppressing further warnings.",
+                needed, model_max,
+            )
+            self._over_context_warned = True
+
     @classmethod
     def _should_apply_chat_template(cls, model_name: str, dataset_name: str) -> bool:
         """Whether to wrap the prompt in the model's chat template.
@@ -551,7 +589,16 @@ class LongBenchRunner:
             # fraction of the cache BUDGET (not the full context), resolved here
             # at the max_length upper bound (the runtime resolves against each
             # example's own prefill length).
-            max_len = getattr(self.lb, "max_length", 7500)
+            # When truncation is disabled (max_length null), fall back to the
+            # model's context window for this informational estimate; the
+            # runtime policy resolves local_window_size against each example's
+            # real prefill length regardless.
+            max_len = getattr(self.lb, "max_length", None)
+            if not max_len:
+                max_len = getattr(
+                    getattr(self.model, "config", None),
+                    "max_position_embeddings", 8192,
+                )
             budget_tokens = int(budget * (max_len + max_gen_len))
             raw = lws * budget_tokens
             ceiled = math.ceil(raw)
