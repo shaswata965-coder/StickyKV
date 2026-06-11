@@ -34,7 +34,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .scorer import compute_window_scores
+import os
+
+from .scorer import compute_window_scores, reduce_token_scores_to_windows
+
+
+def _prefill_score_chunk() -> int:
+    """Query-row block size for the prefill score pass.
+
+    The flash hook reconstructs ``softmax(q·kᵀ).sum(over queries)`` to score
+    keys. Doing it in one shot materializes the full ``[B, H_q, T, S]`` matrix —
+    tens of GiB per layer at full LongBench context (T up to ~18k). Because the
+    score is a sum over query rows, we accumulate it in blocks of this many rows
+    and never hold more than ``[B, H_q, chunk, S]``. Override with the env var
+    ``STICKYKV_PREFILL_SCORE_CHUNK`` (smaller = less memory, more iterations).
+    """
+    try:
+        v = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024"))
+        return v if v > 0 else 1024
+    except (TypeError, ValueError):
+        return 1024
 
 try:
     from transformers.models.llama.modeling_llama import (
@@ -214,36 +233,50 @@ def install_score_hooks(
                 else:
                     k_expanded = k_current  # [B, H_q, S, D]
 
-                # 3. Auxiliary SDPA (standard PyTorch, NOT flash-attn).
-                # [B, H_q, T, D] @ [B, H_q, D, S] -> [B, H_q, T, S]
+                # 3. Auxiliary attention scoring, CHUNKED over the query rows.
+                #    The score we need is softmax(q·kᵀ).sum(over query rows) — a
+                #    sum, so we accumulate it in query-row blocks and never
+                #    materialize the full [B, H_q, T, S] matrix. Peak memory is
+                #    O(chunk · S) instead of O(T · S); at full LongBench context
+                #    the full fp32 matrix is tens of GiB per layer (the prior
+                #    cause of CUDA OOM once truncation was removed).
+                #
+                #    Numerics: per block we softmax in fp32 then cast to q.dtype
+                #    and sum — identical to the previous one-shot path when
+                #    T <= chunk (every prefill <= chunk and every generation
+                #    step, where T == 1). Only T > chunk diverges, and that case
+                #    previously OOM'd, so no baseline depends on it.
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
-                attn_weights = (
-                    torch.matmul(q, k_expanded.transpose(-2, -1)) * scaling
+                k_t = k_expanded.transpose(-2, -1)  # [B, H_q, D, S]
+                token_scores = torch.zeros(
+                    q.shape[0], q.shape[1], S, device=q.device, dtype=q.dtype
                 )
+                chunk = _prefill_score_chunk()
+                for start in range(0, T, chunk):
+                    end = min(start + chunk, T)
+                    q_blk = q[:, :, start:end, :]                    # [B,H,blk,D]
+                    aw = torch.matmul(q_blk, k_t) * scaling          # [B,H,blk,S]
 
-                # Causal mask for multi-row (prefill) passes: query row r is
-                # at absolute position S-T+r and may attend to keys 0..S-T+r.
-                # Generation passes have T=1 and need no mask.
-                if T > 1:
-                    causal = torch.triu(
-                        torch.ones(
-                            T, S,
-                            device=attn_weights.device,
-                            dtype=torch.bool,
-                        ),
-                        diagonal=S - T + 1,
-                    )
-                    attn_weights = attn_weights.masked_fill(
-                        causal, float("-inf")
-                    )
+                    # Causal mask for this block: the global query row (start+r)
+                    # sits at absolute position S-T+start+r and may attend to
+                    # keys 0..S-T+start+r. Generation (T==1) needs no mask.
+                    if T > 1:
+                        blk = end - start
+                        causal = torch.triu(
+                            torch.ones(
+                                blk, S, device=aw.device, dtype=torch.bool
+                            ),
+                            diagonal=S - T + start + 1,
+                        )
+                        aw = aw.masked_fill(causal, float("-inf"))
 
-                attn_weights = F.softmax(
-                    attn_weights, dim=-1, dtype=torch.float32
-                ).to(q.dtype)
+                    aw = F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype)
+                    token_scores += aw.sum(dim=-2)                   # [B,H,S]
+                    del aw
 
                 # 4. Reduce to per-window scores and hand off to the cache.
-                scores = compute_window_scores(
-                    attn_weights, num_sink, window_size
+                scores = reduce_token_scores_to_windows(
+                    token_scores, num_sink, window_size
                 )
                 cache.cache_kwargs[lidx]["window_scores"] = scores
 

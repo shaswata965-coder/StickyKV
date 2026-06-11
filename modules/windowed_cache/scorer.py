@@ -44,6 +44,35 @@ def compute_window_scores(
     # 1. Sum over T query rows → per-token scores [B, H_q, S]
     token_scores = attn.sum(dim=-2)
 
+    # 2-4. Strip sink, pad, window-reduce.
+    return reduce_token_scores_to_windows(token_scores, num_sink, window_size)
+
+
+def reduce_token_scores_to_windows(
+    token_scores: Tensor,
+    num_sink: int,
+    window_size: int,
+) -> Tensor:
+    """Reduce per-token received-attention to per-window scores.
+
+    This is steps 2-4 of :func:`compute_window_scores`, split out so callers
+    that build ``token_scores`` incrementally (e.g. the flash hook accumulating
+    over query-row chunks to bound peak memory at full context) can reuse the
+    exact same sink-strip + pad + window-sum without materializing the full
+    ``[B, H, T, S]`` attention matrix.
+
+    Parameters
+    ----------
+    token_scores : Tensor
+        Shape ``[B, H_q, S]`` — per-key total received attention (already
+        summed over the query dimension).
+    num_sink, window_size : int
+
+    Returns
+    -------
+    Tensor
+        Shape ``[B, H_q, W]``.  Sink tokens are **not** represented.
+    """
     # 2. Strip sink prefix
     post_sink = token_scores[..., num_sink:]  # [B, H_q, S_post]
 

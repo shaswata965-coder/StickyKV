@@ -453,8 +453,48 @@ class TestEviction:
         # Full attention with softmax already applied
         attn = torch.randn(B, H_q, T_obs, S).softmax(dim=-1)
         scores = compute_window_scores(attn, num_sink=4, window_size=8)
-        # All scores should be positive (sum of positive softmax values)
+        # All scores should be positive (sum of softmax values)
         assert (scores >= 0).all()
+
+    def test_chunked_query_scoring_matches_one_shot(self):
+        """The flash hook's chunked prefill scoring == the one-shot computation.
+
+        Replicates the hook's per-block causal mask (diagonal = S - T + start + 1)
+        and accumulation, then checks it equals the full [T, S] path through
+        compute_window_scores. Locks the off-by-one mask math across chunk
+        boundaries — the riskiest part of the O(T^2)->O(chunk*T) memory fix.
+        """
+        import torch.nn.functional as F
+        from modules.windowed_cache.scorer import reduce_token_scores_to_windows
+
+        torch.manual_seed(0)
+        B, H, T, S, D = 1, 4, 20, 20, 8   # prefill: T == S
+        num_sink, window_size = 4, 8
+        q = torch.randn(B, H, T, D)
+        k = torch.randn(B, H, S, D)
+        scaling = D ** -0.5
+
+        # One-shot reference (the previous implementation's math).
+        aw = torch.matmul(q, k.transpose(-2, -1)) * scaling
+        full_mask = torch.triu(torch.ones(T, S, dtype=torch.bool), diagonal=S - T + 1)
+        aw = aw.masked_fill(full_mask, float("-inf"))
+        aw = F.softmax(aw, dim=-1, dtype=torch.float32)
+        ref = reduce_token_scores_to_windows(aw.sum(dim=-2), num_sink, window_size)
+
+        # Chunked path (chunk=7 → 3 blocks, boundaries at 7 and 14).
+        chunk = 7
+        token_scores = torch.zeros(B, H, S)
+        for start in range(0, T, chunk):
+            end = min(start + chunk, T)
+            blk = end - start
+            a = torch.matmul(q[:, :, start:end, :], k.transpose(-2, -1)) * scaling
+            cm = torch.triu(torch.ones(blk, S, dtype=torch.bool), diagonal=S - T + start + 1)
+            a = a.masked_fill(cm, float("-inf"))
+            a = F.softmax(a, dim=-1, dtype=torch.float32)
+            token_scores += a.sum(dim=-2)
+        got = reduce_token_scores_to_windows(token_scores, num_sink, window_size)
+
+        assert torch.allclose(ref, got, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
