@@ -47,7 +47,6 @@ class CacheConfig:
     window_size: int = 8
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
-    rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:

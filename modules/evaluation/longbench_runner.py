@@ -184,8 +184,9 @@ class LongBenchRunner:
 
     def run(self) -> None:
         """Run predictions on all configured datasets."""
-        # Fail fast on an unsupported transformers version: the windowed cache's
-        # RoPE handling assumes monotonic cache_position (transformers <= 4.47).
+        # Fail fast on an unsupported transformers version: transformers 5.x's
+        # create_causal_mask -> Cache.get_mask_sizes() path is incompatible with
+        # WindowedCache (see utils.cache_factory).
         if self.is_windowed:
             from utils.cache_factory import assert_transformers_version_supported
 
@@ -463,7 +464,6 @@ class LongBenchRunner:
             num_sink_tokens=cfg.cache.num_sink_tokens,
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
-            rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
         )
 
         # Get RoPE module
@@ -623,7 +623,6 @@ class LongBenchRunner:
             "compression_ratio": compression_ratio,
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
-            "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

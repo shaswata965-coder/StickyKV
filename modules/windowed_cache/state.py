@@ -22,11 +22,13 @@ class CacheState:
     value_states : Tensor
         Shape ``[B, H_kv, T, D]``.
     position_ids : Tensor
-        Shape ``[B, T]``, int64.  After eviction, gathered **per row** to the
-        surviving tokens' **original** positions so keys keep their original
-        RoPE phase.  Each batch row may evict different windows, so rows can
-        carry different surviving positions.  Only rebased to ``arange(T)``
-        (per row) when ``rerotate_keys`` runs (the opt-in StreamingLLM path).
+        Shape ``[B, T]``, int64.  Every eviction compacts then **re-rotates**:
+        ``slice_and_keep`` first gathers the surviving tokens' original
+        positions (so ``rerotate_keys`` can strip RoPE with the correct angles),
+        then ``rerotate_keys`` rebases them to contiguous ``arange(T_retained)``
+        and re-applies RoPE at those positions (KVPress methodology).  The query
+        position is overridden to the compacted cache length each step
+        (``install_position_override_hook``), keeping relative phase exact.
     window_scores : Tensor
         Shape ``[B, H_q, W]``.  Running cumulative per-window scores.
     original_window_ids : Tensor
@@ -146,12 +148,11 @@ class CacheState:
         self.value_states = torch.gather(self.value_states, dim=2, index=idx_k).contiguous()
 
         # Gather position_ids to the surviving tokens' ORIGINAL positions.
-        # The keys retain the RoPE rotation they were stored with, so their
-        # positions must stay original for the query<->key relative phase to be
-        # correct. (Rebasing to arange is only valid when the keys are *also*
-        # re-rotated and the query position is rebased -- see rerotate_keys.)
-        # position_ids is [B, T]; gather each row independently because rows
-        # may evict different windows and thus keep different positions.
+        # This is the intermediate state: the caller has already snapshotted
+        # these originals, and rerotate_keys (called right after) strips RoPE at
+        # these angles and then rebases position_ids to contiguous
+        # arange(T_retained). position_ids is [B, T]; gather each row
+        # independently because rows may evict different windows.
         if self.position_ids is not None:
             self.position_ids = torch.gather(
                 self.position_ids, 1, retain_token_indices.to(self.position_ids.device)

@@ -41,8 +41,9 @@ class WindowedCache(_HFCacheBase):
     kv_dtype : torch.dtype
         Data type of the KV cache tensors.
     rope_module : nn.Module
-        The model's rotary embedding module, used for key re-rotation only
-        when ``config.rerotate_on_evict`` is enabled.
+        The model's rotary embedding module, used to re-rotate surviving keys
+        to contiguous positions after every eviction (KVPress
+        ``KeyRerotationPress`` methodology).
     num_layers : int
         Number of transformer layers.
     telemetry : Telemetry, optional
@@ -121,8 +122,9 @@ class WindowedCache(_HFCacheBase):
         3. Accumulate into ``state.window_scores``.
         4. If ``policy.should_evict(step)``:
            a. Two-step retain: window indices → token indices.
-           b. ``state.slice_and_keep`` (surviving keys keep their original RoPE).
-           c. Optionally ``state.rerotate_keys`` when ``rerotate_on_evict``.
+           b. Snapshot survivors' original positions, then ``state.slice_and_keep``.
+           c. ``state.rerotate_keys`` — strip + re-apply RoPE at contiguous
+              positions ``[0..T_retained-1]`` (always; KVPress methodology).
            d. Gather ``state.window_scores`` by retained window indices.
         5. Return ``(state.key_states, state.value_states)``.
         """
@@ -244,33 +246,27 @@ class WindowedCache(_HFCacheBase):
                 layer_idx, step, state.window_scores, retain_token_idx
             )
 
-            # b. Snapshot old positions before compaction (only needed when
-            #    re-rotating; scoped to the flag to avoid confusion).
+            # b. Snapshot survivors' original positions before compaction so
+            #    rerotate_keys can strip RoPE with the correct (original) angles.
             #    position_ids is [B, T]; gather per row so each row's snapshot
             #    matches the tokens it actually keeps.
-            old_positions = (
-                torch.gather(
-                    state.position_ids, 1,
-                    retain_token_idx.to(state.position_ids.device),
-                ).clone()
-                if self.resolved.rerotate_on_evict
-                else None
-            )
+            old_positions = torch.gather(
+                state.position_ids, 1,
+                retain_token_idx.to(state.position_ids.device),
+            ).clone()
 
-            # c. Compact K/V. Surviving keys keep their original RoPE rotation
-            #    and position_ids are gathered to their original values.
+            # c. Compact K/V (gather survivors contiguous in memory).
             state.slice_and_keep(retain_token_idx)
 
-            # d. Optionally re-rotate keys to contiguous positions
-            #    (StreamingLLM-style). OFF by default: HF generate advances the
-            #    query's cache_position monotonically (it does not re-derive it
-            #    from get_seq_length each step on transformers <= 4.47), so
-            #    re-rotating keys to contiguous positions while the query stays
-            #    at its original absolute position corrupts the RoPE relative
-            #    phase after the first eviction. Keeping original positions
-            #    matches KVPress / H2O and is correct on any version.
-            if self.resolved.rerotate_on_evict:
-                state.rerotate_keys(self.rope_module, old_positions)
+            # d. Re-rotate surviving keys to contiguous positions
+            #    [0..T_retained-1] (KVPress KeyRerotationPress). This is the only
+            #    eviction path: keys are rebased AND the query's RoPE position is
+            #    overridden to the compacted cache length every step
+            #    (install_position_override_hook), so query<->key relative phase
+            #    stays exact. Because the override sets the query position
+            #    explicitly, this is correct independent of how HF derives
+            #    cache_position across transformers versions.
+            state.rerotate_keys(self.rope_module, old_positions)
 
             # e. Gather window_scores by retained_window_idx
             idx_w = retained_window_idx.unsqueeze(1).expand(B, H_q, -1)

@@ -98,6 +98,18 @@ All prompt tokens arrive in one batch.
   `output_attentions=True` to be passed to `model.generate()`).
 - Calls `compute_window_scores()` and stores into `cache.cache_kwargs`.
 
+**Query-position override (both backends):**  
+`utils/position_override.py:install_position_override_hook()` — registered from
+both `install_score_hooks()` (its handle lives in the same `HookHandles`).
+Registers a `forward_pre_hook` on `model.get_decoder()` that, each step,
+overrides `position_ids` / `cache_position` so the query sits at the **compacted**
+cache length (`cache.get_seq_length()`), and nulls the stale full-length 2D
+`attention_mask` for B=1. This is the KVPress query-position override that pairs
+with key re-rotation (§5d): survivors are rebased to contiguous positions, so the
+query must be placed at the compacted length too, keeping the relative RoPE phase
+exact. Because the position is set explicitly it is correct on any transformers
+version. (B=1 only — see the cache's batching notes for B>1.)
+
 ### 3b. Score computation inside the hook
 
 **File:** `modules/windowed_cache/scorer.py`  
@@ -380,6 +392,10 @@ The `WindowedCache.update()` method is identical for both backends.
 
 ```
 model.generate() — one step
+  │
+  ├─► [DECODER FORWARD PRE-HOOK]  utils/position_override.py
+  │     override position_ids / cache_position → compacted cache length
+  │     (KVPress query-position override; null stale B=1 attention_mask)
   │
   └─► LlamaAttention.forward(q, k, v, ...)
         │

@@ -197,7 +197,11 @@ See the locked algorithmic decisions in the project specification:
 - Cache layout: `[sink | evictable windows | local windows]`
 - H2O-style cumulative attention scoring
 - Byte-based budget computation (GQA-aware)
-- RoPE rerotation using model's own `apply_rotary_pos_emb`
+- KVPress compact-and-rerotate eviction: survivors are gathered contiguous and
+  re-rotated to contiguous positions every eviction (model's own
+  `apply_rotary_pos_emb`), with a forward pre-hook
+  (`utils/position_override.py`) overriding the query to the compacted cache
+  length each step
 - Two backends sharing identical public APIs
 - Vectorized hot paths (no Python loops over batch/heads/tokens)
 

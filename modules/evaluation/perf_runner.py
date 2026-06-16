@@ -137,8 +137,9 @@ class PerfRunner:
                 assert_transformers_version_supported,
                 get_cache_classes,
             )
-            # Fail fast: the windowed cache's RoPE handling assumes monotonic
-            # cache_position (transformers <= 4.47).
+            # Fail fast: transformers 5.x's create_causal_mask ->
+            # Cache.get_mask_sizes() path is incompatible with WindowedCache
+            # (see utils.cache_factory).
             assert_transformers_version_supported()
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
             w = cfg.window

@@ -74,6 +74,7 @@ C:\StickyKV/
 └── utils/                           # Shared utilities
     ├── config.py                    # Typed config dataclasses + load_config() + validate_parity_pair()
     ├── cache_factory.py             # get_cache_classes() — backend selection + pairing validation
+    ├── position_override.py         # install_position_override_hook() — query→compacted-length pre-hook (KVPress)
     ├── metrics.py                   # Jaccard similarity + aggregation helpers (vectorized, loop-free)
     ├── sticky_metrics.py            # Sticky-K policy analytics — Global LIR + absolute missed mass
     ├── hashing.py                   # sha256_file(), sha256_string()
@@ -197,6 +198,12 @@ Used when `backend_package: eager` and `attn_implementation: eager`.
 Eager attention materializes `attn_weights` and includes them in the output tuple.
 `hooks.py` registers a plain `register_forward_hook` and reads them directly.
 The runner must pass `output_attentions=True` to `model.generate()`.
+
+**Both backends** also install the shared query-position override pre-hook
+(`utils/position_override.py`) from `install_score_hooks()`: the cache re-rotates
+survivors to contiguous positions every eviction, so the pre-hook overrides the
+query's `position_ids`/`cache_position` to the compacted cache length each step
+(KVPress methodology). Its handle is removed with the score hooks.
 
 **When to use which:**  
 Use eager on Kaggle T4/P100 or any machine without `flash-attn` installed.  

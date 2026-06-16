@@ -34,7 +34,6 @@ class ResolvedConfig:
     bytes_per_token: int
     total_budget_bytes: int
     total_budget_tokens: int
-    rerotate_on_evict: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -63,19 +62,16 @@ class WindowedCacheConfig:
         Must be ``float`` — ``int`` and ``bool`` are rejected with clear errors.
     track_scores : bool
         Enable telemetry recording.  Default ``False``.
-    rerotate_on_evict : bool
-        If ``True``, re-rotate surviving keys to contiguous positions after
-        each eviction (StreamingLLM-style).  **Default ``False``.**  Re-rotation
-        is only correct if the model also rebases the query's RoPE position to
-        the compacted cache length every step; HuggingFace ``generate``
-        (transformers <= 4.47) advances ``cache_position`` monotonically
-        instead, so re-rotating keys while the query keeps its original absolute
-        position corrupts RoPE phase after the first eviction.  Leaving this off
-        keeps original key positions (KVPress / H2O behaviour), correct on any
-        version.
 
     Notes
     -----
+    Eviction always **compacts and re-rotates** (KVPress ``KeyRerotationPress``
+    methodology): surviving keys are gathered contiguous in memory, their RoPE
+    rotation is stripped and re-applied at contiguous positions
+    ``[0..T_retained-1]``, and the query position is overridden to the compacted
+    cache length each step (see ``install_position_override_hook`` in
+    ``hooks.py``).  There is no keep-original-positions path.
+
     Scoring is H2O-style cumulative: every query row contributes to the
     per-key score at every step.  There is no observation window.
     """
@@ -85,7 +81,6 @@ class WindowedCacheConfig:
     local_window_size: Union[int, float]
     cache_budget: float
     track_scores: bool = False
-    rerotate_on_evict: bool = False
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -246,5 +241,4 @@ class WindowedCacheConfig:
             bytes_per_token=bytes_per_token,
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
-            rerotate_on_evict=self.rerotate_on_evict,
         )

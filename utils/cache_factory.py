@@ -32,14 +32,16 @@ _BACKEND_TO_ATTN_IMPL = {
 }
 
 # Highest transformers version the windowed KV cache is known-correct on.
-# The cache keeps surviving keys at their ORIGINAL RoPE positions after an
-# eviction (rerotate_on_evict defaults False) and relies on HF ``generate``
-# advancing the query's ``cache_position`` MONOTONICALLY — the transformers
-# <= 4.47 behaviour. Newer transformers re-derive ``cache_position`` from the
-# (now shrunken) cache length each step, so after the first eviction the query
-# and the retained keys disagree on absolute position → corrupted RoPE phase
-# and silently degraded results. Until the rerotation path is reworked, refuse
-# to run on a newer version rather than emit wrong numbers.
+# RoPE positioning is no longer version-coupled: every eviction compacts AND
+# re-rotates surviving keys to contiguous positions, and a forward pre-hook
+# (utils.position_override) overrides the query's position to the compacted
+# cache length each step — set explicitly, so it does not depend on how HF
+# derives ``cache_position``. The remaining reason to pin <= 4.47.1 is a
+# SEPARATE incompatibility: transformers 5.x builds the causal mask via
+# ``create_causal_mask`` → ``Cache.get_mask_sizes()``, which ``WindowedCache``
+# does not implement, so a full-model forward crashes on 5.x (see the
+# "Environment caveat" in design.md). Until that mask-API gap is closed, refuse
+# to run on a newer version rather than crash mid-run.
 MAX_SUPPORTED_TRANSFORMERS: Tuple[int, int, int] = (4, 47, 1)
 
 
@@ -95,13 +97,13 @@ def assert_transformers_version_supported(version: Optional[str] = None) -> None
         supported = ".".join(str(p) for p in MAX_SUPPORTED_TRANSFORMERS)
         raise ConfigValidationError(
             f"transformers {version} is newer than the supported {supported}. "
-            "The windowed KV cache keeps evicted-survivor keys at their original "
-            "RoPE positions and relies on HF generate advancing cache_position "
-            "monotonically (transformers <= 4.47). Newer versions re-derive "
-            "cache_position from the compacted cache length after eviction, "
-            "corrupting RoPE phase and silently degrading results. "
-            f"Pin transformers=={supported} (see environment.yml), or rework the "
-            "rerotation path and raise MAX_SUPPORTED_TRANSFORMERS before bumping."
+            "RoPE positioning is version-independent (the cache compacts + "
+            "re-rotates every eviction and a pre-hook overrides the query "
+            "position explicitly), but transformers 5.x builds the causal mask "
+            "via create_causal_mask -> Cache.get_mask_sizes(), which "
+            "WindowedCache does not implement, so a full-model forward crashes. "
+            f"Pin transformers=={supported} (see environment.yml), or implement "
+            "the Cache mask API and raise MAX_SUPPORTED_TRANSFORMERS before bumping."
         )
 
 

@@ -15,54 +15,65 @@
 
 Two-tier windowed KV cache: **top-K** windows in full precision + **top-Q** windows
 in **int4** (hand-rolled KIVI-style), with **per-window pinned scale/zero**.
-Q-tier keys default to **post-RoPE** storage in v1; **pre-RoPE** storage is the
-planned default for the Phase 2 Triton kernel (better int4 quality, free in-kernel).
-Resolutions below are the agreed design; full challenge analysis lives in the plan
-file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
+Q-tier keys are stored **pre-RoPE** in **both** phases (see AMENDMENT 2): the cache
+re-rotates survivors on every eviction, so pre-RoPE is required to keep the pinned
+grid idempotent (post-RoPE would accumulate quant error), and it also gives better
+int4 quality. Resolutions below are the agreed design; full challenge analysis lives
+in the plan file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
 
-> ## ⚠️ AMENDMENT — rerotation removed; contiguous-only, original positions (commit `f80326b`)
+> ## ⚠️ AMENDMENT 2 — rerotation RESTORED; compact + re-rotate + query-position override (supersedes the `f80326b` amendment)
 >
-> The cache no longer re-rotates keys on eviction. `rerotate_on_evict` now defaults
-> to **`False`**: `slice_and_keep` gathers survivors **contiguous in memory** but
-> keeps their **ORIGINAL `position_ids`** (no rebasing to `arange`), and keys retain
-> the RoPE rotation they were stored with. This matches **KVPress / H2O** and is
-> correct on any transformers version (rebasing corrupts the query↔key relative
-> phase since HF advances the query `cache_position` monotonically). Several
-> resolutions below change as a result:
+> Verified against the real NVIDIA/kvpress source: KVPress **does** re-rotate
+> evicted-survivor keys (`KeyRerotationPress` rebases survivors to contiguous
+> `[0..N_survivor-1]`, computes `delta_pos = idx − selected_positions`, and
+> rebuilds cos/sin) **and** overrides the query position in its pipeline
+> (`context_length = cache.get_seq_length()` ⇒ the query lands at the compacted
+> length, the "N_survivor+1" slot — not its original position). The earlier
+> `f80326b` amendment (keep-original-positions, rerotation off) was based on the
+> **opposite, incorrect** reading and has been **reverted**. On **every** eviction
+> the cache now: (1) compacts survivors contiguous, (2) **re-rotates** their keys
+> to contiguous positions (`state.rerotate_keys`), and (3) a forward pre-hook
+> (`utils.position_override`) overrides the query's `position_ids`/`cache_position`
+> to the compacted cache length each step. The `rerotate_on_evict` knob is gone —
+> this is the only path. Because the query position is set **explicitly**, this is
+> correct independent of the transformers version. Implications for quantization:
 >
-> - **The original-prompt goal "RoPE does not accumulate quantization error" is now
->   met by the architecture itself.** With no strip/re-apply cycle, RoPE is applied
->   **exactly once** (at prefill/gen) and never re-applied to cached keys → no
->   rope-driven error accumulation for *either* tier, quantized or not. So the
->   *accumulation* motivation for pre-RoPE is **moot**.
-> - **#2 reframed — Q-tier RoPE is a fork across phases.** No free strip gap exists
->   in the default (`rerotate_on_evict=False`) path. **v1 default: post-RoPE** —
->   quantize already-rotated keys as-is; dequant-only at read; no strip at demotion;
->   promotion is a plain dequant. **Phase 2 default: pre-RoPE** — un-rotate once at
->   demotion, store pre-RoPE codes + cached `(cos, sin)` tables; apply RoPE inside the
->   Triton tile (arithmetic on already-loaded data, zero extra memory traffic in the
->   bandwidth-bound decode regime — not an ongoing cost). Pre-RoPE is the Phase 2
->   default because it gives better int4 quality (consistent per-channel outliers that
->   RoPE smears) at no bandwidth penalty in the fused kernel. The old "quantize between
->   strip and re-rotate" piggyback applies only under `rerotate_on_evict=True`.
-> - **#3 collapses.** Positions are **never rebased** — each window keeps its true
->   original positions forever. No merged-`arange`, no per-tier slice reassignment, no
->   "positions change at compaction." The "one logical axis" is simply the **true
->   original positions** carried per window; relative distances are now **exact**, not
->   the old compaction approximation. The collision/independent-`arange` risk is gone.
-> - **#7 cost drops** under the default post-RoPE Q tier: per step it's **dequant only**
->   (no RoPE), roughly halving the Q-tier read cost and removing the per-step-rotation
->   concern. (Pre-RoPE option re-adds rotation + the demotion strip.)
-> - **#8 / #9 simplify.** `q_positions` never change ⇒ grids are trivially
->   position-invariant; the per-window record's position-slot is a **fixed original
->   range**, not a reassigned slice.
-> - **G5 is moot** — the fp tier no longer re-rotates either, so neither tier has
->   rotation-compounding. (Removed.)
-> - **Both backends already mirror this** (commit touched `windowed_cache` and
->   `windowed_eager_cache` symmetrically), consistent with #10.
+> - **The original-prompt goal "pre-RoPE so RoPE does not accumulate quantization
+>   error" (#4) is back in force — and is now a *correctness* requirement for the
+>   Q tier, not merely a quality lever.** A strip→re-rotate cycle runs at **every**
+>   eviction. If Q-tier keys were stored **post-RoPE**, keeping them consistent
+>   with the rebased positions would require
+>   dequant→un-rotate→re-rotate→re-quant each eviction; re-rotation changes the
+>   values, so re-quantizing against the pinned grid is **no longer idempotent**
+>   and quantization error **accumulates** across evictions (breaking #13).
+>   Therefore the Q tier stores **pre-RoPE** codes: un-rotated **once** at
+>   demotion, pinned grid, with RoPE applied **fresh at read** using the window's
+>   current (contiguous) positions. The stored codes never change across evictions
+>   — only the cos/sin applied at read do — so pinned-grid idempotence (#13) holds
+>   and there is **zero** rope-driven quant-error accumulation.
+> - **#2 / #8 — pre-RoPE is now the Q-tier default in BOTH phases** (was: post-RoPE
+>   v1, pre-RoPE Phase 2). v1 materialize path: `dequant → apply RoPE at current
+>   positions → concat [fp ‖ Q]` (one extra RoPE apply on already-dequantized data
+>   — no custom kernel). Phase 2 tile: `load int4 → unpack → scale → apply RoPE
+>   from cos/sin → MAC`. The demotion-time un-rotate **reuses `rerotate_keys`'
+>   un-rotate half**, which now always runs.
+> - **#3 / #9 — positions ARE rebased to contiguous every eviction** (not "never
+>   rebased"). The Q store records each surviving window's **current** position
+>   range and updates it at each eviction; because the codes are pre-RoPE
+>   (position-independent) this costs only a cos/sin recompute at read, never a
+>   re-quant. The query carries the **overridden compacted** `cache_position`, so
+>   query↔key relative phase is exact (not the old compaction approximation).
+> - **#7 / #10 — per-step Q cost gains one RoPE apply** (pre-RoPE read), still
+>   bandwidth-trivial; the fp16 write-back remains the real v1 cost Phase 2
+>   eliminates.
+> - **G5 restored:** both tiers re-rotate every eviction. The fp tier re-rotates
+>   in place (negligible fp error); the Q tier avoids compounding precisely
+>   *because* it stores pre-RoPE codes (above).
+> - **Both backends mirror this** (`windowed_cache` + `windowed_eager_cache`),
+>   consistent with #10.
 >
-> The affected resolutions below (#1, #2, #3, #7, #8, #9, #10) have been updated
-> inline to match this amendment; no conflicting guidance remains.
+> The affected resolutions below (#2, #3, #7, #8, #9, #10) have been updated inline
+> to match this amendment; no conflicting guidance remains.
 
 1. **Quantization granularity.** Keys quantized **per-channel at the window-index
    level** (one scale/zero per `(head, channel, window)`); values **per-token**.
@@ -103,39 +114,43 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
    (`[B,H_kv,T_fp,D]` + `position_ids`) and a separate **Q store** (int4 codes +
    scales/zeros + `position_ids`), both **gap-free**. *Rejected:* a full-length fp
    tensor with zeros in Q slots — wastes memory and zero keys aren't softmax-neutral
-   (`exp(q·0)=1`). RoPE needs only `position_id`, not co-location: each key
-   carries its true original position (post-RoPE default ⇒ both tiers already rotated),
-   so just **concatenate `[fp ‖ Q]`** (order-free during decode). Shared
-   layout is a **logical index/tier map** (the per-window record, #9), not a tensor.
-8. **#2 — Q-tier RoPE strategy is phase-dependent (per AMENDMENT + kernel roadmap).**
-   No free strip gap in the default (`rerotate_on_evict=False`) path. Two phases:
-   **v1 (post-RoPE):** quantize already-rotated keys as-is at demotion — no strip; at
-   read dequant-only, no rotation; promotion is a plain dequant. Simple, no custom
-   kernels. **Phase 2 (pre-RoPE, Triton tile default):** un-rotate once at demotion
-   (reuse `rerotate_keys`' un-rotate half); store pre-RoPE codes + pre-computed fixed
-   `(cos, sin)` tables keyed by original position (valid forever — positions never
-   rebased); apply RoPE inside the tile kernel on already-loaded data — **zero extra
-   memory traffic**, negligible arithmetic in the bandwidth-bound regime. Pre-RoPE is
-   the Phase 2 default because it yields better int4 quality (KVQuant: consistent
-   per-channel outliers before rotation, smeared after) at no bandwidth cost in the
-   fused path. `update()` returns one normal fp tensor in both phases; values carry
-   no RoPE (asymmetric store).
-9. **#3 — Original positions, never rebased (per AMENDMENT).** Rerotation off ⇒
-   `slice_and_keep` keeps each surviving token's **true original `position_id`**;
-   positions are **never** rebased to `arange` and never reassigned. So there is **no
-   merged-`arange`, no per-tier slice juggling, no collision risk** — both tiers carry
-   true positions, relative distances are **exact** (not the old compaction
-   approximation), and the query keeps its absolute `cache_position`. The Q store
-   records each window's fixed original position range (only needed at read **if** the
-   pre-RoPE option is used). New tokens append at their natural absolute position.
+   (`exp(q·0)=1`). RoPE needs only `position_id`, not co-location: the fp tier is
+   rotated in place, the Q tier stores **pre-RoPE** codes and is rotated **at read**
+   using each window's current contiguous position, so the dequantized result can
+   simply **concatenate `[fp ‖ Q]`** (order-free during decode). Shared layout is a
+   **logical index/tier map** (the per-window record, #9), not a tensor.
+8. **#2 — Q-tier RoPE strategy: pre-RoPE in both phases (per AMENDMENT 2).**
+   A strip→re-rotate cycle runs at **every** eviction, so the Q tier stores
+   **pre-RoPE** codes: un-rotate **once** at demotion (reuse `rerotate_keys`'
+   un-rotate half, which now always runs), pin the grid, and apply RoPE **fresh at
+   read** using the window's current contiguous positions. This keeps the pinned
+   codes idempotent across evictions; post-RoPE storage would instead accumulate
+   quant error through repeated dequant→re-rotate→re-quant (see AMENDMENT 2).
+   **v1 (materialize):** `dequant → apply RoPE at current positions → concat
+   [fp ‖ Q]` — no custom kernel. **Phase 2 (Triton tile):** `load int4 → unpack →
+   scale → apply RoPE from cos/sin → MAC` — RoPE is arithmetic on already-loaded
+   data, **zero extra memory traffic** in the bandwidth-bound regime. Pre-RoPE also
+   yields better int4 quality (KVQuant: consistent per-channel outliers before
+   rotation, smeared after). `update()` returns one normal fp tensor in both
+   phases; values carry no RoPE (asymmetric store).
+9. **#3 — Positions rebased to contiguous every eviction (per AMENDMENT 2).**
+   Each eviction re-rotates survivors to contiguous `arange(T_retained)` and the
+   query's `cache_position` is **overridden** to the compacted length, so
+   query↔key relative distances are **exact** (not the old compaction
+   approximation). The Q store records each surviving window's **current**
+   (contiguous) position range and refreshes it at each eviction; because the
+   codes are **pre-RoPE (position-independent)**, rebasing costs only a cos/sin
+   recompute at read — never a re-quant — so the pinned grid survives rebasing.
+   New tokens append at the (overridden) compacted position.
 10. **#7 — Per-step Q-tier cost: accepted, mitigated, measured.** Recent/local + sink
-    + top-K stay fp, so the most-attended tokens skip the slow path. **v1 (post-RoPE,
-    materialize path): dequant-only per step** — the Q tier blooms to fp16 transiently
-    per layer (modest: `(Q-fp size)/num_layers`), then freed. **Phase 2 (Triton tile):
-    eliminates the fp16 write-back entirely**; pre-RoPE adds in-tile RoPE arithmetic
-    but zero extra memory traffic — not a per-step bandwidth cost. Benchmark gate:
-    Suite C (`perf_runner.py`) must confirm memory savings outweigh TPOT impact in v1
-    before moving to Phase 2. (SKVQ-style recent-window-in-fp.)
+    + top-K stay fp, so the most-attended tokens skip the slow path. **v1 (pre-RoPE,
+    materialize path): dequant + one RoPE apply per step** — the Q tier blooms to
+    fp16 transiently per layer (modest: `(Q-fp size)/num_layers`), then freed; the
+    RoPE apply is arithmetic on the already-dequantized tensor (bandwidth-trivial).
+    **Phase 2 (Triton tile): eliminates the fp16 write-back entirely**; RoPE moves
+    in-tile (still zero extra memory traffic). Benchmark gate: Suite C
+    (`perf_runner.py`) must confirm memory savings outweigh TPOT impact in v1 before
+    moving to Phase 2. (SKVQ-style recent-window-in-fp.)
 11. **#8 — Gather is a non-issue; grids are stable.** Start with **unpacked int8
     codes** → `torch.gather` works token-wise; when packing to nibbles later, switch
     the Q store to **whole-window block selection**. Since positions are **never
@@ -157,11 +172,13 @@ file (`~/.claude/plans/to-integrate-quantization-into-witty-stonebraker.md`).
 14. **#10 — Mirror the shared twins, keep hooks divergent.** "Mirror" = the
     byte-identical `cache.py`/`state.py` (+ new shared quant module), **not**
     `hooks.py` (flash recomputes via aux SDPA; eager reads materialized weights — we
-    do **not** add aux SDPA to eager). Shared `update()` returns effective K/V
-    `[fp ‖ dequant Q]` (post-RoPE default — dequant only; `+rotate` only under the
-    pre-RoPE option), so eager scoring needs no change; the flash aux SDPA sources the
-    same effective K via a shared `materialize_effective_kv` helper.
-    Transient dequant is **per-layer** (modest, ~`(Q-fp size)/num_layers`).
+    do **not** add aux SDPA to eager). The query-position override is already shared
+    (`utils.position_override`, installed from both `install_score_hooks`). Shared
+    `update()` returns effective K/V `[fp ‖ dequant+rotate Q]` (the Q tier is
+    pre-RoPE, so the read path dequantizes then applies RoPE at the window's current
+    positions), so eager scoring needs no change; the flash aux SDPA sources the same
+    effective K via a shared `materialize_effective_kv` helper. Transient dequant is
+    **per-layer** (modest, ~`(Q-fp size)/num_layers`).
 
 ### Locked decisions (bigger-picture review)
 - **Full bidirectional promotion in v1** (per the initial prompt). Accept the
@@ -205,12 +222,12 @@ Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift), LongBen
 The following were analysed and dropped before v1. Recorded here so they are not
 re-debated during implementation.
 
-- **Async eviction** (overlap RoPE strip + quantize with FFN via CUDA streams):
-  with rerotation off the eviction-time work is now just gather + quantize a few
-  newly-demoted windows — essentially nothing to hide. Even with rerotation on, it
-  requires decoupling this step's attention from the compaction (Suite A parity
-  break), raises peak memory during overlap (pre- and post-eviction buffers
-  coexist), is GPU-only, and adds stream/determinism risk. **Dropped.**
+- **Async eviction** (overlap the RoPE strip + re-rotate + quantize with FFN via
+  CUDA streams): a strip→re-rotate cycle now runs every eviction, but the per-step
+  work is still bounded (a few newly-demoted windows). Overlapping it requires
+  decoupling this step's attention from the compaction (Suite A parity break),
+  raises peak memory during overlap (pre- and post-eviction buffers coexist), is
+  GPU-only, and adds stream/determinism risk. **Dropped.**
 
 - **Deferred memory movement** (flag migrations, batch copies every N steps):
   movement already happens only at eviction cadence, batched, boundary-crossers
@@ -227,12 +244,12 @@ re-debated during implementation.
   **Dropped.**
 
 - **Hysteresis at the K/Q boundary** (require a score margin before migrating):
-  with rerotation off, demotion costs one quantize call and promotion one dequant —
-  both cheap. With the pinned grid, re-quantizing an oscillating window is already
-  idempotent (zero error). Hysteresis adds a tunable margin knob for marginal
-  migration savings. Its only remaining value is damping the G4 score-feedback drift,
-  which is already instrumented via Suite A Jaccard. **Dropped as a v1 concern;**
-  revisit if Suite A shows measurable boundary churn.
+  demotion costs one un-rotate + quantize and promotion one dequant — both cheap.
+  With the pinned **pre-RoPE** grid, an oscillating window's codes are unchanged
+  across migrations (idempotent, zero error). Hysteresis adds a tunable margin knob
+  for marginal migration savings. Its only remaining value is damping the G4
+  score-feedback drift, already instrumented via Suite A Jaccard. **Dropped as a v1
+  concern;** revisit if Suite A shows measurable boundary churn.
 
 ## Kernel roadmap (three phases)
 
@@ -240,8 +257,10 @@ re-debated during implementation.
 Dequantize the entire Q store to fp16, concatenate with the fp store
 `[fp ‖ dequant-Q]`, and pass the result to the standard attention path unchanged.
 No custom kernels; fully CPU-testable; correctness is the only goal here.
-- **Q-tier RoPE:** post-RoPE default — keys are stored already-rotated, so the
-  dequantized tensor is immediately ready for attention with no further rotation.
+- **Q-tier RoPE:** pre-RoPE — codes are stored un-rotated, so the read path is
+  `dequantize → apply RoPE at the window's current contiguous positions → concat`.
+  (Post-RoPE storage is unusable here: the strip→re-rotate cycle that runs every
+  eviction would accumulate quant error — see AMENDMENT 2.)
 - **Memory peak (the materialization concern):** yes, this creates a transient fp16
   copy of the Q tier. But attention runs **layer-by-layer**, so only one layer's Q
   tier is live in fp16 at any moment — peak impact ≈ `(Q-fp size)/num_layers`.
@@ -256,17 +275,16 @@ No custom kernels; fully CPU-testable; correctness is the only goal here.
 A Triton decode kernel that loads int4 codes tile-by-tile, dequantizes to fp16
 **in registers**, and runs `Q·K^T` before any write-back to global memory. The
 fp16 materialization is eliminated entirely — only int4 codes are read from HBM.
-- **Default: post-RoPE.** Keys are stored post-RoPE (same as Phase 1), so the tile
-  kernel is: `load int4 → unpack → scale → MAC`. No in-kernel rotation. Straightforward
-  to write (~150–200 lines Triton); directly removes the fp16 write-back cost.
-- **Optional: pre-RoPE.** As a quality lever (KVQuant per-channel outlier benefit),
-  keys can be stored pre-RoPE (un-rotated at demotion once; original positions cached
-  as fixed `cos/sin` tables). The tile kernel becomes: `load int4 → unpack → scale →
-  apply RoPE from cached cos/sin → MAC`. RoPE is pure arithmetic on already-loaded
-  data — **zero extra memory traffic** in the bandwidth-bound decode regime; the
-  arithmetic overhead is negligible. Pre-computed `cos/sin` tables are valid forever
-  (positions never rebased). This option is **not in the initial kernel** — add only
-  after the post-RoPE tile is validated and profiled.
+- **Q-tier storage: pre-RoPE** (same as Phase 1; the only viable storage under the
+  rerotation methodology — post-RoPE would accumulate quant error across the
+  per-eviction re-rotations, see AMENDMENT 2). Codes are un-rotated once at demotion;
+  each window's current contiguous positions drive its `cos/sin`. The tile kernel is:
+  `load int4 → unpack → scale → apply RoPE from cos/sin → MAC`. RoPE is pure
+  arithmetic on already-loaded data — **zero extra memory traffic** in the
+  bandwidth-bound decode regime; the arithmetic overhead is negligible. Also gives
+  the KVQuant per-channel-outlier quality benefit. `cos/sin` are recomputed for a
+  window's current positions whenever an eviction rebases them (cheap — the codes
+  themselves never change).
 - **Scope:** decode path only (GEMV, one query token at a time). Prefill continues
   on the Phase 1 materialize path. That is fine — the Q tier is a decode-phase
   construct (windows are demoted during generation, not prefill).

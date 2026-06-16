@@ -120,8 +120,9 @@ class OursParityRunner:
         w = cfg.window
         log.info("=== Ours Parity Runner (backend=%s) ===", cfg.cache.backend_package)
 
-        # Fail fast on an unsupported transformers version: the windowed cache's
-        # RoPE handling assumes monotonic cache_position (transformers <= 4.47).
+        # Fail fast on an unsupported transformers version: transformers 5.x's
+        # create_causal_mask -> Cache.get_mask_sizes() path is incompatible with
+        # WindowedCache (see utils.cache_factory).
         from utils.cache_factory import assert_transformers_version_supported
 
         assert_transformers_version_supported()

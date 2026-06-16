@@ -23,6 +23,7 @@ from modules.windowed_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_cache.state import CacheState
 from modules.windowed_cache.telemetry import NullTelemetry, Telemetry
 from modules.windowed_cache.hooks import HookHandles
+from utils.position_override import install_position_override_hook
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,21 @@ class _FakeModelConfig:
     hidden_size: int = 4096
     head_dim: int = 128
     num_hidden_layers: int = 32
+
+
+class _NoOpRoPE(torch.nn.Module):
+    """RoPE stub returning cos=1, sin=0 so ``rerotate_keys`` leaves key VALUES
+    unchanged (apply_rotary_pos_emb with cos=1/sin=0 is identity) while still
+    exercising the strip+reapply path and rebasing ``position_ids`` to
+    contiguous. Lets eviction tests assert token survival via key values AND the
+    contiguous position rebasing at once."""
+
+    def forward(self, x, position_ids):
+        seq_len = position_ids.shape[-1]
+        D = x.shape[-1]
+        cos = torch.ones(1, seq_len, D, dtype=x.dtype, device=x.device)
+        sin = torch.zeros(1, seq_len, D, dtype=x.dtype, device=x.device)
+        return cos, sin
 
 
 def _make_config(**overrides):
@@ -294,12 +310,14 @@ class TestScoring:
 class TestEviction:
 
     # -------------------------------------------------------------------
-    # 11. test_position_ids_preserve_originals_after_eviction
+    # 11. test_position_ids_rebased_to_contiguous_after_eviction
     # -------------------------------------------------------------------
 
-    def test_position_ids_preserve_originals_after_eviction(self):
-        """After slice_and_keep, position_ids = the surviving tokens' ORIGINAL
-        positions (no rebasing) so keys keep their original RoPE phase."""
+    def test_position_ids_rebased_to_contiguous_after_eviction(self):
+        """Eviction compacts THEN re-rotates (KVPress methodology, no
+        keep-original path): ``slice_and_keep`` yields the survivors' original
+        positions as an intermediate, then ``rerotate_keys`` rebases them to
+        contiguous ``arange(T_retained)``."""
         state = CacheState()
         B, H, T, D = 1, 4, 20, 64
         state.key_states = torch.randn(B, H, T, D)
@@ -308,10 +326,19 @@ class TestEviction:
         state.position_ids = torch.arange(T).unsqueeze(0)
 
         retain = torch.tensor([[0, 1, 5, 10, 15, 19]])
+        old_positions = state.position_ids.gather(1, retain).clone()
         state.slice_and_keep(retain)
+        # Intermediate: slice_and_keep gathers the survivors' ORIGINAL positions.
+        assert torch.equal(state.position_ids, torch.tensor([[0, 1, 5, 10, 15, 19]]))
 
-        expected = torch.tensor([[0, 1, 5, 10, 15, 19]])
-        assert torch.equal(state.position_ids, expected)
+        try:
+            state.rerotate_keys(_NoOpRoPE(), old_positions)
+        except ImportError:
+            pytest.skip("transformers not available for rerotation test")
+
+        # Final: positions rebased to contiguous arange(T_retained).
+        T_ret = retain.shape[1]
+        assert torch.equal(state.position_ids, torch.arange(T_ret).unsqueeze(0))
 
     # -------------------------------------------------------------------
     # 12. test_key_rerotation_uses_new_positions
@@ -639,7 +666,7 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
     )
     cache = WindowedCache(
         config=cfg, prefill_len=8, model_config=model_cfg,
-        kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+        kv_dtype=torch.float32, rope_module=_NoOpRoPE(),
         num_layers=1, max_tokens=0,
     )
     k = _make_pos_keys(B, H_kv, 8, D)
@@ -669,13 +696,15 @@ class TestBatching:
         assert state.original_window_ids[0].tolist() == [1, 3, 9]
         assert state.original_window_ids[1].tolist() == [5, 7, 9]
 
-        # position_ids gathered per row to the surviving ORIGINAL positions.
+        # Eviction always re-rotates: position_ids are rebased to contiguous
+        # arange(T_retained) for every row (the survivors' ORIGINAL positions
+        # live on in original_window_ids above, not in position_ids).
         assert state.position_ids.shape == (2, 3)
-        assert state.position_ids[0].tolist() == [1, 3, 9]
-        assert state.position_ids[1].tolist() == [5, 7, 9]
+        assert state.position_ids[0].tolist() == [0, 1, 2]
+        assert state.position_ids[1].tolist() == [0, 1, 2]
 
-        # Keys encode their original token index → confirm the right tokens
-        # survived in each row independently.
+        # Keys encode their original token index; the no-op RoPE leaves key
+        # values unchanged → confirm the right tokens survived per row.
         kept = state.key_states[:, 0, :, 0]  # [B, T_retained]
         assert kept[0].tolist() == [1.0, 3.0, 9.0]
         assert kept[1].tolist() == [5.0, 7.0, 9.0]
@@ -705,3 +734,83 @@ class TestBatching:
         state.slice_and_keep(retain)
         assert state.position_ids[0].tolist() == [0, 2, 5]
         assert state.position_ids[1].tolist() == [101, 103, 104]
+
+
+class TestPositionOverrideHook:
+    """The query-position override pre-hook forces the query to sit at the
+    COMPACTED cache length each step (KVPress methodology), independent of the
+    monotonic position_ids HF generate would otherwise pass."""
+
+    @staticmethod
+    def _install(seq_len):
+        """Build a fake (model, decoder, captured-kwargs, cache) and install the
+        override pre-hook. ``seq_len`` is the compacted cache length the cache
+        reports via get_seq_length()."""
+        captured: dict = {}
+
+        class _Decoder(torch.nn.Module):
+            def forward(self, **kwargs):
+                captured.update(kwargs)
+                return None
+
+        decoder = _Decoder()
+
+        class _Model:
+            def get_decoder(self_inner):
+                return decoder
+
+        class _Cache:
+            def get_seq_length(self_inner, layer_idx=0):
+                return seq_len
+
+        handles = HookHandles()
+        install_position_override_hook(_Model(), _Cache(), handles)
+        return decoder, captured, handles
+
+    def test_prefill_positions_start_at_zero(self):
+        decoder, captured, handles = self._install(seq_len=0)
+        try:
+            decoder(
+                input_ids=torch.zeros(1, 8, dtype=torch.long),
+                position_ids=torch.arange(8).unsqueeze(0),
+                cache_position=torch.arange(8),
+                attention_mask=torch.ones(1, 8, dtype=torch.long),
+            )
+            assert captured["cache_position"].tolist() == list(range(8))
+            assert captured["position_ids"].tolist() == [list(range(8))]
+            # prefill mask length (8) == past_seen(0)+q_len(8) → left intact.
+            assert captured["attention_mask"] is not None
+        finally:
+            handles.remove()
+
+    def test_decode_query_placed_at_compacted_length(self):
+        # Cache compacted to 5 survivors; generate would pass a monotonic
+        # position (42) and a full-length attention mask (43).
+        decoder, captured, handles = self._install(seq_len=5)
+        try:
+            decoder(
+                input_ids=torch.zeros(1, 1, dtype=torch.long),
+                position_ids=torch.tensor([[42]]),
+                cache_position=torch.tensor([42]),
+                attention_mask=torch.ones(1, 43, dtype=torch.long),
+            )
+            # Query overridden to the compacted length (the "N_survivor" slot).
+            assert captured["cache_position"].tolist() == [5]
+            assert captured["position_ids"].tolist() == [[5]]
+            # Full-length mask (43) != compacted (5+1) → nulled for B=1.
+            assert captured["attention_mask"] is None
+        finally:
+            handles.remove()
+
+    def test_remove_restores_passthrough(self):
+        decoder, captured, handles = self._install(seq_len=5)
+        handles.remove()
+        # After removal the hook no longer rewrites kwargs.
+        decoder(
+            input_ids=torch.zeros(1, 1, dtype=torch.long),
+            position_ids=torch.tensor([[42]]),
+            cache_position=torch.tensor([42]),
+            attention_mask=torch.ones(1, 43, dtype=torch.long),
+        )
+        assert captured["cache_position"].tolist() == [42]
+        assert captured["attention_mask"] is not None
