@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StickyKV — Quantization Design Walkthrough</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0;
+       -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  @page { size: letter; margin: 0; }
+  html, body { background: #0f1117; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    color: #e8eaf0;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 744px; margin: 0 auto; padding: 40px 32px 48px; }
+
+  .cover { padding: 40px 0 28px; border-bottom: 1px solid #2a2d38; margin-bottom: 30px; }
+  .cover h1 { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 8px; }
+  .cover .sub { font-size: 13px; color: #9da3af; }
+  .cover .tags { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .tag { font-size: 10px; font-weight: 600; padding: 3px 9px; border-radius: 20px; background: #1a1d26; border: 1px solid #2a2d38; color: #9da3af; }
+
+  .section { margin-bottom: 30px; page-break-inside: avoid; }
+  .section-label { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: #6b7280; margin-bottom: 12px; }
+
+  /* plain english prose */
+  .prose { page-break-inside: auto; }
+  .prose h3 { font-size: 14px; font-weight: 700; color: #e8eaf0; margin: 18px 0 6px; }
+  .prose h3:first-child { margin-top: 0; }
+  .prose p { font-size: 12.5px; color: #c8cdd8; margin-bottom: 9px; line-height: 1.62; }
+  .prose ol { margin: 6px 0 9px 20px; }
+  .prose ol li { font-size: 12.5px; color: #c8cdd8; margin-bottom: 7px; line-height: 1.6; }
+  .prose strong { color: #e8eaf0; }
+  .prose .hl { color: #d4a843; font-weight: 700; }
+
+  code { display: inline-block; background: #1e2128; border-radius: 3px; padding: 0 5px; font-family: 'Consolas','JetBrains Mono', monospace; font-size: 10.5px; color: #88b4e8; }
+
+  /* tokens / strips */
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #9da3af; }
+  .legend-box { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; }
+  .strip { display: flex; align-items: stretch; gap: 2px; height: 40px; }
+  .tok { border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; height: 100%; }
+  .tok-sink  { background: #2d4a6e; color: #7ab3ef; }
+  .tok-kept  { background: #1e4a32; color: #5dbf82; }
+  .tok-evict { background: #3d1f1f; color: #c87070; opacity: 0.5; }
+  .tok-local { background: #2e2a1a; color: #d4a843; }
+  .tok-q     { background: #2a1e3a; color: #a07ed4; }
+  .tok-new   { background: #1e2a3a; color: #6698c8; border: 1px dashed #4a6fa8; }
+  .win-group { display: flex; gap: 1px; border-radius: 4px; padding: 2px; }
+  .win-group.fp { outline: 1px solid #2a5a3a; } .win-group.q { outline: 1px solid #4a2a6a; }
+  .win-group.snk { outline: 1px solid #1e3a5f; } .win-group.lcl { outline: 1px solid #4a3a10; }
+  .strip-labels { display: flex; gap: 2px; margin-top: 5px; }
+  .strip-labels div { font-size: 9px; color: #6b7280; text-align: center; }
+
+  .card { background: #1a1d26; border: 1px solid #2a2d38; border-radius: 8px; padding: 14px 16px; page-break-inside: avoid; }
+  .card-title { font-size: 11px; font-weight: 700; margin-bottom: 6px; }
+  .card-body { font-size: 10.5px; color: #9da3af; line-height: 1.55; }
+
+  /* step rows */
+  .step-row { display: grid; grid-template-columns: 90px 1fr; gap: 0; page-break-inside: avoid; }
+  .step-num { font-size: 11px; font-weight: 700; color: #6b7280; padding: 10px 12px 10px 0; text-align: right; border-right: 2px solid #2a2d38; white-space: nowrap; }
+  .step-body { padding: 10px 0 10px 16px; border-bottom: 1px solid #1e2128; }
+  .step-title { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
+  .step-desc { font-size: 11px; color: #9da3af; line-height: 1.55; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10px; font-weight: 600; }
+  .pill-blue { background: #1e3a5f; color: #7ab3ef; } .pill-green { background: #1a3d2a; color: #5dbf82; }
+  .pill-yellow { background: #2e2a10; color: #d4a843; } .pill-purple { background: #2a1e3a; color: #a07ed4; }
+
+  /* position diagram */
+  .pos-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .pos-label { width: 92px; font-size: 10px; color: #9da3af; text-align: right; flex-shrink: 0; }
+  .pos-bar { display: flex; gap: 1px; flex: 1; }
+  .pos-seg { border-radius: 2px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; flex: 1; }
+  .pos-gap { height: 24px; flex: 1; border: 1px dashed #2a2d38; border-radius: 2px; display: flex; align-items: center; justify-content: center; font-size: 8px; color: #4a5568; }
+
+  /* tables */
+  table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  th { text-align: left; font-size: 9.5px; font-weight: 700; color: #6b7280; padding: 5px 8px; border-bottom: 1px solid #2a2d38; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 6px 8px; border-bottom: 1px solid #1e2128; color: #c8cdd8; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .frozen { color: #5dbf82; font-size: 9.5px; font-weight: 600; }
+  .mutable { color: #d4a843; font-size: 9.5px; font-weight: 600; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .tier-row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; border-bottom: 1px solid #1e2128; color: #c8cdd8; }
+  .tier-row:last-child { border-bottom: none; }
+  .tier-val { font-weight: 600; }
+  .pagebreak { page-break-before: always; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="cover">
+    <h1>StickyKV — KV-Cache Quantization Design</h1>
+    <div class="sub">Windowed eviction · Two-tier int4 quantization · Interleaved position map · Pre-RoPE ledger</div>
+    <div class="tags">
+      <span class="tag">Plain-English walkthrough</span>
+      <span class="tag">Forward pass explained</span>
+      <span class="tag">Colored reference diagrams</span>
+    </div>
+  </div>
+
+  <!-- ============ PLAIN ENGLISH ============ -->
+  <div class="section prose">
+    <div class="section-label">The whole thing in plain English</div>
+
+    <p>Okay so here is the entire design without the jargon, written the way I'd explain it to someone over coffee.</p>
+
+    <h3>The problem</h3>
+    <p>When the model reads a long prompt and starts generating, it remembers every token it has seen so far — that memory is the KV cache. The thing keeps growing and eventually eats the whole GPU. So we have to throw stuff away. The whole game is throwing away the right stuff and keeping the stuff that matters.</p>
+
+    <h3>Windows</h3>
+    <p>We chop the sequence into fixed-size chunks called windows (say 32 tokens each). Every <code>window_size</code> steps we pause, look at how much attention each window has been pulling, and rank them. A couple of windows never get ranked — the sink (first few tokens) and the local window (the most recent one) are always kept, because they always matter.</p>
+
+    <h3>Three buckets instead of two</h3>
+    <p>Normally a window is either kept or deleted. We add a middle bucket. The best windows stay in full precision fp16 — that's the <strong>K tier</strong>. The ones that aren't good enough for fp16 but are still too useful to throw away, we squeeze down to int4, a quarter of the memory — that's the <strong>Q tier</strong>. Everything else gets dropped. So a window can be kept-full, kept-small, or deleted.</p>
+
+    <h3>What happens at every eviction (the press cycle)</h3>
+    <ol>
+      <li>We rank all the windows.</li>
+      <li>The windows crossing into the Q tier get quantized — but right before we quantize, we strip RoPE off them. RoPE is basically the position stamp on a token. We store the stripped, un-stamped version. This pre-RoPE bit is the most important decision we made and I'll explain why in a second.</li>
+      <li>The survivors get squished together so there are no gaps, and we renumber their positions starting from zero.</li>
+      <li>Here is the part that bit us. The renumbering has to cover <strong>both tiers at once</strong>. Say window 1 and window 5 stay in fp16, and window 3 is sitting between them in the Q tier. We can't just renumber 1 and 5 and tack 3 on at the end — that would tell the model window 3 is the newest thing it just saw, which is a lie. So we sort all the survivors back into their original order, lay out one shared set of positions across both tiers together, and the fp windows simply leave a gap in position space where the Q windows live.</li>
+      <li><span class="hl">And every single press cycle we go back and update the <code>position_range</code> of every Q window in the ledger.</span> The codes never change. The scale never changes. Only this one position number changes. It's one cheap integer write per window. This is the thing we must never forget to do — if the ledger position goes stale, the window gets stamped to the wrong place at read time and the math is wrong.</li>
+    </ol>
+
+    <h3>Why we store them un-stamped (pre-RoPE)</h3>
+    <p>Because we renumber positions on <em>every</em> eviction. If we had baked the position stamp into the quantized codes, then every cycle we'd have to un-stamp them, re-stamp them at the new position, and re-quantize — and re-quantizing keeps piling on a little error each time until the window turns to mush. By storing them un-stamped and only stamping fresh when we actually read them, the codes are frozen forever and never drift. The position lives in the ledger as a plain number, not inside the data.</p>
+
+    <h3>The forward pass — how we actually read it back</h3>
+    <p>When the model needs to attend during generation:</p>
+    <ol>
+      <li>The fp16 windows are already stamped, so they're ready to go.</li>
+      <li>For each Q window we look it up in the ledger, grab the int4 codes, blow them back up to fp16 (dequantize), and stamp them with RoPE using the <code>position_range</code> we've been keeping fresh.</li>
+      <li>We glue the fp16 windows and the freshly-stamped Q windows into one tensor and hand it to normal attention.</li>
+      <li>The order we glue them in doesn't matter at all. Each key already carries its correct position inside its own values (we just stamped it), so attention works out the right distances no matter where a key physically sits in the tensor.</li>
+    </ol>
+    <p>In Phase 1 we do this the dumb-simple way — blow up the whole Q tier to fp16, glue, attend. In Phase 2 we get clever: we do the blow-up one window at a time <em>inside</em> the attention kernel itself, so the fp16 version never even gets written to memory. Only the small int4 version ever lives in HBM, and the dequant + stamp + multiply all happen in registers.</p>
+
+    <h3>That's the whole thing</h3>
+    <p>Cut into windows, rank them, keep the best in fp16, squeeze the middle into int4, drop the rest. Renumber everyone together every cycle. Keep the ledger's position numbers fresh on every press. And stamp the positions back on only at the moment we read.</p>
+  </div>
+
+  <!-- ============ 1. WINDOWS ============ -->
+  <div class="section pagebreak">
+    <div class="section-label">1 · Token Windows</div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-box" style="background:#2d4a6e"></div>Sink (immutable)</div>
+      <div class="legend-item"><div class="legend-box" style="background:#1e4a32"></div>Top-K (fp16)</div>
+      <div class="legend-item"><div class="legend-box" style="background:#3d1f1f"></div>Evicted (dropped)</div>
+      <div class="legend-item"><div class="legend-box" style="background:#2a1e3a"></div>Q-tier (int4)</div>
+      <div class="legend-item"><div class="legend-box" style="background:#2e2a1a"></div>Local / recent</div>
+    </div>
+    <div class="strip">
+      <div class="win-group snk" style="flex:0 0 60px">
+        <div class="tok tok-sink" style="flex:1">s</div><div class="tok tok-sink" style="flex:1">s</div><div class="tok tok-sink" style="flex:1">s</div><div class="tok tok-sink" style="flex:1">s</div>
+      </div>
+      <div class="win-group fp" style="flex:1"><div class="tok tok-kept" style="flex:1">W1</div><div class="tok tok-kept" style="flex:1">·</div><div class="tok tok-kept" style="flex:1">·</div><div class="tok tok-kept" style="flex:1">·</div></div>
+      <div class="win-group" style="flex:1; outline:1px solid #5a1f1f"><div class="tok tok-evict" style="flex:1">W2</div><div class="tok tok-evict" style="flex:1">·</div><div class="tok tok-evict" style="flex:1">·</div><div class="tok tok-evict" style="flex:1">·</div></div>
+      <div class="win-group q" style="flex:1"><div class="tok tok-q" style="flex:1">W3</div><div class="tok tok-q" style="flex:1">·</div><div class="tok tok-q" style="flex:1">·</div><div class="tok tok-q" style="flex:1">·</div></div>
+      <div class="win-group" style="flex:1; outline:1px solid #5a1f1f"><div class="tok tok-evict" style="flex:1">W4</div><div class="tok tok-evict" style="flex:1">·</div><div class="tok tok-evict" style="flex:1">·</div><div class="tok tok-evict" style="flex:1">·</div></div>
+      <div class="win-group fp" style="flex:1"><div class="tok tok-kept" style="flex:1">W5</div><div class="tok tok-kept" style="flex:1">·</div><div class="tok tok-kept" style="flex:1">·</div><div class="tok tok-kept" style="flex:1">·</div></div>
+      <div class="win-group lcl" style="flex:1"><div class="tok tok-local" style="flex:1">W6</div><div class="tok tok-local" style="flex:1">·</div><div class="tok tok-local" style="flex:1">·</div><div class="tok tok-local" style="flex:1">·</div></div>
+      <div class="tok tok-new" style="flex:0 0 24px">→</div>
+    </div>
+    <div class="strip-labels">
+      <div style="flex:0 0 60px">Sink</div>
+      <div style="flex:1">W1 ✓ fp16</div><div style="flex:1">W2 ✗ drop</div><div style="flex:1">W3 ↓ int4</div>
+      <div style="flex:1">W4 ✗ drop</div><div style="flex:1">W5 ✓ fp16</div><div style="flex:1">W6 local</div><div style="flex:0 0 24px">new</div>
+    </div>
+    <p style="font-size:10.5px; color:#9da3af; margin-top:10px">Every <code>window_size</code> generation steps an eviction fires. Sink (first 4 tokens) never touched. Local window always kept. All others compete on cumulative attention score.</p>
+  </div>
+
+  <!-- ============ 2. SCORING ============ -->
+  <div class="section">
+    <div class="section-label">2 · Cumulative H2O Scoring</div>
+    <div class="card">
+      <div style="display:grid; grid-template-columns:1fr 20px 1fr 20px 1fr; gap:8px; align-items:center">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#7ab3ef;margin-bottom:3px">Attention matrix</div>
+          <div style="font-size:10px;color:#9da3af">Flash: aux SDPA from cached K + recomputed Q. Eager: read <code>attn_weights</code>. Shape <code>[B,H,T,S]</code>.</div>
+        </div>
+        <div style="text-align:center;color:#4a5568;font-size:15px">→</div>
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#5dbf82;margin-bottom:3px">Sum over query rows</div>
+          <div style="font-size:10px;color:#9da3af">Each query row counts equally. <code>attn.sum(-2)</code>. Strip sink, reduce by window.</div>
+        </div>
+        <div style="text-align:center;color:#4a5568;font-size:15px">→</div>
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#d4a843;margin-bottom:3px">Accumulate in-place</div>
+          <div style="font-size:10px;color:#9da3af"><code>window_scores += new</code> every step. Prefill chunked to bound memory.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 3. EVICTION CYCLE ============ -->
+  <div class="section">
+    <div class="section-label">3 · Eviction Cycle (Every window_size Steps)</div>
+    <div class="step-row"><div class="step-num">① Select</div><div class="step-body">
+      <div class="step-title"><span class="pill pill-blue">compute_retain_window_indices()</span></div>
+      <div class="step-desc">Mean scores across heads <code>[B,H,W]→[B,W]</code>. Top-K on evictable slice, sorted chronologically, local windows appended.</div>
+    </div></div>
+    <div class="step-row"><div class="step-num">② Demote</div><div class="step-body">
+      <div class="step-title"><span class="pill pill-purple">Rank → Q tier or drop</span></div>
+      <div class="step-desc">Below-K-above-Q windows demoted: un-rotate once, quantize, write codes + pinned scale/zero to Q store. Below-Q windows dropped.</div>
+    </div></div>
+    <div class="step-row"><div class="step-num">③ Compact</div><div class="step-body">
+      <div class="step-title"><span class="pill pill-green">state.slice_and_keep()</span></div>
+      <div class="step-desc"><code>torch.gather</code> on fp K/V tensors. Survivors become a contiguous tensor <code>[B,H_kv,T_fp,D]</code>.</div>
+    </div></div>
+    <div class="step-row"><div class="step-num">④ Position map</div><div class="step-body">
+      <div class="step-title"><span class="pill pill-yellow">build_interleaved_position_map()</span> &nbsp;←&nbsp; new</div>
+      <div class="step-desc">Sort ALL survivors (fp + Q) by <code>original_window_id</code>. Assign one contiguous <code>arange(T_total)</code> across both tiers. Returns fp target positions and Q-tier <code>position_range</code> assignments.</div>
+    </div></div>
+    <div class="step-row"><div class="step-num">⑤ Rerotate</div><div class="step-body">
+      <div class="step-title"><span class="pill pill-yellow">rerotate_keys(rope, old_pos, new_pos)</span></div>
+      <div class="step-desc">Fp keys re-rotated to their interleaved targets (may skip over Q slots). Un-rotate old → apply new.</div>
+    </div></div>
+    <div class="step-row"><div class="step-num">⑥ Ledger</div><div class="step-body" style="border-bottom:none">
+      <div class="step-title"><span class="pill pill-purple">Update position_range every cycle</span></div>
+      <div class="step-desc">Each surviving Q window's <code>position_range</code> rewritten from the map. <strong style="color:#d4a843">No re-quant</strong> — codes are pre-RoPE. Override <code>cache_position</code> to <code>T_total</code>.</div>
+    </div></div>
+  </div>
+
+  <!-- ============ 4. INTERLEAVED MAP ============ -->
+  <div class="section pagebreak">
+    <div class="section-label">4 · Interleaved Position Map — Worked Example</div>
+    <div class="card">
+      <p style="font-size:10.5px; color:#9da3af; margin-bottom:14px">W1(fp), W3(Q), W5(fp) survive. W2 and W4 dropped. <code>window_size = 4</code>.</p>
+
+      <div style="font-size:10px; font-weight:700; color:#c87070; margin-bottom:5px">❌ Fp-only compaction (wrong)</div>
+      <div class="pos-row"><div class="pos-label">fp_store</div><div class="pos-bar">
+        <div class="pos-seg tok-sink" style="flex:2">sink</div>
+        <div class="pos-seg tok-kept">W1·0</div><div class="pos-seg tok-kept">W1·1</div><div class="pos-seg tok-kept">W1·2</div><div class="pos-seg tok-kept">W1·3</div>
+        <div class="pos-seg tok-kept">W5·4</div><div class="pos-seg tok-kept">W5·5</div><div class="pos-seg tok-kept">W5·6</div><div class="pos-seg tok-kept">W5·7</div>
+      </div></div>
+      <div class="pos-row"><div class="pos-label">concat append</div><div class="pos-bar">
+        <div class="pos-seg tok-q">W3·8</div><div class="pos-seg tok-q">W3·9</div><div class="pos-seg tok-q">W3·10</div><div class="pos-seg tok-q">W3·11</div>
+      </div></div>
+      <p style="font-size:10px; color:#c87070; margin:2px 0 16px 98px">W3 lands at 8–11 — newer than W5. Model thinks W3 is the most recent context. Relative distances corrupted.</p>
+
+      <div style="font-size:10px; font-weight:700; color:#5dbf82; margin-bottom:5px">✓ Interleaved position map (correct)</div>
+      <div class="pos-row"><div class="pos-label" style="color:#5dbf82">sort by id</div><div class="pos-bar" style="gap:6px; align-items:center">
+        <div class="pos-seg tok-kept" style="flex:0 0 36px; border-radius:4px">W1 fp</div><div style="color:#4a5568">→</div>
+        <div class="pos-seg tok-q" style="flex:0 0 36px; border-radius:4px">W3 Q</div><div style="color:#4a5568">→</div>
+        <div class="pos-seg tok-kept" style="flex:0 0 36px; border-radius:4px">W5 fp</div>
+        <div style="color:#9da3af; font-size:11px; padding-left:4px">→ assign positions 0..11</div>
+      </div></div>
+      <div class="pos-row"><div class="pos-label">full pos space</div><div class="pos-bar">
+        <div class="pos-seg tok-sink" style="flex:2">sink</div>
+        <div class="pos-seg tok-kept">0</div><div class="pos-seg tok-kept">1</div><div class="pos-seg tok-kept">2</div><div class="pos-seg tok-kept">3</div>
+        <div class="pos-seg tok-q">4</div><div class="pos-seg tok-q">5</div><div class="pos-seg tok-q">6</div><div class="pos-seg tok-q">7</div>
+        <div class="pos-seg tok-kept">8</div><div class="pos-seg tok-kept">9</div><div class="pos-seg tok-kept">10</div><div class="pos-seg tok-kept">11</div>
+      </div></div>
+      <div class="pos-row"><div class="pos-label">fp_store rotated</div><div class="pos-bar">
+        <div class="pos-seg tok-sink" style="flex:2">sink</div>
+        <div class="pos-seg tok-kept">W1·0</div><div class="pos-seg tok-kept">W1·1</div><div class="pos-seg tok-kept">W1·2</div><div class="pos-seg tok-kept">W1·3</div>
+        <div class="pos-gap">—</div><div class="pos-gap">—</div><div class="pos-gap">—</div><div class="pos-gap">—</div>
+        <div class="pos-seg tok-kept">W5·8</div><div class="pos-seg tok-kept">W5·9</div><div class="pos-seg tok-kept">W5·10</div><div class="pos-seg tok-kept">W5·11</div>
+      </div></div>
+      <div class="pos-row"><div class="pos-label" style="color:#a07ed4">ledger update</div><div class="pos-bar" style="align-items:center; gap:8px">
+        <div class="pos-seg tok-q" style="flex:0 0 36px; border-radius:4px">W3</div>
+        <div style="font-size:10px; color:#9da3af">position_range ← (4, 7) &nbsp;·&nbsp; codes unchanged &nbsp;·&nbsp; scale/zero unchanged</div>
+      </div></div>
+      <div class="pos-row"><div class="pos-label">at read</div><div class="pos-bar" style="align-items:center; gap:6px">
+        <div class="pos-seg tok-q" style="flex:0 0 52px; border-radius:4px; font-size:8px">dequant W3</div><div style="color:#4a5568">→</div>
+        <div style="font-size:10px; color:#9da3af">RoPE at (4,7)</div><div style="color:#4a5568">→</div>
+        <div style="font-size:10px; color:#9da3af">concat [fp ‖ W3] — physical order irrelevant</div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- ============ 5. LEDGER ============ -->
+  <div class="section">
+    <div class="section-label">5 · The Q-Tier Ledger (Per-Window Record)</div>
+    <div class="card">
+      <p style="font-size:10.5px; color:#9da3af; margin-bottom:10px">One record per Q window, keyed by <code>original_window_id</code>. The physical Q store is a bag of bytes — the ledger makes it navigable.</p>
+      <table>
+        <thead><tr><th>Field</th><th>Frozen?</th><th>Set when</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>original_window_id</code></td><td><span class="frozen">yes</span></td><td>birth (prefill)</td><td>Chronological identity; sorts both tiers for the interleaved map</td></tr>
+          <tr><td><code>codes</code> (int4)</td><td><span class="frozen">yes</span></td><td>first demotion</td><td>Packed quantized bits; never touched again</td></tr>
+          <tr><td><code>scale</code>, <code>zero</code></td><td><span class="frozen">yes</span></td><td>first demotion</td><td>Pinned affine grid; <code>quant(dequant(c))=c</code> exactly, forever</td></tr>
+          <tr><td><code>offset</code></td><td><span class="mutable">no</span></td><td>each eviction</td><td>Byte offset in Q store; shifts as windows drop and the store compacts</td></tr>
+          <tr><td><code>position_range</code></td><td><span class="mutable">no</span></td><td><strong style="color:#d4a843">each eviction</strong></td><td>Slot in the interleaved map; drives RoPE at read. One integer write, no re-quant</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ 6. TWO-TIER ============ -->
+  <div class="section">
+    <div class="section-label">6 · Two-Tier Budget</div>
+    <div class="grid2">
+      <div class="card" style="border-color:#1e4a32">
+        <div class="card-title" style="color:#5dbf82">K+ Tier — Full Precision</div>
+        <div style="font-size:10px; color:#9da3af; margin-bottom:8px">Sink + Top-K + Local windows</div>
+        <div class="tier-row"><span>Format</span><span class="tier-val" style="color:#5dbf82">fp16 / bf16</span></div>
+        <div class="tier-row"><span>RoPE</span><span class="tier-val">post-RoPE, re-rotated each eviction</span></div>
+        <div class="tier-row"><span>Memory</span><span class="tier-val">(1−q) × M_budget</span></div>
+      </div>
+      <div class="card" style="border-color:#2a1e3a">
+        <div class="card-title" style="color:#a07ed4">Q Tier — int4</div>
+        <div style="font-size:10px; color:#9da3af; margin-bottom:8px">Demoted high-scoring windows</div>
+        <div class="tier-row"><span>Format</span><span class="tier-val" style="color:#a07ed4">int4 + pinned scale/zero</span></div>
+        <div class="tier-row"><span>RoPE</span><span class="tier-val" style="color:#a07ed4">pre-RoPE → applied at read</span></div>
+        <div class="tier-row"><span>Memory</span><span class="tier-val">q × M_budget (≈ ¼ bytes)</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 7. PRE-ROPE ============ -->
+  <div class="section">
+    <div class="section-label">7 · Pre-RoPE Storage — Why</div>
+    <div class="grid2">
+      <div class="card" style="border-color:#5a1a1a">
+        <div class="card-title" style="color:#c87070">❌ Post-RoPE storage</div>
+        <div class="card-body">Every eviction: <code>dequant → un-rotate → re-rotate → re-quant</code>. Re-quantizing against a pinned grid after values changed is not idempotent → error accumulates each cycle.</div>
+      </div>
+      <div class="card" style="border-color:#1a4a2a">
+        <div class="card-title" style="color:#5dbf82">✓ Pre-RoPE storage (our design)</div>
+        <div class="card-body"><strong style="color:#e8eaf0">At demotion:</strong> un-rotate once → quantize → freeze codes. <strong style="color:#e8eaf0">Each eviction:</strong> update ledger <code>position_range</code> only. <strong style="color:#e8eaf0">At read:</strong> dequant → RoPE at current range. Codes never change → zero drift.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 8. FORWARD PASS ============ -->
+  <div class="section">
+    <div class="section-label">8 · Forward Pass — Read Path Each Step</div>
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:12px">
+        <div style="background:#1e3a5f; border-radius:5px; padding:6px 9px; font-size:10px; color:#7ab3ef; font-weight:600">fp_store K/V<br><span style="font-weight:400">already rotated</span></div>
+        <div style="font-size:13px; color:#4a5568">+</div>
+        <div class="pos-seg tok-q" style="flex:0 0 50px; border-radius:4px; font-size:9px; height:34px">int4 codes</div>
+        <div style="font-size:12px; color:#4a5568">→</div>
+        <div style="background:#1e2a18; border-radius:5px; padding:6px 9px; font-size:10px; color:#5dbf82; font-weight:600">dequant<br><span style="font-weight:400">pinned scale/zero</span></div>
+        <div style="font-size:12px; color:#4a5568">→</div>
+        <div style="background:#1e2a18; border-radius:5px; padding:6px 9px; font-size:10px; color:#5dbf82; font-weight:600">apply RoPE<br><span style="font-weight:400">at position_range</span></div>
+        <div style="font-size:12px; color:#4a5568">→</div>
+        <div style="background:#2a2218; border-radius:5px; padding:6px 9px; font-size:10px; color:#d4a843; font-weight:600">concat [fp ‖ Q]<br><span style="font-weight:400">order-free → attention</span></div>
+      </div>
+      <div style="padding-top:10px; border-top:1px solid #2a2d38; font-size:10px; color:#9da3af; line-height:1.6">
+        <strong style="color:#e8eaf0">Phase 1:</strong> Materialize the full Q store to fp16, concat, standard attention. Transient fp16 freed after each layer.<br>
+        <strong style="color:#e8eaf0">Phase 2 (Triton):</strong> One tile = one window. Load int4 → unpack in registers → apply RoPE arithmetically → MAC. Zero fp16 write-back to HBM.<br>
+        <strong style="color:#e8eaf0">Why order-free:</strong> each key's RoPE rotation already encodes its logical position from the interleaved map, so physical tensor order does not affect attention correctness.
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 9. NOVEL ============ -->
+  <div class="section">
+    <div class="section-label">9 · What's Novel</div>
+    <div class="grid3">
+      <div class="card"><div class="card-title">Compact-and-rerotate</div><div class="card-body">KVPress methodology. Every eviction, fp survivors re-indexed to contiguous positions and re-rotated. Query position overridden to match.</div></div>
+      <div class="card"><div class="card-title">Interleaved position map</div><div class="card-body">Both tiers sorted by <code>original_window_id</code> and positioned jointly. Fp keys skip over Q slots; Q ledger gets the right chronological slot.</div></div>
+      <div class="card"><div class="card-title">Pinned-grid pre-RoPE int4</div><div class="card-body">Codes quantized once, stored un-rotated, frozen. Only <code>position_range</code> changes each cycle — a free integer write. Zero rope-driven drift.</div></div>
+      <div class="card"><div class="card-title">Write-once ledger</div><div class="card-body">Only structure tracking Q windows across compactions. Two frozen fields, two mutable. Keeps the Q store a dense gap-free byte array.</div></div>
+      <div class="card"><div class="card-title">Tile-fused dequant</div><div class="card-body">Phase 2: one Triton tile = one window = one scale group. Dequant + RoPE + MAC in registers. No cross-tile bookkeeping, no fp16 write-back.</div></div>
+      <div class="card"><div class="card-title">Cumulative H2O scoring</div><div class="card-body">Scores accumulate in-place via sum-over-query-rows. Prefill chunked to avoid the full <code>[B,H,T,S]</code> matrix. Feedback drift watched via Suite A Jaccard.</div></div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
