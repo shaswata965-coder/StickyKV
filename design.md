@@ -3,9 +3,10 @@
 Two-tier windowed KV cache: **top-K** windows in full precision (fp16) plus
 **top-Q** windows in **int4** (hand-rolled KIVI-style), with a **per-window pinned
 scale/zero-point**. The int4 (Q) tier stores keys **pre-RoPE**; RoPE is applied
-fresh at read using each window's current contiguous positions. This document is the
-implementation spec. The decision record — original prompt, amendment log, rejected
-alternatives, and rationale — lives in [design_history.md](design_history.md).
+fresh at read using each window's current contiguous positions. This document records
+only **fixed** design choices. Supporting analysis, trade-offs, and open items live in
+[design_rationale.md](design_rationale.md); the decision record (original prompt,
+amendment log, rejected alternatives) lives in [design_history.md](design_history.md).
 
 ---
 
@@ -28,7 +29,7 @@ compacts and re-rotates survivors on **every** eviction, jointly across both tie
 logic (§9).
 
 The design is realised in three kernel phases (§11); Phase 1 (materialize-then-
-concat) is the shippable v1 and is fully CPU-testable.
+interleave) is the shippable v1 and is fully CPU-testable.
 
 ---
 
@@ -41,22 +42,34 @@ concat) is the shippable v1 and is fully CPU-testable.
   values, so groups are kept fine to localise range. But not arbitrarily fine — each
   group costs a scale + zero, so over-fine grouping eats the int4 savings.
 - **Affine, asymmetric.** The distributions are skewed, so use asymmetric affine
-  quantization. Validate **int8 first**, then int4.
+  int4 quantization.
 - **Pinned grid.** Each window's **scale and zero-point are pinned at first
   quantization and reused until eviction**. The affine grid is therefore fixed, so
   `quant(dequant(c)) = c` exactly — zero drift, no compounding across re-reads (§3,
   §8).
-- **Packing.** Start with **unpacked int8 codes** (so `torch.gather` works token-wise
-  and the module is simple to validate); switch to **nibble-packed int4 with whole-
-  window block selection** once correctness is established.
-- **Outliers.** Fine grouping cannot kill **intra-group** outliers. At int4, optional
-  outlier handling (dense-and-sparse retention of the top ~1% channels in fp, or a
-  Hadamard rotation to spread outliers) may be needed. The specific strategy is an
-  **open question** (§12), not required for the int8 milestone.
+- **Nibble packing (decided).** Pack the two int4 codes that **share a scale** into
+  one byte — i.e. pack along each tier's quantization-group axis:
+  - **Keys** (per-channel scale, group = window along the token axis): store the Q
+    store **channel-major** `[H_kv, D, T_q]` and pack 2 consecutive tokens per byte →
+    `[H_kv, D, ceil(window/2)]` uint8, scale/zero `[H_kv, D]` per window.
+  - **Values** (per-token scale, group = head_dim): keep token-major `[H_kv, T_q, D]`
+    and pack 2 consecutive channels per byte → `[H_kv, T_q, ceil(D/2)]` uint8,
+    scale/zero `[H_kv, T_q]`.
 
-The quantizer is a shared module (a hand-rolled KIVI-style quantizer); the exact
-affine formula and int4 packing layout must be pinned against a KIVI reference before
-coding (§12).
+  Both nibbles in every byte then share one scale → a single scale load per byte pair,
+  branchless vectorized dequant, and (Phase 2) tile = window = scale group = packing
+  group. Nibbles are unsigned `[0,15]` (asymmetric zero-point); even-index code in the
+  low 4 bits. `window_size` must be even (head_dim always is), so no tail padding.
+  **Bring-up path:** validate with unpacked codes (one 4-bit value per byte, so
+  `torch.gather` works token-wise), then switch to this packed layout; Phase 2 repacks
+  into uint32 words (8 nibbles) for 32-bit-aligned loads, same group axis.
+- **Outlier handling.** The int4 outlier strategy is **not yet ratified** into this
+  spec; its analysis, cost, and the recommended approach are in
+  [design_rationale.md](design_rationale.md).
+
+The quantizer is a shared module implementing the above. Open numeric details (the
+exact asymmetric affine quant/dequant formula, and any int4 outlier handling) are
+tracked in [design_rationale.md](design_rationale.md) and pinned before coding.
 
 ---
 
@@ -87,10 +100,12 @@ Two separate, gap-free dense stores per layer:
 
 A full-length fp tensor with zeros in the Q slots is **rejected**: it wastes memory
 and zero keys are not softmax-neutral (`exp(q·0) = 1`). RoPE needs only a
-`position_id`, not physical co-location, so at read the dequantized Q keys can simply
-**concatenate `[fp ‖ Q]`** in any order (§5, "order-free"). The shared cross-store
-layout is a **logical index/tier map** (the per-window ledger, §6), not a tensor. A
-window's tier is implicit: tier *is* which store holds it.
+`position_id`, not physical co-location, so at read the dequantized Q keys are merged
+with the fp store into one effective tensor. The merge is **chronological by window
+id** (§5) — correct for attention regardless of order, but chronological so the window
+scorer's physical chunking stays valid. The shared cross-store layout is a **logical
+index/tier map** (the per-window ledger, §6), not a tensor. A window's tier is
+implicit: tier *is* which store holds it.
 
 ---
 
@@ -137,9 +152,14 @@ only at read keeps the codes frozen forever: pinned-grid idempotence holds and t
 is zero RoPE-driven quant-error accumulation. Values carry no RoPE in either tier
 (asymmetric store).
 
-**Order-free concat.** The read-time concat `[fp_store ‖ dequant_Q]` may appear in any
-physical order: RoPE has already baked each key's logical position into its values, so
-Q·Kᵀ is correct regardless of where a key physically sits.
+**Effective K/V is materialized in chronological window order.** *Attention* is
+order-free — RoPE has baked each key's logical position into its values, so Q·Kᵀ is
+correct regardless of physical order. But the window **scorer** chunks the physical key
+axis into windows (`b h (w s) -> b h w`), so it requires physical order = chronological
+window order. Therefore `materialize_effective_kv` interleaves the fp and Q windows by
+`original_window_id` (a cheap gather over `N_fp + N_q` windows, not a plain
+`[fp ‖ Q]` concat), yielding `[sink ‖ windows in chronological order]`. This keeps the
+existing scorer, sink-strip, and Lp accumulation unchanged.
 
 ### New/changed primitives (relative to the current cache)
 
@@ -153,7 +173,15 @@ Q·Kᵀ is correct regardless of where a key physically sits.
   set to the interleaved (possibly gappy) fp positions, **not** `arange(T_retained)`,
   or the next eviction snapshots wrong "old" angles.
 - `position_override.py` — `cache_position` uses `T_total` (fp + Q tokens), not
-  `T_fp`.
+  `T_fp`. Correspondingly `cache.get_seq_length()` must report the **effective**
+  length `T_total`, since HF uses it for mask sizing and the override's `past_seen`;
+  reporting the fp-only length would desync the query position from the effective key
+  count.
+- `materialize_effective_kv(fp_store, q_store, ledger, rope)` — dequantizes the Q
+  store, applies RoPE at each Q window's `position_range`, and interleaves with the fp
+  store by `original_window_id` into chronological order. Returns effective K/V. Used
+  **both** as `update()`'s return and by the flash score hook (which currently reads
+  raw `key_states`).
 
 ---
 
@@ -199,8 +227,8 @@ b_q ≈ ¼ · b_fp  +  per-window key-scale/zero  +  per-token value-scale overh
 
 The resolver **must use `b_q`, not `b_fp`, for the Q tier** — the int4 tier holds
 ~4× the windows of equal fp memory (minus overhead). The scale/zero overhead term
-depends on the chosen **scale dtype** (fp16 / fp8 / int8), which is an empirical knob
-(§12); the resolver takes it as an input so `N_q` is deterministic for a given config.
+depends on the chosen **scale dtype** (fp16 / fp8); the resolver takes the scale dtype
+as an input so `N_q` is deterministic for a given config.
 
 **Sink + local windows stay fp**, inside `M_fp`: `top-K-fp = N_fp − (sink + local)`.
 
@@ -217,8 +245,9 @@ This extends the existing byte-based `resolve()` (which already computes
 
 **Read path (v1, materialize).** For each Q window: look it up in the ledger, take
 the int4 codes, dequantize to fp16, apply RoPE at the window's current
-`position_range`, then concat `[fp ‖ dequant-Q]` and hand the result to the standard
-attention path. The fp tier is already rotated and ready. `update()` returns one
+`position_range`, then interleave the fp and Q windows chronologically by window id
+(§5) and hand the result to the standard attention path. The fp tier is already
+rotated and ready. `update()` returns one
 normal fp tensor.
 
 **Cost.** Recent/local + sink + top-K stay fp, so the most-attended tokens skip the
@@ -229,11 +258,13 @@ one layer's Q tier is live in fp16 at any moment — peak impact ≈ `(Q-fp size
 num_layers` (~1–2% of the full cache at 32 layers), freed immediately after each
 layer. Phase 2 eliminates the write-back entirely (§11).
 
-**Scoring.** Because `update()` returns the concatenated effective K/V, attention (and
-the eager scoring hook) attends over the dequantized Q keys and both tiers accrue
-`window_scores` with no change to the scorer. The scoring path must map the
-per-window attention weights back to **both** stores' windows (the concat is order-
-free, so the mapping is by window identity, not physical position).
+**Scoring.** Because the effective K/V is materialized in **chronological window
+order** (§5), the window scorer's physical chunking (`b h (w s) -> b h w`) stays
+valid unchanged and both tiers accrue `window_scores`. This does require the effective
+K/V — not the raw fp `key_states` — to be what gets scored: the eager backend already
+attends over `update()`'s return, but the flash score hook currently reads raw
+`cache._states[l].key_states` and must instead source the effective K via
+`materialize_effective_kv` (§9).
 
 **Benchmark gate.** Suite C (`perf_runner.py`) must confirm memory savings outweigh
 TPOT impact in v1 before moving to Phase 2.
@@ -249,16 +280,18 @@ no aux SDPA is added to eager.
 
 - The query-position override is already shared (`utils.position_override`, installed
   from both backends' `install_score_hooks`).
-- Shared `update()` returns the effective K/V `[fp ‖ dequant+rotate Q]` (Q tier is
-  pre-RoPE, so the read path dequantizes then applies RoPE at each window's current
-  positions), so **eager scoring needs no change**.
-- The flash aux SDPA sources the same effective K via a shared
-  `materialize_effective_kv` helper.
+- Shared `update()` returns the effective K/V via `materialize_effective_kv` (Q tier
+  is pre-RoPE, so the read path dequantizes, applies RoPE at each window's current
+  positions, and interleaves with the fp tier in chronological order — §5). The eager
+  backend attends over this return, so its real-attention scoring works unchanged.
+- The flash score hook must **also** source effective K via `materialize_effective_kv`
+  — it currently reads raw `key_states` (`hooks.py`), which would miss the Q tier and
+  the interleaving. This is the one required flash-hook change.
 - Transient dequant is **per-layer** (§8).
 
 **Implementation note:** `update()` currently returns the live `state.key_states /
-value_states`. With the Q tier it returns a freshly-built concat instead; callers must
-not assume the returned tensor aliases the stored fp cache.
+value_states`. With the Q tier it returns a freshly-built interleaved effective tensor
+instead; callers must not assume the returned tensor aliases the stored fp cache.
 
 ---
 
@@ -272,30 +305,37 @@ not assume the returned tensor aliases the stored fp cache.
 - **Pinned grid by identity kills oscillation.** A window retains its pinned grid **by
   identity, even through a promotion** → a promote→demote round trip re-quantizes
   against the old grid → idempotent → identical codes → zero added error. Explicit
-  hysteresis is optional and deferred (§12).
+  hysteresis is not used.
 - **Quant group = the eviction window.** This pins one grid per window, which
   promotion requires. `window_size`, bit-width, and scale dtype are empirical knobs
   swept in Suite C / LongBench — **no hardcoded floor**; pick by measured effective-
   bits-vs-quality. Effective key bits ≈ `4 + 32/window_size` (expectation-setting,
   not a rule).
+- **Precision: fp16 K tier, int4 Q tier.** Full-precision windows are fp16; the
+  quantized tier is int4 (§2, §7).
+- **v1 is batch-size 1 only.** The read path uses `utils.position_override` (a B=1
+  construct) and the interleaved position map runs per row; B>1 is **out of scope for
+  v1** and gated behind the ragged left-padded batching design. Keep the per-row
+  primitives in §5 so B>1 is a later extension, not a rewrite.
 
 ---
 
 ## 11. Kernel roadmap (three phases)
 
-### Phase 1 — v1: materialize-then-concat (ship first)
+### Phase 1 — v1: materialize-then-interleave (ship first)
 
-Dequantize the entire Q store to fp16, concat with the fp store `[fp ‖ dequant-Q]`,
-pass to the standard attention path unchanged. No custom kernels; fully CPU-testable;
+Dequantize the entire Q store to fp16, interleave with the fp store chronologically by
+window id (§5), pass to the standard attention path unchanged. No custom kernels; fully
+CPU-testable;
 correctness is the only goal.
 
 - **Q-tier RoPE:** pre-RoPE — codes stored un-rotated; read path is `dequantize →
-  apply RoPE at the window's current contiguous positions → concat`.
+  apply RoPE at the window's current contiguous positions → interleave by window id`.
 - **Memory peak:** a transient fp16 copy of one layer's Q tier at a time
   (≈ `(Q-fp size)/num_layers`), freed immediately. The fp16 write-back is the real
   cost (~4× the int4 read); Phase 2 eliminates it.
 - **Exit criterion:** Suite C confirms net memory savings; Suite A Jaccard holds;
-  LongBench quality acceptable at int8, then int4. Only then move to Phase 2.
+  LongBench quality acceptable at int4. Only then move to Phase 2.
 
 ### Phase 2 — Triton GEMV tile: fused dequant-inside-attention (future work)
 
@@ -324,24 +364,6 @@ until Phase 2 is profiled.
 
 ---
 
-## 12. Open questions (resolve before the affected milestone)
-
-- **Outlier strategy (blocks int4, not int8).** Dense-and-sparse (top ~1% channels in
-  fp, KVQuant) vs Hadamard rotation (RotateKV/QuaRot) vs none. Decide by measured int4
-  quality on LongBench.
-- **Scale dtype (blocks a deterministic `b_q`).** fp16 / fp8 / int8 for the pinned
-  scale/zero. Swept in Suite C; the resolver needs a default to compute `N_q`.
-- **Quantizer numerics.** Pin the exact asymmetric affine quant/dequant formula and
-  the int4 nibble-packing layout against a KIVI reference before coding the module.
-- **B>1 composition.** The v1 read path relies on `position_override`, which is a
-  **B=1 construct** (see its docstring), and `build_interleaved_position_map` must run
-  per-row. v1 quant is therefore **B=1-only** unless it is explicitly integrated with
-  the ragged left-padded batching design. State the intended scope before coding.
-- **Explicit hysteresis.** Deferred; revisit only if Suite A Jaccard shows measurable
-  K/Q boundary churn.
-
----
-
 ## Environment caveat
 
 The **target** across eval devices is **transformers 4.47.1**; `environment.yml` is
@@ -366,7 +388,7 @@ CPU unit tests: round-trip error, pinned-grid idempotence, position-invariance,
 interleaved-map correctness (fp gaps over Q slots), flash/eager parity.
 
 Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift vs fp-only),
-LongBench (quality at int8, then int4).
+LongBench (quality at int4).
 
 ---
 
