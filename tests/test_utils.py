@@ -191,6 +191,21 @@ class TestCacheConfig:
         assert result == 16
         assert result % 8 == 0
 
+    def test_score_p_defaults_to_one(self) -> None:
+        assert CacheConfig().score_p == 1.0
+
+    def test_score_p_normalizes_int_to_float(self) -> None:
+        cfg = CacheConfig(score_p=3)
+        assert cfg.score_p == 3.0 and isinstance(cfg.score_p, float)
+
+    def test_rejects_score_p_below_one(self) -> None:
+        with pytest.raises(CfgValidationError, match="score_p must be >= 1"):
+            CacheConfig(score_p=0.5)
+
+    def test_rejects_score_p_bool(self) -> None:
+        with pytest.raises(CfgValidationError, match="score_p"):
+            CacheConfig(score_p=True)
+
 
 class TestLoadConfig:
     def test_load_valid_yaml(self, tmp_path: Path) -> None:
