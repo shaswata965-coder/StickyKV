@@ -18,11 +18,15 @@ def compute_window_scores(
     attn: Tensor,
     num_sink: int,
     window_size: int,
+    p: float = 1.0,
 ) -> Tensor:
-    """Reduce full attention weights to per-window scores.
+    """Reduce full attention weights to per-window Lp power-sums.
 
     Algorithm:
-    1. Sum over T query rows → per-token received attention ``[B, H_q, S]``.
+    1. Reduce over T query rows → per-key power-sum ``Σ_i A_ij^p`` giving
+       ``[B, H_q, S]`` (``p = 1`` is a plain sum). The ``1/p`` root is NOT
+       applied here — the cache accumulates these power-sums across prefill and
+       decode (they are additive) and roots once at eviction time.
     2. Strip sink prefix (never scored).
     3. Right-pad trailing partial window with zeros.
     4. ``einops.reduce('b h (w s) -> b h w', 'sum')``.
@@ -35,16 +39,33 @@ def compute_window_scores(
         Number of sink tokens to strip from the key dimension.
     window_size : int
         Window size for aggregation.
+    p : float
+        Lp-norm exponent for pooling over the query axis. ``p = 1`` (default)
+        is the plain H2O cumulative sum. ``p > 1`` emphasises concentrated
+        (peaky) attention. Applies to every pass (prefill and decode); the
+        power-sums are additive so decode folds in one query row at a time, and
+        the ``1/p`` root is deferred to the cache at eviction time.
 
     Returns
     -------
     Tensor
-        Shape ``[B, H_q, W]``.  Sink tokens are **not** represented.
+        Shape ``[B, H_q, W]`` — per-window power-sums ``Σ_i A_ij^p`` (pre-root).
+        Sink tokens are **not** represented.
     """
-    # 1. Sum over T query rows → per-token scores [B, H_q, S]
-    token_scores = attn.sum(dim=-2)
+    # 1. Reduce over T query rows → per-key power-sum [B, H_q, S].
+    #    p == 1 is the plain H2O sum. p > 1 accumulates the p-th powers
+    #    Σ_i A_ij^p (Lp-norm pooling over the query axis, PRE-root): keys
+    #    attended intensely by a few queries dominate keys attended diffusely by
+    #    many. The root is NOT taken here — the cache accumulates these
+    #    power-sums continuously across prefill and decode (they are additive)
+    #    and applies the 1/p root once at eviction time. The power is taken in
+    #    fp32 so small softmax probabilities do not underflow before the sum.
+    if p != 1.0:
+        token_scores = attn.to(torch.float32).pow(p).sum(dim=-2)
+    else:
+        token_scores = attn.sum(dim=-2)
 
-    # 2-4. Strip sink, pad, window-reduce.
+    # 2-4. Strip sink, pad, window-reduce (sum over the tokens in each window).
     return reduce_token_scores_to_windows(token_scores, num_sink, window_size)
 
 

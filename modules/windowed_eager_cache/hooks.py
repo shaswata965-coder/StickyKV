@@ -124,6 +124,7 @@ def install_score_hooks(
 
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
+    score_p = float(getattr(config, "score_p", 1.0))
 
     warned_once = [False]
 
@@ -172,9 +173,13 @@ def install_score_hooks(
                     return
 
                 # attn_weights: [B, H_q, T, S]
-                # compute_window_scores sums across the T axis internally;
-                # every query row contributes (H2O cumulative, no obs_window).
-                scores = compute_window_scores(attn_weights, num_sink, window_size)
+                # compute_window_scores reduces across the T axis internally,
+                # returning per-window power-sums Σ_i A_ij^p (p=1 is the plain
+                # H2O sum). The cache accumulates these across prefill+decode
+                # and takes the 1/p root at eviction time.
+                scores = compute_window_scores(
+                    attn_weights, num_sink, window_size, p=score_p
+                )
 
                 # Push into cache_kwargs; cache.update() accumulates across steps.
                 cache.cache_kwargs[lidx]["window_scores"] = scores
