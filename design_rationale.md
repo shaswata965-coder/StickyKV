@@ -12,7 +12,10 @@ Target precision is **int4** (the int8 milestone was dropped).
 
 ## Outlier strategy (int4)
 
-The int4 outlier choice is **not yet ratified**. This section records the analysis.
+**Ratified for v1 (2026-07-06): no outlier machinery.** NF4 keys and the value
+Hadamard fold are deferred beyond v1 altogether — see the v1 decision at the end of
+this section. The analysis below is retained as the record and governs the post-v1
+revisit.
 
 ### Why the burden is already light
 
@@ -55,7 +58,7 @@ for v1. Split by phase:
   per-channel NUQ codebook (k-means) adds offline work per demotion. Use the fixed
   codebook to keep the pinned-grid freeze trivial.
 
-### Recommended int4 approach (revised)
+### Earlier recommendation (superseded for v1 — retained as the post-v1 record)
 
 Adopt both cheap pieces up front; keep only the genuinely-costly piece contingent:
 
@@ -88,6 +91,29 @@ baseline (both cheap in v1); dense-sparse is the sole contingency.
 are free/near-free in the materialize path). Real cost appears only in the Phase 2 tile
 (NF4 LUT) and in the optional sparse net. And the dominant v1 cost overall is the fp16
 write-back of the materialized Q tier (design.md §8) — outlier handling is second-order.
+
+### v1 decision: no outlier machinery (NF4 + value-fold deferred beyond v1)
+
+**Ratified 2026-07-06.** v1 ships with the pinned asymmetric affine int4 quantizer
+(design.md §2) and **no outlier handling**. NF4 keys and the value Hadamard fold —
+recommended above as near-free in the materialize path — are **deferred beyond v1
+altogether**:
+
+- **The value fold is model surgery** (integration audit item 11): a
+  weight-modification step at model load with its own correctness surface (per-head
+  block-diagonal fold, GQA head mapping, tied-weight edge cases), for a benefit the
+  SAW-INT4 ablations suggest is second-order (key-side rotation dominates
+  value-side, and our keys are already per-channel pre-RoPE).
+- **NF4 keys change the grid** the quantizer tests must certify and add a codebook
+  choice; the free-in-v1 analysis above stands, but v1 correctness is served better
+  by one quantizer with a byte-comparable KIVI reference.
+- **The structural mitigations are the heavy lifters** per the burden analysis at
+  the top of this section: per-channel pre-RoPE keys, the fp tier holding the
+  largest-spike windows, and the always-fp16 sink.
+
+The sole contingency remains the micro dense-sparse side-list (~0.1–0.25%), added
+only if the int4 LongBench gate misses. NF4 keys and the value fold re-enter
+consideration post-v1, alongside the Phase 2 in-tile kernel decision.
 
 ---
 
@@ -125,12 +151,17 @@ Roughly ordered from cache-core outward.
     scores only the fp tier and misses the interleave. **The one required flash-hook
     change.** (Eager attends over `update()`'s return, so its real-attention scoring
     needs no hook change — but it *does* depend on (6)/(7)/(8).)
-11. **Value Hadamard fold (if adopted) is model surgery, outside the cache.** Folding
-    `H`→`W_v` and `Hᵀ`→`W_o` is a model-load step (e.g. in `cache_factory`/model setup);
-    no weight-modification step exists today. Larger integration surface than the
-    cache-local key changes — worth scoping explicitly.
+11. **Value Hadamard fold — DEFERRED beyond v1** (see the v1 decision above; decision
+    record in design_history.md Amendment 4). If revived post-v1 it is model surgery,
+    outside the cache: folding `H`→`W_v` and `Hᵀ`→`W_o` at model load (e.g. in
+    `cache_factory`/model setup); no weight-modification step exists today. Larger
+    integration surface than the cache-local key changes — scope explicitly then.
 12. **Mirror to `windowed_eager_cache`.** All `cache.py`/`state.py` edits stay
     byte-identical; the quant module + ledger are shared.
+13. **`telemetry.py` — tier-migration counters.** Per layer per eviction: windows
+    promoted / demoted (first-time) / reactivated / dropped, plus Q-tier occupancy.
+    Required by design.md §10's instrumentation (promotion frequency + Suite A
+    Jaccard-vs-fp-only).
 
 Already anticipated by design.md: (4),(5),(9) via §5; (7) via §9; (1)-(3) via §5–§7.
 Newly surfaced / previously understated: (6) return-value + chronological interleave,
@@ -140,11 +171,10 @@ Newly surfaced / previously understated: (6) return-value + chronological interl
 
 ## Open items (resolve before the affected milestone)
 
-- **Scale dtype (blocks a deterministic `b_q`).** fp16 / fp8 for the pinned scale/zero.
-  Swept in Suite C; the resolver needs a default to compute `N_q`.
-- **Quantizer numerics.** Pin the exact asymmetric affine quant/dequant formula and the
-  NF4 codebook (fixed QLoRA constants vs per-channel percentiles) against a KIVI/NF4
-  reference before coding. Nibble packing is already decided (design.md §2).
+*(Resolved 2026-07-06 and graduated to design.md §2: scale dtype = fp16; the exact
+asymmetric affine quant/dequant formula is pinned; NF4 is deferred beyond v1. See
+design_history.md Amendment 4.)*
+
 - **int4 sparse-net gate.** Decide the LongBench threshold that triggers the micro
   dense-sparse escalation.
 - **Explicit hysteresis.** Deferred; revisit only if Suite A Jaccard shows measurable

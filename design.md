@@ -41,12 +41,31 @@ interleave) is the shippable v1 and is fully CPU-testable.
   single global scale is pinned by the largest outlier and obliterates small/median
   values, so groups are kept fine to localise range. But not arbitrarily fine — each
   group costs a scale + zero, so over-fine grouping eats the int4 savings.
-- **Affine, asymmetric.** The distributions are skewed, so use asymmetric affine
-  int4 quantization.
+- **Affine, asymmetric — numerics pinned.** The distributions are skewed, so use
+  asymmetric affine int4 quantization, KIVI-reference float-offset form, computed in
+  fp32:
+
+  ```
+  scale = (mx − mn) / 15                # mx/mn over the quant group
+  zero  = mn                            # float offset (not an integer zero-point)
+  q     = clamp(round((x − zero) / scale), 0, 15)   # round-half-even; clamp BEFORE the uint cast
+  x̂     = q · scale + zero
+  ```
+
+  Degenerate group (`mx == mn`): set `scale = 1` → all codes 0 and `x̂ = mn`
+  exactly. **Scales and zeros are stored fp16 (pinned).** The fp8-scale option is
+  dropped: it saves ~1.5% of Q-tier bytes while injecting scale-quantization noise
+  into every dequant. Quantization runs against the **fp16-stored** `scale`/`zero`
+  (not the fp32 intermediates), so the grid the codes were fit to is bit-identical
+  to the grid used at every dequant. The float-offset form is used rather than an
+  integer zero-point because K/V groups often exclude zero — an integer zero-point
+  clamped to `[0, 15]` cannot represent an offset outside the group's own span.
 - **Pinned grid.** Each window's **scale and zero-point are pinned at first
-  quantization and reused until eviction**. The affine grid is therefore fixed, so
-  `quant(dequant(c)) = c` exactly — zero drift, no compounding across re-reads (§3,
-  §8).
+  quantization and never recomputed**. Codes are written exactly once in a window's
+  lifetime: re-reads only dequantize, and a re-demotion **reactivates** the stored
+  ledger entry instead of re-quantizing (§10). Zero drift and zero compounding are
+  therefore **structural** guarantees — no arithmetic path ever runs
+  `quant(dequant(·))` — not numerical ones (§3, §8).
 - **Nibble packing (decided).** Pack the two int4 codes that **share a scale** into
   one byte — i.e. pack along each tier's quantization-group axis:
   - **Keys** (per-channel scale, group = window along the token axis): store the Q
@@ -63,13 +82,17 @@ interleave) is the shippable v1 and is fully CPU-testable.
   **Bring-up path:** validate with unpacked codes (one 4-bit value per byte, so
   `torch.gather` works token-wise), then switch to this packed layout; Phase 2 repacks
   into uint32 words (8 nibbles) for 32-bit-aligned loads, same group axis.
-- **Outlier handling.** The int4 outlier strategy is **not yet ratified** into this
-  spec; its analysis, cost, and the recommended approach are in
-  [design_rationale.md](design_rationale.md).
+- **Outlier handling (v1: none).** v1 ships **no outlier machinery**: per-channel
+  key scales, pre-RoPE storage, and the two-tier split (the largest spikes sit in
+  the fp tier, and the sink is always fp16) already absorb the dominant outlier
+  structure. NF4-style key codebooks and the value Hadamard fold are **deferred
+  beyond v1 altogether** (decision record in [design_history.md](design_history.md);
+  analysis retained in [design_rationale.md](design_rationale.md)). The sole
+  contingency — a micro dense-and-sparse fp16 side-list (~0.1–0.25%) — is added
+  **only if** the int4 LongBench gate misses.
 
-The quantizer is a shared module implementing the above. Open numeric details (the
-exact asymmetric affine quant/dequant formula, and any int4 outlier handling) are
-tracked in [design_rationale.md](design_rationale.md) and pinned before coding.
+The quantizer is a shared module implementing exactly the scheme above; no numeric
+details remain open.
 
 ---
 
@@ -81,7 +104,8 @@ Past KV is immutable. There is **no re-quantization** of stored windows:
   accrue `window_scores`. This dequant-for-scoring is a **read-path cost** (§8), not
   a re-quant.
 - The new/local window is born in fp16 and is quantized **at most once** — only if it
-  is later demoted into the Q tier.
+  is later demoted into the Q tier. Codes are computed at the **first** demotion
+  only; any later re-demotion reactivates the stored ledger entry (§10).
 - **Promotion/demotion decisions are pure score-ranking arithmetic** ("where does
   this window land in the ranking?"). No dequantization and no concatenation is
   needed for the *decision*; those happen only in the attention read path.
@@ -122,12 +146,15 @@ recent context, corrupting every Q·Kᵀ dot product involving W2.
 2. **Assign tiers.** Top `N_fp` windows (including sink + local) → fp; next `N_q` →
    Q; the rest → dropped (`N_fp`, `N_q` from the budget resolver, §7).
 3. **Move boundary-crossers.**
-   - **Demote (K→Q):** un-rotate the window's fp keys **once** (reuse the
-     `rerotate_keys` un-rotate half), quantize against a freshly-pinned grid, append
-     to the Q store, remove from the fp store. (A window that has been demoted before
-     re-uses its pinned grid by identity — §8.)
-   - **Promote (Q→K):** dequantize the window's codes, append to the fp store, remove
-     from the Q store.
+   - **Demote (K→Q), first time:** un-rotate the window's fp keys **once** (reuse
+     the `rerotate_keys` un-rotate half), quantize against a freshly-pinned grid,
+     append to the Q store, remove from the fp store. A window that has been demoted
+     before is **reactivated, not re-quantized**: its dormant ledger entry (codes +
+     pinned grid) is still live, so demotion is drop-the-fp-copy + mark the entry
+     active (§10).
+   - **Promote (Q→K):** dequantize the window's codes, append to the fp store,
+     remove it from the Q store **but keep its ledger entry dormant** (codes +
+     pinned grid) for a possible future re-demotion (§10).
 4. **Build the interleaved position map.** Merge **all** surviving windows (both
    tiers) sorted by `original_window_id`; assign one contiguous position map
    `arange(T_total)` across the merged set, where `T_total = T_fp + T_q`. Fp windows
@@ -182,6 +209,37 @@ existing scorer, sink-strip, and Lp accumulation unchanged.
   store by `original_window_id` into chronological order. Returns effective K/V. Used
   **both** as `update()`'s return and by the flash score hook (which currently reads
   raw `key_states`).
+- `expand_to_token_indices` becomes **tier-aware** (see the merged window axis
+  below): it expands only the **fp partition** of the retained merged indices into
+  fp-store token indices (for `slice_and_keep` / `rerotate_keys`); Q windows are
+  handled entirely through the ledger and never through a token gather.
+
+### The merged window axis (one index space for scores, ranking, and retention)
+
+All per-window bookkeeping lives on **one axis**: the merged chronological window
+axis — every surviving window from **both tiers**, sorted by `original_window_id`,
+exactly the order `materialize_effective_kv` emits. Invariant: merged-axis index `i`
+↔ the `i`-th chronological surviving window ↔ the `i`-th physical window chunk of
+the effective K/V. Like `original_window_ids` today, the axis is **per row** (rows
+may evict different windows). Concretely:
+
+- `window_scores` `[B, H_q, W]` and `original_window_ids` `[B, W]` index the merged
+  axis (`W = W_fp + W_q`). The scorer chunks the effective K/V — materialized in
+  merged order — so its output aligns with this axis by construction; `accumulate`
+  and `update()`'s W-growth bookkeeping run unchanged, just on the merged axis.
+- **Ranking and tier assignment** (steps 1–2 above) run on the merged axis and
+  partition its indices into fp survivors, Q survivors, and dropped.
+- **Index translation is tier-aware.** A merged index no longer maps to a physical
+  offset by arithmetic alone; it resolves through the tier map (§4):
+  - **fp window** → its token range in the fp store. The fp windows' *relative*
+    order on the merged axis equals their physical order in the fp store, so the
+    fp-store window rank is a cumsum over the fp-tier mask, and token indices are
+    `num_sink + rank_fp · window_size + offset`.
+  - **Q window** → its ledger entry (codes / scales / `position_range`). It has
+    **no** fp-store token indices.
+- The sink prefix sits outside the axis (never scored, always fp), and the local
+  windows are the trailing merged indices (newest ids), so the local-protection
+  slice in `compute_retain_window_indices` is unchanged.
 
 ---
 
@@ -202,6 +260,13 @@ evictions. The fp tier needs no ledger — it is a plain dense tensor.
 the read path feeds to RoPE. The ledger update at eviction is O(Q_windows) integer
 assignments — no tensor movement, no re-quant.
 
+Entries **persist through promotion**: a promoted window's entry goes **dormant**
+(codes + scale/zero retained; `offset` invalid; excluded from reads and the
+interleave) rather than being freed, so a later re-demotion is a pure reactivation
+(§10). An entry is freed only when its window is dropped outright. Dormant codes are
+a small, freeable overhead — bounded by the fp tier's window count at int4 size —
+which the v1 budget resolver may ignore.
+
 ---
 
 ## 7. Tier-aware budget resolver
@@ -219,16 +284,18 @@ N_fp = M_fp / b_fp          # fp windows
 N_q  = M_q  / b_q           # int4 windows
 ```
 
-where `b_fp` is fp bytes-per-window and
+where `b_fp = 4 · H_kv · D · window_size` bytes (K + V, fp16) and, with fp16
+scale/zero (pinned, §2):
 
 ```
-b_q ≈ ¼ · b_fp  +  per-window key-scale/zero  +  per-token value-scale overhead
+b_q = H_kv · D · window_size      # packed int4 codes, K + V   (= ¼ · b_fp)
+    + 4 · H_kv · D                # key scale+zero, per (head, channel), fp16
+    + 4 · H_kv · window_size      # value scale+zero, per (head, token), fp16
 ```
 
 The resolver **must use `b_q`, not `b_fp`, for the Q tier** — the int4 tier holds
-~4× the windows of equal fp memory (minus overhead). The scale/zero overhead term
-depends on the chosen **scale dtype** (fp16 / fp8); the resolver takes the scale dtype
-as an input so `N_q` is deterministic for a given config.
+~4× the windows of equal fp memory (minus overhead). The scale dtype is **fixed at
+fp16 in v1** (§2), so `N_q` is deterministic for a given config with no dtype input.
 
 **Sink + local windows stay fp**, inside `M_fp`: `top-K-fp = N_fp − (sink + local)`.
 
@@ -237,7 +304,8 @@ windows retained at 25% of full memory.
 
 This extends the existing byte-based `resolve()` (which already computes
 `bytes_per_token`, `total_budget_bytes`, `top_k_windows`). New config knobs: `β`
-(exists as `cache_budget`), `q`, bit-width, group size, scale dtype.
+(exists as `cache_budget`), `q`, bit-width, group size. Scale dtype is fixed fp16
+(§2) — not a knob.
 
 ---
 
@@ -260,7 +328,8 @@ layer. Phase 2 eliminates the write-back entirely (§11).
 
 **Scoring.** Because the effective K/V is materialized in **chronological window
 order** (§5), the window scorer's physical chunking (`b h (w s) -> b h w`) stays
-valid unchanged and both tiers accrue `window_scores`. This does require the effective
+valid unchanged and both tiers accrue `window_scores` — the scores land on the
+merged window axis (§5). This does require the effective
 K/V — not the raw fp `key_states` — to be what gets scored: the eager backend already
 attends over `update()`'s return, but the flash score hook currently reads raw
 `cache._states[l].key_states` and must instead source the effective K via
@@ -302,15 +371,21 @@ instead; callers must not assume the returned tensor aliases the stored fp cache
   frequency telemetry and **Suite A Jaccard-vs-fp-only** over long sequences. (The
   score-feedback loop and the not-chosen fallback are documented in
   [design_history.md](design_history.md).)
-- **Pinned grid by identity kills oscillation.** A window retains its pinned grid **by
-  identity, even through a promotion** → a promote→demote round trip re-quantizes
-  against the old grid → idempotent → identical codes → zero added error. Explicit
-  hysteresis is not used.
+- **Ledger entries persist through promotion; re-demotion is a reactivation.** A
+  promoted window's ledger entry (codes + pinned scale/zero) is **retained dormant**,
+  not freed (§6). Because past KV is immutable, the window's pre-RoPE content can
+  never change — so a later demotion does **not** un-rotate or re-quantize: it drops
+  the fp copy and reactivates the stored codes. Zero compute, and **exactly** zero
+  added error. (A re-quantization path would pick up fp16 rounding from the
+  intermediate fp-tier re-rotations and could flip boundary codes — this is why
+  reactivation, not "re-quantize against the old grid", is the spec.) This is what
+  "pinned grid by identity" means operationally, and it makes promote→demote
+  oscillation free without explicit hysteresis.
 - **Quant group = the eviction window.** This pins one grid per window, which
-  promotion requires. `window_size`, bit-width, and scale dtype are empirical knobs
-  swept in Suite C / LongBench — **no hardcoded floor**; pick by measured effective-
-  bits-vs-quality. Effective key bits ≈ `4 + 32/window_size` (expectation-setting,
-  not a rule).
+  promotion requires. `window_size` and bit-width are empirical knobs swept in
+  Suite C / LongBench — **no hardcoded floor**; pick by measured effective-
+  bits-vs-quality. (Scale dtype is fixed fp16, §2.) Effective key bits ≈
+  `4 + 32/window_size` (expectation-setting, not a rule).
 - **Precision: fp16 K tier, int4 Q tier.** Full-precision windows are fp16; the
   quantized tier is int4 (§2, §7).
 - **v1 is batch-size 1 only.** The read path uses `utils.position_override` (a B=1
@@ -357,10 +432,13 @@ eliminated — only int4 codes are read from HBM.
 ### Phase 3 — FlashInfer integration (production ceiling, not in scope)
 
 Replace the custom GEMV tile with FlashInfer's paged quantized decode attention
-(online softmax, GQA, paged blocks, int4/fp8 native). Requires aligning
-`QuantizedStore`'s block layout with FlashInfer's paged KV convention. Strictly
-better than Phase 2 but adds a significant dependency and layout constraint. Deferred
-until Phase 2 is profiled.
+(online softmax, GQA, paged blocks). **Note: FlashInfer is fp8/fp4-native — int4 is
+*not* a native FlashInfer path**; the int4 decode kernels in the literature (Atom)
+are custom builds on top of it. Phase 3 therefore either (a) re-targets the Q tier
+to fp8/nvfp4 for the native path, or (b) ports an Atom-style int4 kernel — decided
+when Phase 2 is profiled. Requires aligning `QuantizedStore`'s block layout with
+FlashInfer's paged KV convention. Strictly better than Phase 2 but adds a
+significant dependency and layout constraint. Deferred until Phase 2 is profiled.
 
 ---
 
@@ -384,8 +462,11 @@ New `QuantizedStore` + hand-rolled KIVI-style quantizer module; two-tier
 position_map` + `rerotate_keys(new_pos)` change; `materialize_effective_kv` helper;
 tier-aware budget resolver (§7); mirrored into both backends (§9).
 
-CPU unit tests: round-trip error, pinned-grid idempotence, position-invariance,
-interleaved-map correctness (fp gaps over Q slots), flash/eager parity.
+CPU unit tests: round-trip error, degenerate-group exactness (`mx == mn` → `x̂ = mn`),
+promote→demote reactivation (codes bit-identical, no recompute), position-invariance,
+interleaved-map correctness (fp gaps over Q slots), merged-axis score alignment
+(`window_scores` index ↔ chronological window id across a mixed-tier eviction),
+flash/eager parity.
 
 Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift vs fp-only),
 LongBench (quality at int4).
@@ -414,7 +495,8 @@ to int4, a quarter of the memory — that's the Q tier. Everything else is dropp
 1. We rank all the windows.
 2. The windows crossing into the Q tier get quantized — but right before we quantize,
    we strip RoPE off them (RoPE is the position stamp on a token). We store the
-   stripped, un-stamped version.
+   stripped, un-stamped version. (A window that has been in the Q tier before skips
+   all of this — we kept its old codes and just switch them back on.)
 3. The survivors get squished together so there are no gaps, and we renumber their
    positions from zero.
 4. The renumbering covers **both tiers at once**. Say windows 1 and 5 stay in fp16 and

@@ -147,6 +147,50 @@ before each amendment and why it changed.
 >
 > The affected resolutions (#9 and #12) were updated inline.
 
+### Amendment 4 — v1 quantizer pinned (fp16 scales, affine-only), ledger reactivation, merged window axis
+
+> Ratified 2026-07-06, following an end-to-end design review against the current
+> literature (KIVI/KVQuant lineage, RDKV, SAW-INT4, KVSink, Atom/FlashInfer):
+>
+> - **Scale dtype pinned to fp16; the fp8-scale option is removed.** fp8 scales
+>   save ~1.5% of Q-tier bytes while injecting scale-quantization noise into every
+>   dequant. This unblocks a deterministic `b_q` / `N_q`; the exact per-window byte
+>   formula is now in design.md §7.
+> - **Quantizer numerics ratified** (design.md §2): KIVI-reference asymmetric
+>   affine, float-offset form (`zero = mn`), fp32 compute, round-half-even,
+>   clamp-before-cast, degenerate-group rule `scale = 1` when `mx == mn`.
+>   Quantization runs against the fp16-*stored* scale/zero so the fitted grid is
+>   bit-identical to the read-path grid. The float-offset form was chosen over an
+>   integer zero-point because K/V groups often exclude zero — an integer
+>   zero-point clamped to `[0, 15]` cannot represent an offset outside the group's
+>   own span (catastrophic for strictly-positive/negative channels).
+> - **NF4 keys and the value Hadamard fold are deferred beyond v1 altogether**
+>   (were the rationale file's recommended baseline). The value fold is model
+>   surgery with its own correctness surface for a benefit SAW-INT4's ablations
+>   suggest is second-order on values; NF4 changes the grid the tests must certify.
+>   v1 ships one quantizer with a byte-comparable KIVI reference and no outlier
+>   machinery; the micro dense-sparse side-list remains the sole contingency,
+>   gated on LongBench.
+> - **Ledger entries persist through promotion; re-demotion is a reactivation, not
+>   a re-quantization.** The earlier claim — "a promote→demote round trip
+>   re-quantizes against the old grid → idempotent → identical codes" — was only
+>   epsilon-true: intermediate fp-tier re-rotations add fp16 rounding that can flip
+>   boundary codes on re-quantization. Since pre-RoPE window content is immutable,
+>   the stored codes never need recomputing: promotion keeps the ledger entry
+>   dormant, re-demotion drops the fp copy and reactivates it. Exactly lossless,
+>   zero compute, and it makes pinned-grid idempotence a structural property (no
+>   path ever runs `quant(dequant(·))`) instead of a numerical one.
+> - **Merged window axis specified** (design.md §5): `window_scores` /
+>   `original_window_ids` / ranking all live on one merged chronological window
+>   axis spanning both tiers (the order `materialize_effective_kv` emits);
+>   `expand_to_token_indices` becomes tier-aware — only the fp partition expands to
+>   fp-store token indices, Q windows resolve through the ledger. This closes the
+>   previously-undeclared gap between the merged scoring axis and the per-store
+>   physical token axis.
+> - **Phase 3 claim corrected:** FlashInfer is fp8/fp4-native; the int4 decode
+>   kernels in the literature (Atom) are custom builds on top of it. Phase 3 either
+>   re-targets the Q tier to fp8/nvfp4 or ports an Atom-style int4 kernel.
+
 ---
 
 ## Considered and explicitly rejected optimizations
