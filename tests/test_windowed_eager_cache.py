@@ -21,7 +21,7 @@ from torch import Tensor
 
 from modules.windowed_eager_cache.cache import WindowedCache
 from modules.windowed_eager_cache.config import ResolvedConfig, WindowedCacheConfig
-from modules.windowed_eager_cache.policy import EvictionPolicy
+from modules.windowed_eager_cache.policy import EvictionPolicy, pool_over_heads
 from modules.windowed_eager_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_eager_cache.state import CacheState
 from modules.windowed_eager_cache.telemetry import NullTelemetry, Telemetry
@@ -307,6 +307,77 @@ class TestEviction:
         retained = policy.compute_retain_window_indices(scores)
         assert 0 in retained[0].tolist()
         assert 3 in retained[1].tolist()
+
+    # Cross-head Lp pooling (score_p_head) + GQA-group pooling ------------
+
+    def test_pool_over_heads_p1_is_mean(self):
+        scores = torch.randn(2, 8, 5).abs()
+        assert torch.allclose(pool_over_heads(scores, 1.0), scores.mean(dim=1))
+
+    def test_pool_over_heads_monotone_toward_max(self):
+        scores = torch.rand(2, 8, 5)
+        mean = scores.mean(dim=1)
+        mx = scores.amax(dim=1)
+        p2 = pool_over_heads(scores, 2.0)
+        p8 = pool_over_heads(scores, 8.0)
+        p64 = pool_over_heads(scores, 64.0)
+        assert (p2 >= mean - 1e-5).all()
+        assert (p8 >= p2 - 1e-5).all()
+        assert (p64 >= p8 - 1e-5).all()
+        assert (p64 <= mx + 1e-5).all()
+        assert (mx - p64).abs().mean() < (mx - mean).abs().mean()
+
+    def test_default_head_reduction_is_mean(self):
+        policy = EvictionPolicy(_make_resolved(top_k_windows=2, local_tokens=16))
+        scores = torch.randn(2, 8, 6).abs()
+        assert torch.allclose(policy._reduce_heads(scores), scores.mean(dim=1))
+
+    def test_high_p_head_recovers_retrieval_window(self):
+        scores = torch.tensor([[
+            [0.10, 0.80, 0.10, 0.0],
+            [0.45, 0.20, 0.35, 0.0],
+            [0.50, 0.20, 0.30, 0.0],
+            [0.45, 0.25, 0.30, 0.0],
+            [0.50, 0.20, 0.30, 0.0],
+        ]])
+        base = EvictionPolicy(_make_resolved(top_k_windows=1, local_tokens=8))
+        base.initialize_after_prefill(4 + 8 * 4)
+        assert base.compute_retain_window_indices(scores)[0].tolist() == [0, 3]
+        sharp = EvictionPolicy(
+            _make_resolved(top_k_windows=1, local_tokens=8, score_p_head=8.0)
+        )
+        sharp.initialize_after_prefill(4 + 8 * 4)
+        assert sharp.compute_retain_window_indices(scores)[0].tolist() == [1, 3]
+
+    def test_group_max_preserves_group_peak(self):
+        scores = torch.tensor([[
+            [0.05, 0.90, 0.05],
+            [0.55, 0.15, 0.30],
+            [0.55, 0.15, 0.30],
+            [0.55, 0.15, 0.30],
+        ]])
+        w1_max = EvictionPolicy(
+            _make_resolved(num_key_value_groups=2, head_group_pool="max")
+        )._reduce_heads(scores)[0, 1]
+        w1_mean = EvictionPolicy(
+            _make_resolved(num_key_value_groups=2, head_group_pool="mean")
+        )._reduce_heads(scores)[0, 1]
+        assert w1_max > w1_mean
+
+    def test_resolve_populates_kv_groups(self):
+        resolved = _make_config().resolve(
+            prefill_len=1024,
+            model_config=_FakeModelConfig(),
+            kv_dtype=torch.float16,
+            max_tokens=128,
+        )
+        assert resolved.num_key_value_groups == 4
+
+    def test_head_pool_config_validation(self):
+        with pytest.raises(ValueError):
+            _make_config(head_group_pool="bogus")
+        with pytest.raises(ValueError):
+            _make_config(score_p_head=0.5)
 
 
 class TestHooksInherited:

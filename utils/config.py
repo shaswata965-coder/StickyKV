@@ -48,6 +48,8 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     score_p: float = 1.0  # Lp-norm exponent for query pooling (p=1 = plain H2O sum)
+    score_p_head: float = 1.0  # Lp-norm exponent for cross-head pooling (p=1 = plain mean)
+    head_group_pool: str = "none"  # intra-GQA-group reduction: "none" | "max" | "mean"
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -108,6 +110,29 @@ class CacheConfig:
                 f"score_p must be >= 1 (p=1 is plain-sum / H2O), got {self.score_p}"
             )
         self.score_p = float(self.score_p)
+
+        # -- score_p_head (cross-head Lp exponent; mirrors score_p) --
+        if isinstance(self.score_p_head, bool):
+            raise ConfigValidationError(
+                f"score_p_head must be a number >= 1, got bool {self.score_p_head!r}"
+            )
+        if not isinstance(self.score_p_head, (int, float)):
+            raise ConfigValidationError(
+                f"score_p_head must be int or float, got {type(self.score_p_head).__name__}"
+            )
+        if self.score_p_head < 1.0:
+            raise ConfigValidationError(
+                f"score_p_head must be >= 1 (p=1 is the plain mean over heads), "
+                f"got {self.score_p_head}"
+            )
+        self.score_p_head = float(self.score_p_head)
+
+        # -- head_group_pool (intra-GQA-group reduction) --
+        if self.head_group_pool not in ("none", "max", "mean"):
+            raise ConfigValidationError(
+                f"head_group_pool must be one of 'none' | 'max' | 'mean', got "
+                f"{self.head_group_pool!r}"
+            )
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.

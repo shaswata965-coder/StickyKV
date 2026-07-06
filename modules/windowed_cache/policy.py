@@ -16,6 +16,29 @@ if TYPE_CHECKING:
     from .config import ResolvedConfig
 
 
+def pool_over_heads(scores: Tensor, p: float) -> Tensor:
+    """Reduce per-head window scores ``[B, H, W]`` to ``[B, W]`` via an Lp power-mean.
+
+    ``p == 1`` is a plain mean over heads (``scores.mean(dim=1)``) — byte-identical
+    to the historical behaviour. ``p > 1`` up-weights the heads that express a
+    sharp preference for a window (retrieval heads) over heads that spread their
+    attention diffusely, so a single head's evidence is not averaged away by many
+    indifferent heads; ``p -> inf`` approaches a max over heads.
+
+    The power-mean is normalised by the per-window head-max before the ``pow`` so
+    that large ``p`` at full-context score magnitudes cannot overflow fp32. This
+    is an exact identity: ``(mean_h s^p)^(1/p) = m · (mean_h (s/m)^p)^(1/p)`` with
+    ``m = max_h s`` (``s >= 0`` always, since scores are rooted attention
+    power-sums).
+    """
+    if p == 1.0:
+        return scores.mean(dim=1)
+    s = scores.to(torch.float32)
+    m = s.amax(dim=1, keepdim=True).clamp_min(1e-12)   # [B, 1, W]
+    pooled = (s / m).pow(p).mean(dim=1).pow(1.0 / p) * m.squeeze(1)  # [B, W]
+    return pooled.to(scores.dtype)
+
+
 class EvictionPolicy:
     """Stateful eviction controller.
 
@@ -32,6 +55,10 @@ class EvictionPolicy:
         self.local_windows: int = resolved.local_tokens // resolved.window_size
         self.top_k_windows: int = resolved.top_k_windows
         self.total_tokens: int = 0
+        # Head-pooling knobs (default: plain mean over heads → byte-identical).
+        self.score_p_head: float = resolved.score_p_head
+        self.head_group_pool: str = resolved.head_group_pool
+        self.num_key_value_groups: int = resolved.num_key_value_groups
 
     # -----------------------------------------------------------------
     # State bookkeeping
@@ -78,13 +105,44 @@ class EvictionPolicy:
     # Retain indices — window granularity
     # -----------------------------------------------------------------
 
+    def _reduce_heads(self, window_scores: Tensor) -> Tensor:
+        """Reduce per-head window scores ``[B, H_q, W]`` to ``[B, W]``.
+
+        Two-stage, GQA-aware:
+
+        1. If ``head_group_pool != "none"`` and the query heads divide evenly
+           into ``num_key_value_groups``, pool the query heads **within each GQA
+           group** (``"max"`` keeps what the group's most-demanding member needs;
+           ``"mean"`` averages them) → one score per KV head.
+        2. Pool the resulting heads with an Lp power-mean of exponent
+           ``score_p_head`` (see :func:`pool_over_heads`).
+
+        Defaults (``head_group_pool="none"``, ``score_p_head=1.0``) reduce to
+        ``window_scores.mean(dim=1)``.
+        """
+        H_q = window_scores.shape[1]
+        g = self.num_key_value_groups
+        if self.head_group_pool != "none" and g > 1 and H_q % g == 0:
+            B, _, W = window_scores.shape
+            H_kv = H_q // g
+            grouped = window_scores.view(B, H_kv, g, W)
+            if self.head_group_pool == "max":
+                per_head = grouped.amax(dim=2)   # [B, H_kv, W]
+            else:  # "mean"
+                per_head = grouped.mean(dim=2)   # [B, H_kv, W]
+        else:
+            per_head = window_scores             # [B, H_q, W]
+        return pool_over_heads(per_head, self.score_p_head)
+
     def compute_retain_window_indices(
         self, window_scores: Tensor
     ) -> Tensor:
         """Primary retain-decision method at **window** granularity.
 
         Algorithm (all single-call tensor ops):
-        1. ``mean_scores = window_scores.mean(dim=1)`` → ``[B, W_total]``.
+        1. ``mean_scores = self._reduce_heads(window_scores)`` → ``[B, W_total]``
+           (Lp power-mean over heads, optionally GQA-group-aware; defaults to a
+           plain mean).
         2. Slice to evictable window range.
         3. ``torch.topk`` on the slice.
         4. Sort indices chronologically (never by score).
@@ -108,8 +166,13 @@ class EvictionPolicy:
         local_w = min(self.local_windows, W_total)
         evictable_w = W_total - local_w
 
-        # 1. Mean across heads
-        mean_scores = window_scores.mean(dim=1)  # [B, W_total]
+        # 1. Reduce the head axis → [B, W_total]. Optionally pool query heads
+        #    within their GQA group first (the query heads sharing one KV head
+        #    must keep the same tokens, so with "max" the group keeps what its
+        #    most-demanding member needs), then apply an Lp power-mean across the
+        #    resulting heads. With head_group_pool="none" and score_p_head=1.0
+        #    this is exactly window_scores.mean(dim=1).
+        mean_scores = self._reduce_heads(window_scores)  # [B, W_total]
 
         # 2. Slice to evictable window range [0, evictable_w)
         evictable_scores = mean_scores[:, :evictable_w]  # [B, evictable_w]

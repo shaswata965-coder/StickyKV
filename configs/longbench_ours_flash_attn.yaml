@@ -27,6 +27,8 @@ cache:
   num_sink_tokens: 4
   local_window_size: 0.25                   # ratio of post-sink region
   score_p: 1.0                              # Lp-norm exponent (query pooling, prefill+decode); 1=H2O sum, sweep {2,3,4}
+  score_p_head: 1.0                         # Lp exponent for cross-head pooling at eviction; 1=plain mean, sweep {3,4,8}
+  head_group_pool: none                     # intra-GQA-group reduction before cross-head pooling: none | max | mean
 
 telemetry:
   track_scores: false                       # mandatory; see prompt 04 §1

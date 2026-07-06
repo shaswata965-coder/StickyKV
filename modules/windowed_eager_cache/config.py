@@ -35,6 +35,9 @@ class ResolvedConfig:
     total_budget_bytes: int
     total_budget_tokens: int
     score_p: float = 1.0    # Lp-norm exponent for query pooling (prefill + decode)
+    score_p_head: float = 1.0   # Lp-norm exponent for cross-head pooling at eviction
+    head_group_pool: str = "none"   # intra-GQA-group reduction: "none" | "max" | "mean"
+    num_key_value_groups: int = 1   # H_q // H_kv (GQA fan-out), for group-aware pooling
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,23 @@ class WindowedCacheConfig:
         attended diffusely by many; because the largest term dominates the
         power-sum, a strong early spike is guarded against dilution by later
         diffuse attention.
+    score_p_head : float
+        Exponent for Lp power-mean pooling **across attention heads** at
+        eviction, the head-axis analogue of ``score_p``.  The retain decision
+        reduces the per-head window scores ``[B, H, W]`` to ``[B, W]`` via
+        ``(mean_h s_h^p)^(1/p)``.  ``p = 1`` (default) is the plain mean over
+        heads and is byte-identical to the prior behaviour; ``p > 1`` up-weights
+        the heads that express a sharp preference for a window (retrieval heads)
+        so a single head's evidence is not averaged away by many diffuse heads;
+        ``p -> inf`` approaches a max over heads.
+    head_group_pool : str
+        Intra-GQA-group reduction applied **before** the cross-head power-mean:
+        one of ``"none"`` | ``"max"`` | ``"mean"``.  The ``num_key_value_groups``
+        query heads that share one KV head must keep the same tokens, so with
+        ``"max"`` the group keeps what its most-demanding member needs (the
+        query -> KV-group -> global reduction that respects GQA sharing).
+        ``"none"`` (default) pools all query heads flat; combined with
+        ``score_p_head = 1.0`` this is exactly ``mean(dim=1)``.
 
     Notes
     -----
@@ -94,6 +114,8 @@ class WindowedCacheConfig:
     cache_budget: float
     track_scores: bool = False
     score_p: float = 1.0
+    score_p_head: float = 1.0
+    head_group_pool: str = "none"
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -179,6 +201,30 @@ class WindowedCacheConfig:
         # Normalize to float so the downstream pow() exponent is unambiguous.
         self.score_p = float(self.score_p)
 
+        # -- score_p_head (cross-head Lp exponent; mirrors score_p) --
+        if isinstance(self.score_p_head, bool):
+            raise ValueError(
+                f"score_p_head must be a number >= 1, got bool {self.score_p_head!r}"
+            )
+        if not isinstance(self.score_p_head, (int, float)):
+            raise ValueError(
+                f"score_p_head must be int or float, got "
+                f"{type(self.score_p_head).__name__}"
+            )
+        if self.score_p_head < 1.0:
+            raise ValueError(
+                f"score_p_head must be >= 1 (p=1 is the plain mean over heads), "
+                f"got {self.score_p_head}"
+            )
+        self.score_p_head = float(self.score_p_head)
+
+        # -- head_group_pool (intra-GQA-group reduction) --
+        if self.head_group_pool not in ("none", "max", "mean"):
+            raise ValueError(
+                f"head_group_pool must be one of 'none' | 'max' | 'mean', got "
+                f"{self.head_group_pool!r}"
+            )
+
     # -----------------------------------------------------------------
     # resolve() — pure function, no mutation
     # -----------------------------------------------------------------
@@ -229,6 +275,14 @@ class WindowedCacheConfig:
                 )
             head_dim = hidden // num_heads
 
+        # GQA fan-out: how many query heads share each KV head. Used by the
+        # eviction policy's group-aware head pooling. Falls back to 1 (MHA / no
+        # grouping) when the model does not expose num_attention_heads.
+        num_attn_heads = getattr(model_config, "num_attention_heads", num_kv_heads)
+        num_kv_groups = (
+            max(1, num_attn_heads // num_kv_heads) if num_kv_heads else 1
+        )
+
         element_size = torch.tensor([], dtype=kv_dtype).element_size()
         # K + V, each shaped [num_kv_heads, head_dim] per token
         bytes_per_token = num_kv_heads * head_dim * element_size * 2
@@ -273,4 +327,7 @@ class WindowedCacheConfig:
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
             score_p=self.score_p,
+            score_p_head=self.score_p_head,
+            head_group_pool=self.head_group_pool,
+            num_key_value_groups=num_kv_groups,
         )
