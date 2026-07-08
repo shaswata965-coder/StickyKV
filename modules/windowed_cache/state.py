@@ -37,11 +37,19 @@ class CacheState:
         Stays identity before the first eviction; gathered per row alongside
         ``window_scores`` at every subsequent eviction so that compact
         top-K indices can be translated back to original positions for
-        faithful Jaccard comparison.
+        faithful Jaccard comparison.  With a live Q tier this is the
+        **merged** window axis (design §5): every surviving window from both
+        tiers, sorted chronologically.
+    fp_tier_mask : Tensor
+        Shape ``[B, W]``, bool.  ``True`` where the merged-axis window lives
+        in the fp store (its tokens are physically here), ``False`` where it
+        lives in the int4 Q store (resolved through the ledger, never through
+        a token gather).  ``None`` on the single-tier path (``quant_ratio=0``)
+        — the legacy behaviour is untouched.
     """
 
     __slots__ = ("key_states", "value_states", "position_ids",
-                 "window_scores", "original_window_ids")
+                 "window_scores", "original_window_ids", "fp_tier_mask")
 
     def __init__(self) -> None:
         self.key_states: Optional[Tensor] = None
@@ -49,6 +57,7 @@ class CacheState:
         self.position_ids: Optional[Tensor] = None
         self.window_scores: Optional[Tensor] = None
         self.original_window_ids: Optional[Tensor] = None
+        self.fp_tier_mask: Optional[Tensor] = None
 
     # -----------------------------------------------------------------
     # seq_length property
@@ -166,8 +175,9 @@ class CacheState:
         self,
         rope_module: torch.nn.Module,
         old_position_ids: Tensor,
+        new_position_ids: Optional[Tensor] = None,
     ) -> None:
-        """Strip old RoPE rotation and re-apply with contiguous positions.
+        """Strip old RoPE rotation and re-apply at new positions.
 
         Uses the model's own ``apply_rotary_pos_emb`` to preserve NTK / YaRN
         scaling.  Values are **not** rotated (RoPE applies to keys only in
@@ -181,6 +191,15 @@ class CacheState:
             Shape ``[B, T_retained]`` (per row), or ``[T_retained]`` (shared
             across the batch, broadcast).  The original positions before
             compaction.
+        new_position_ids : Tensor, optional
+            Explicit target positions, ``[B, T_retained]`` or ``[T_retained]``
+            (broadcast).  ``None`` (default, the single-tier path) rebases to
+            contiguous ``arange(T_retained)``.  The two-tier eviction passes
+            the fp tier's slots in the **interleaved** position map (design §5
+            step 5), which are gappy where Q windows sit — and the trailing
+            ``position_ids`` bookkeeping is then set to those gappy positions,
+            NOT ``arange``, so the next eviction snapshots correct "old"
+            angles.
         """
         # Lazy import to avoid circular deps at module level
         try:
@@ -207,12 +226,18 @@ class CacheState:
             self.key_states, self.key_states, cos_old, -sin_old
         )
 
-        # New contiguous positions (same for every row)
-        new_pos = (
-            torch.arange(T_retained, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
+        # Target positions: explicit (two-tier interleaved slots, possibly
+        # gappy) or the default contiguous rebase (same for every row).
+        if new_position_ids is None:
+            new_pos = (
+                torch.arange(T_retained, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(B, -1)
+            )
+        else:
+            new_pos = new_position_ids.to(device)
+            if new_pos.dim() == 1:
+                new_pos = new_pos.unsqueeze(0).expand(B, -1)
         cos_new, sin_new = rope_module(self.value_states, new_pos)
 
         # Apply new rotation
@@ -221,12 +246,8 @@ class CacheState:
         )
 
         self.key_states = k_rerotated
-        # Keys now live at contiguous positions [0..T_retained-1]; keep the
-        # bookkeeping in sync (slice_and_keep left the *original* positions) so
-        # a subsequent eviction snapshots correct "old" positions.
-        self.position_ids = (
-            torch.arange(T_retained, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(B, -1)
-            .contiguous()
-        )
+        # Keys now live at new_pos; keep the bookkeeping in sync
+        # (slice_and_keep left the *original* positions) so a subsequent
+        # eviction snapshots correct "old" positions. With explicit target
+        # positions this stores the interleaved (gappy) fp positions.
+        self.position_ids = new_pos.contiguous().clone()

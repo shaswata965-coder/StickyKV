@@ -35,6 +35,10 @@ class ResolvedConfig:
     total_budget_bytes: int
     total_budget_tokens: int
     score_p: float = 1.0    # Lp-norm exponent for query pooling (prefill + decode)
+    # -- two-tier quantization (design.md §7); all-zero when the feature is off --
+    quant_ratio: float = 0.0   # q — fraction of the MEMORY budget given to int4
+    top_q_windows: int = 0     # N_q — int4-tier window capacity (from b_q, not b_fp)
+    quant_window_bytes: int = 0  # b_q — bytes per int4 window incl. fp16 scale/zero
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,17 @@ class WindowedCacheConfig:
         attended diffusely by many; because the largest term dominates the
         power-sum, a strong early spike is guarded against dilution by later
         diffuse attention.
+    quant_ratio : float
+        ``q`` — fraction of the **memory** budget (not the window count) given
+        to the int4 Q tier (design.md §7): ``M_fp = (1−q)·M_budget``,
+        ``M_q = q·M_budget``, ``N_q = M_q / b_q`` with ``b_q`` the int4 window
+        byte cost (packed K+V codes **plus** the fp16 key and value scale/zero
+        overhead). ``q = 0`` (default) disables the Q tier entirely — the cache
+        is byte-identical to the single-tier behaviour. Sink + local windows
+        always stay inside the fp share. Bit-width is fixed at 4 and the quant
+        group is the eviction window in v1; scale dtype is fixed fp16 (§2) —
+        none of these are knobs. Requires an even ``window_size`` (nibble
+        packing pairs 2 tokens per byte).
 
     Notes
     -----
@@ -94,6 +109,7 @@ class WindowedCacheConfig:
     cache_budget: float
     track_scores: bool = False
     score_p: float = 1.0
+    quant_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -179,6 +195,29 @@ class WindowedCacheConfig:
         # Normalize to float so the downstream pow() exponent is unambiguous.
         self.score_p = float(self.score_p)
 
+        # -- quant_ratio (Q-tier memory fraction; bool rejected, [0, 1)) --
+        if isinstance(self.quant_ratio, bool):
+            raise ValueError(
+                f"quant_ratio must be a number in [0, 1), got bool "
+                f"{self.quant_ratio!r}"
+            )
+        if not isinstance(self.quant_ratio, (int, float)):
+            raise ValueError(
+                f"quant_ratio must be int or float, got "
+                f"{type(self.quant_ratio).__name__}"
+            )
+        if not (0.0 <= self.quant_ratio < 1.0):
+            raise ValueError(
+                f"quant_ratio must be in [0, 1) — q = 1 leaves no fp budget "
+                f"for sink + local — got {self.quant_ratio}"
+            )
+        self.quant_ratio = float(self.quant_ratio)
+        if self.quant_ratio > 0.0 and self.window_size % 2 != 0:
+            raise ValueError(
+                f"quant_ratio > 0 requires an even window_size (int4 nibble "
+                f"packing pairs 2 tokens per byte), got {self.window_size}"
+            )
+
     # -----------------------------------------------------------------
     # resolve() — pure function, no mutation
     # -----------------------------------------------------------------
@@ -237,6 +276,29 @@ class WindowedCacheConfig:
         total_budget_bytes = int(self.cache_budget * (prefill_len + max_tokens) * bytes_per_token)
         total_budget_tokens = total_budget_bytes // bytes_per_token
 
+        # Two-tier split (design.md §7): the MEMORY budget is divided
+        # M_fp = (1−q)·M_budget / M_q = q·M_budget. Sink + local live inside
+        # M_fp. With q = 0 the fp share IS the whole budget — every value below
+        # reduces to the single-tier arithmetic bit-for-bit.
+        q = self.quant_ratio
+        fp_budget_bytes = (
+            total_budget_bytes if q == 0.0 else int((1.0 - q) * total_budget_bytes)
+        )
+        q_budget_bytes = total_budget_bytes - fp_budget_bytes
+        fp_budget_tokens = fp_budget_bytes // bytes_per_token
+
+        # b_q — bytes per int4 window: packed K+V codes at 2 codes/byte
+        # (H_kv·D·S/2 each) plus the pinned fp16 scale/zero pairs — per
+        # (head, channel) for keys, per (head, token) for values (§2, §7).
+        # The resolver MUST use b_q, not b_fp, for the Q tier: the int4 tier
+        # holds ~4× the windows of equal fp memory (minus scale overhead).
+        quant_window_bytes = (
+            num_kv_heads * head_dim * self.window_size      # packed int4 K + V
+            + 4 * num_kv_heads * head_dim                   # key scale+zero, fp16
+            + 4 * num_kv_heads * self.window_size           # value scale+zero, fp16
+        )
+        top_q_windows = 0 if q == 0.0 else q_budget_bytes // quant_window_bytes
+
         # Resolve local_window_size to concrete int.
         # Float local_window_size is a fraction of the CACHE BUDGET (not the
         # full post-sink context): local ~= ratio * total_budget_tokens, then
@@ -244,8 +306,10 @@ class WindowedCacheConfig:
         # region can never exceed the budget. (The previous post-sink-relative
         # formula could make the local region alone larger than the whole
         # budget, which either crashed resolve() or starved top-K retention.)
+        # A float ratio resolves against the FP share of the budget (== the
+        # whole budget when q = 0), since sink + local must fit inside M_fp.
         if isinstance(self.local_window_size, float):
-            raw = self.local_window_size * total_budget_tokens
+            raw = self.local_window_size * fp_budget_tokens
             ceiled = math.ceil(raw)
             remainder = ceiled % self.window_size
             if remainder != 0:
@@ -254,13 +318,19 @@ class WindowedCacheConfig:
         else:
             local_tokens = self.local_window_size
 
-        # Top-K evictable windows
-        remaining = total_budget_tokens - self.num_sink_tokens - local_tokens
+        # Top-K evictable fp windows (sink + local stay inside the fp share)
+        remaining = fp_budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
+            tier = "total_budget_tokens" if q == 0.0 else "fp share of the budget"
+            hint = (
+                "Increase cache_budget or reduce sink/local sizes."
+                if q == 0.0
+                else "Increase cache_budget, lower quant_ratio, or reduce sink/local sizes."
+            )
             raise ValueError(
-                f"total_budget_tokens ({total_budget_tokens}) < "
+                f"{tier} ({fp_budget_tokens}) < "
                 f"num_sink_tokens ({self.num_sink_tokens}) + local_tokens ({local_tokens}). "
-                f"Increase cache_budget or reduce sink/local sizes."
+                f"{hint}"
             )
         top_k_windows = remaining // self.window_size
 
@@ -273,4 +343,7 @@ class WindowedCacheConfig:
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
             score_p=self.score_p,
+            quant_ratio=q,
+            top_q_windows=top_q_windows,
+            quant_window_bytes=quant_window_bytes if q > 0.0 else 0,
         )

@@ -214,9 +214,14 @@ def install_score_hooks(
                         warned_once[0] = True
                     return
 
-                # Keys: already RoPE-applied and appended by cache.update()
-                # earlier in this same forward pass.
-                k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
+                # Keys: appended by cache.update() earlier in this same
+                # forward pass. Sourced as the EFFECTIVE keys (design §8, §9):
+                # with a live int4 Q tier the raw fp key_states would miss the
+                # Q windows and the chronological interleaving, so the aux
+                # SDPA must score the materialized merged-axis keys — the same
+                # tensor the model just attended over. Single-tier runs get
+                # the raw fp keys back unchanged.
+                k_current = cache.get_effective_keys(lidx)  # [B, H_kv, S, D]
                 if k_current is None:
                     return
 

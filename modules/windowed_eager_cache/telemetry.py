@@ -75,6 +75,35 @@ class Telemetry:
             "position_ids": position_ids.detach().cpu().clone(),
         })
 
+    def record_tier_events(
+        self,
+        layer_idx: int,
+        step: int,
+        promoted: int,
+        demoted: int,
+        reactivated: int,
+        dropped: int,
+        dormant_entries: int,
+        active_q_windows: int,
+    ) -> None:
+        """Record two-tier boundary-crossing counters for one eviction.
+
+        Promotion-frequency telemetry instruments the score-feedback risk of
+        full bidirectional promotion (design §10); ``reactivated`` counts the
+        demotions served from dormant ledger entries (i.e. with zero
+        re-quantization), and ``dormant_entries`` sizes the freeable
+        codes-retention overhead (design §6).
+        """
+        self._records[layer_idx].append({
+            "step": step,
+            "tier_promoted": promoted,
+            "tier_demoted": demoted,
+            "tier_reactivated": reactivated,
+            "tier_dropped": dropped,
+            "tier_dormant_entries": dormant_entries,
+            "tier_active_q_windows": active_q_windows,
+        })
+
     def get_records(self, layer_idx: int) -> List[Dict[str, Any]]:
         """Return all recorded snapshots for a layer."""
         return self._records.get(layer_idx, [])
@@ -97,6 +126,9 @@ class NullTelemetry(Telemetry):
         """No-op."""
 
     def record_cache_state(self, *args: Any, **kwargs: Any) -> None:
+        """No-op."""
+
+    def record_tier_events(self, *args: Any, **kwargs: Any) -> None:
         """No-op."""
 
     def get_records(self, layer_idx: int) -> List[Dict[str, Any]]:

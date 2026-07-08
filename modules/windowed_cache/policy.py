@@ -7,7 +7,7 @@ to ``compute_retain_window_indices``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -31,6 +31,7 @@ class EvictionPolicy:
         self.local_tokens: int = resolved.local_tokens
         self.local_windows: int = resolved.local_tokens // resolved.window_size
         self.top_k_windows: int = resolved.top_k_windows
+        self.top_q_windows: int = resolved.top_q_windows
         self.total_tokens: int = 0
 
     # -----------------------------------------------------------------
@@ -146,21 +147,90 @@ class EvictionPolicy:
         return retained
 
     # -----------------------------------------------------------------
+    # Retain indices — two-tier (fp16 + int4) window granularity
+    # -----------------------------------------------------------------
+
+    def compute_tier_assignments(
+        self, window_scores: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Two-tier retain decision on the **merged** window axis (design §5
+        steps 1–2).
+
+        Ranks the evictable band once and splits the ranking: the top
+        ``top_k_windows`` (plus the protected local windows) go to the fp
+        tier; the **next** ``top_q_windows`` go to the int4 Q tier; the rest
+        are dropped. Pure score-ranking arithmetic — no dequantization is
+        needed for the decision (design §3).
+
+        Parameters
+        ----------
+        window_scores : Tensor
+            Shape ``[B, H_q, W_total]`` on the merged window axis.
+
+        Returns
+        -------
+        (fp_retained, q_retained) : Tuple[Tensor, Tensor]
+            ``[B, W_fp]`` and ``[B, W_q]`` merged-axis window indices, each
+            sorted chronologically per row.  ``fp_retained`` includes the
+            local windows.
+        """
+        B = window_scores.shape[0]
+        W_total = window_scores.shape[2]
+        device = window_scores.device
+
+        local_w = min(self.local_windows, W_total)
+        evictable_w = W_total - local_w
+
+        local_idx = torch.arange(
+            W_total - local_w, W_total, device=device, dtype=torch.long
+        ).unsqueeze(0).expand(B, -1)
+
+        k_fp = min(self.top_k_windows, evictable_w)
+        k_q = min(self.top_q_windows, evictable_w - k_fp)
+        empty = torch.empty(B, 0, device=device, dtype=torch.long)
+
+        if evictable_w == 0 or (k_fp == 0 and k_q == 0):
+            return local_idx, empty
+
+        mean_scores = window_scores.mean(dim=1)          # [B, W_total]
+        evictable_scores = mean_scores[:, :evictable_w]  # [B, evictable_w]
+
+        # One ranking, split at the tier boundary: topk is score-descending,
+        # so the first k_fp indices are the fp band, the next k_q the Q band.
+        _, top_idx = torch.topk(evictable_scores, k_fp + k_q, dim=-1)
+        fp_sorted, _ = torch.sort(top_idx[:, :k_fp], dim=-1)
+        q_sorted, _ = torch.sort(top_idx[:, k_fp:], dim=-1)
+
+        fp_retained = torch.cat([fp_sorted, local_idx], dim=-1)
+        return fp_retained, q_sorted
+
+    # -----------------------------------------------------------------
     # Retain indices — token granularity
     # -----------------------------------------------------------------
 
     def expand_to_token_indices(
-        self, retained_window_idx: Tensor
+        self, retained_window_idx: Tensor, total_tokens: Optional[int] = None
     ) -> Tensor:
         """Expand window indices to absolute token indices.
 
         Prepends sink prefix.  Trims trailing partial window via geometric
         cap computed without touching tensor data (Python int arithmetic).
 
+        Tier-aware use (design §5): with a live Q tier, merged-axis indices no
+        longer map to physical offsets by arithmetic alone.  The caller
+        translates the retained **fp partition** to fp-store window *ranks*
+        (cumsum over the fp-tier mask) and passes those ranks here together
+        with the explicit fp-store ``total_tokens`` cap; Q windows resolve
+        through the ledger and get **no** token gather.
+
         Parameters
         ----------
         retained_window_idx : Tensor
-            Shape ``[B, W_retained]``.
+            Shape ``[B, W_retained]`` — physical fp-store window indices
+            (identical to merged indices on the single-tier path).
+        total_tokens : int, optional
+            Token count bounding the store being indexed.  Defaults to
+            ``self.total_tokens`` (the single-tier path, byte-identical).
 
         Returns
         -------
@@ -169,6 +239,8 @@ class EvictionPolicy:
         """
         B, W_retained = retained_window_idx.shape
         device = retained_window_idx.device
+        if total_tokens is None:
+            total_tokens = self.total_tokens
 
         # Sink prefix [0, 1, ..., num_sink-1]
         sink_idx = torch.arange(
@@ -194,7 +266,7 @@ class EvictionPolicy:
 
         # Mask out indices that exceed the actual sequence length
         # (partial last window produces OOB token positions).
-        valid_mask = all_idx < self.total_tokens  # [B, total]
+        valid_mask = all_idx < total_tokens  # [B, total]
 
         # For batched gather we need rectangular tensors — count valid per row
         # and truncate to the minimum across the batch.

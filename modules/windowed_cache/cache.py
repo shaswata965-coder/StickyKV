@@ -20,6 +20,18 @@ try:
 except ImportError:
     _HFCacheBase = object  # type: ignore[assignment,misc]
 
+from modules.quant import (
+    QuantLedger,
+    QuantizedStore,
+    apply_rope_to_keys,
+    build_interleaved_position_map,
+    dequantize_key_windows,
+    dequantize_value_windows,
+    materialize_effective_kv,
+    quantize_key_windows,
+    quantize_value_windows,
+)
+
 from .config import ResolvedConfig, WindowedCacheConfig
 from .policy import EvictionPolicy
 from .scorer import accumulate
@@ -95,13 +107,60 @@ class WindowedCache(_HFCacheBase):
             i: {} for i in range(num_layers)
         }
 
+        # Two-tier quantization state (design.md §4–§6). One int4 store +
+        # per-window ledger per layer, from the SHARED modules.quant package.
+        # With quant_ratio = 0 these stay empty and every two-tier branch
+        # below is skipped — the single-tier path is untouched.
+        self._two_tier: bool = (
+            self.resolved.quant_ratio > 0.0 and self.resolved.top_q_windows > 0
+        )
+        self._q_stores: List[QuantizedStore] = [
+            QuantizedStore() for _ in range(num_layers)
+        ]
+        self._q_ledgers: List[QuantLedger] = [
+            QuantLedger(self.resolved.window_size) for _ in range(num_layers)
+        ]
+
     # -----------------------------------------------------------------
     # HF Cache interface
     # -----------------------------------------------------------------
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """Return current sequence length for *layer_idx*."""
-        return self._states[layer_idx].seq_length
+        """Return current sequence length for *layer_idx*.
+
+        With a live Q tier this is the **effective** length ``T_total``
+        (fp + Q tokens) — HF sizes the causal mask from it and the
+        position-override hook uses it as ``past_seen``, so reporting the
+        fp-only length would desync the query position from the effective
+        key count (design §5 step 7).
+        """
+        n = self._states[layer_idx].seq_length
+        if self._two_tier:
+            n += self._q_ledgers[layer_idx].active_tokens
+        return n
+
+    def get_effective_keys(self, layer_idx: int) -> Optional[Tensor]:
+        """Effective key tensor for *layer_idx* — both tiers, merged
+        chronologically (design §8, §9).
+
+        The flash score hook sources its auxiliary SDPA keys here: reading the
+        raw fp ``key_states`` would miss the Q windows and the interleaving.
+        On the single-tier path this is exactly the raw fp keys. The returned
+        tensor is freshly built (per-layer transient) — it does not alias the
+        stored fp cache when Q windows are active.
+        """
+        state = self._states[layer_idx]
+        if not self._two_tier or state.key_states is None:
+            return state.key_states
+        k_eff, _ = materialize_effective_kv(
+            state,
+            self._q_stores[layer_idx],
+            self._q_ledgers[layer_idx],
+            self.rope_module,
+            self.resolved.window_size,
+            keys_only=True,
+        )
+        return k_eff
 
     def get_max_length(self) -> Optional[int]:
         """Return ``None`` — windowed cache doesn't have a static max."""
@@ -176,6 +235,13 @@ class WindowedCache(_HFCacheBase):
                     .contiguous()
                 )
                 self._next_original_window_id[layer_idx] = W
+                if self._two_tier:
+                    # Merged-axis tier map: every window is born fp; windows
+                    # only enter the Q tier through eviction-time demotion.
+                    state.fp_tier_mask = torch.ones(
+                        B_w, W, dtype=torch.bool,
+                        device=new_window_scores.device,
+                    )
             else:
                 # Handle size mismatch: new scores may cover more windows
                 W_old = state.window_scores.shape[-1]
@@ -211,6 +277,18 @@ class WindowedCache(_HFCacheBase):
                             [state.original_window_ids, extra], dim=1
                         )
                         self._next_original_window_id[layer_idx] = start_id + n_extra
+                        if state.fp_tier_mask is not None:
+                            # New windows are always born in the fp tier.
+                            state.fp_tier_mask = torch.cat(
+                                [
+                                    state.fp_tier_mask,
+                                    torch.ones(
+                                        B_w, n_extra, dtype=torch.bool,
+                                        device=state.fp_tier_mask.device,
+                                    ),
+                                ],
+                                dim=1,
+                            )
                 elif W_new < W_old:
                     # Symmetric pad on the incoming scores so in-place += works
                     # without changing accumulate's contract. No
@@ -231,7 +309,10 @@ class WindowedCache(_HFCacheBase):
         step = self._generation_step[layer_idx]
         should_evict = not is_prefill and policy.should_evict(step)
 
-        if should_evict and state.window_scores is not None:
+        if should_evict and state.window_scores is not None and self._two_tier:
+            # Two-tier eviction cycle (design §5) — spans both tiers jointly.
+            self._evict_two_tier(layer_idx, step)
+        elif should_evict and state.window_scores is not None:
             B = state.key_states.shape[0]
             H_q = state.window_scores.shape[1]
 
@@ -302,8 +383,273 @@ class WindowedCache(_HFCacheBase):
         if not is_prefill:
             self._generation_step[layer_idx] = step + 1
 
-        # 5. Return
+        # 5. Return. With a live Q tier, the return is a freshly-built
+        # interleaved effective tensor (fp ‖ dequantized+RoPE'd Q windows in
+        # chronological order — design §5, §8), NOT the live fp cache: callers
+        # must not assume it aliases the stored key/value states. On the
+        # single-tier path (and before the first demotion) it is the live fp
+        # cache, exactly as before.
+        if self._two_tier:
+            return materialize_effective_kv(
+                state,
+                self._q_stores[layer_idx],
+                self._q_ledgers[layer_idx],
+                self.rope_module,
+                self.resolved.window_size,
+            )
         return state.key_states, state.value_states
+
+    # -----------------------------------------------------------------
+    # Two-tier eviction cycle (design.md §5)
+    # -----------------------------------------------------------------
+
+    def _evict_two_tier(self, layer_idx: int, step: int) -> None:
+        """Run one eviction spanning both tiers jointly (design §5 steps 1–7).
+
+        1. Rank all windows on the merged axis by accumulated scores.
+        2. Assign tiers: top ``N_fp`` (incl. sink+local) → fp, next ``N_q`` →
+           int4, rest dropped.
+        3. Move boundary-crossers — demote (un-rotate once, quantize against a
+           freshly-pinned fp16 grid, **or reactivate** the dormant ledger
+           entry: no re-quantization, ever), promote (dequantize, entry goes
+           dormant), drop (free the ledger entry).
+        4. Build the interleaved position map over ALL survivors.
+        5. Re-rotate the fp tier to its (gappy) slots in that map.
+        6. Update each Q window's ledger ``position_range`` — O(Q) int writes.
+        7. The query position follows ``get_seq_length() == T_total``.
+
+        B = 1 only in v1 (the read path is a per-row construct — design §10).
+        """
+        state = self._states[layer_idx]
+        policy = self._policies[layer_idx]
+        store = self._q_stores[layer_idx]
+        ledger = self._q_ledgers[layer_idx]
+        S = self.resolved.window_size
+        num_sink = self.resolved.num_sink_tokens
+
+        B = state.key_states.shape[0]
+        if B != 1:
+            raise NotImplementedError(
+                "Two-tier quantization (quant_ratio > 0) is batch-size-1 only "
+                "in v1; see the ragged-batching design before enabling B > 1."
+            )
+        H_q = state.window_scores.shape[1]
+        T_fp_old = state.seq_length
+
+        # Root the accumulated Lp power-sums for ranking (identical to the
+        # single-tier path; stored scores stay in power-space).
+        p = self.resolved.score_p
+        ranking_scores = (
+            state.window_scores if p == 1.0
+            else state.window_scores.pow(1.0 / p)
+        )
+
+        # 1–2. Rank on the merged axis, split into tiers.
+        fp_idx, q_idx = policy.compute_tier_assignments(ranking_scores)
+
+        owids = state.original_window_ids  # [1, W], ascending (chronological)
+        W = owids.shape[1]
+        device = owids.device
+        cur_fp = state.fp_tier_mask
+        if cur_fp is None:
+            cur_fp = torch.ones(B, W, dtype=torch.bool, device=device)
+
+        fp_sel = torch.zeros(B, W, dtype=torch.bool, device=device)
+        fp_sel[0, fp_idx[0]] = True
+        q_sel = torch.zeros(B, W, dtype=torch.bool, device=device)
+        q_sel[0, q_idx[0]] = True
+
+        stay_fp = cur_fp & fp_sel        # fp windows keeping their tier
+        demote = cur_fp & q_sel          # K→Q boundary-crossers
+        promote = (~cur_fp) & fp_sel     # Q→K boundary-crossers
+        stay_q = (~cur_fp) & q_sel       # Q windows keeping their tier
+        dropped = ~(fp_sel | q_sel)
+
+        # Old fp-store window rank of each merged window (valid where cur_fp):
+        # the fp windows' relative merged order equals their physical order,
+        # so rank is a cumsum over the fp-tier mask (design §5).
+        fp_rank = torch.cumsum(cur_fp.long(), dim=1) - 1  # [1, W]
+
+        # ---- 3a. Demotions (K→Q). First-time: un-rotate once + quantize
+        # against a freshly-pinned fp16 grid. Seen-before: reactivate the
+        # dormant entry — codes + grid reused, zero recompute (design §10).
+        demote_pos = demote[0].nonzero().view(-1)
+        demote_owids = owids[0, demote_pos].tolist()
+        fresh_sel = [i for i, owid in enumerate(demote_owids) if owid not in ledger]
+        n_reactivated = len(demote_owids) - len(fresh_sel)
+        for owid in demote_owids:
+            if owid in ledger:
+                ledger.reactivate(owid)
+        if fresh_sel:
+            fresh_ranks = fp_rank[0, demote_pos[fresh_sel]]     # [n_f]
+            offs = torch.arange(S, device=device, dtype=torch.long)
+            dem_tok = (
+                num_sink + fresh_ranks.unsqueeze(-1) * S + offs
+            ).view(-1)                                          # [n_f * S]
+            dem_tok_dev = dem_tok.to(state.key_states.device)
+            k_dem = state.key_states.index_select(2, dem_tok_dev)
+            v_dem = state.value_states.index_select(2, dem_tok_dev)
+            dem_old_pos = state.position_ids.index_select(
+                1, dem_tok.to(state.position_ids.device)
+            )
+            k_dem_pre = apply_rope_to_keys(
+                self.rope_module, k_dem, dem_old_pos, inverse=True
+            )
+            n_f = len(fresh_sel)
+            H_kv, D = k_dem.shape[1], k_dem.shape[3]
+            k_win = k_dem_pre[0].view(H_kv, n_f, S, D).permute(1, 0, 2, 3)
+            v_win = v_dem[0].view(H_kv, n_f, S, D).permute(1, 0, 2, 3)
+            first_slot = store.append(
+                *quantize_key_windows(k_win), *quantize_value_windows(v_win)
+            )
+            for i, owid in enumerate(
+                owids[0, demote_pos[fresh_sel]].tolist()
+            ):
+                ledger.add(owid, first_slot + i)
+
+        # ---- 3b. Promotions (Q→K): dequantize, keep the entry DORMANT
+        # (codes + pinned grid retained for a free future re-demotion).
+        prom_pos = promote[0].nonzero().view(-1)
+        prom_ids = owids[0, prom_pos]
+        n_prom = prom_ids.numel()
+        if n_prom > 0:
+            prom_slots = torch.tensor(
+                [ledger.entries[owid].slot for owid in prom_ids.tolist()],
+                dtype=torch.long,
+            )
+            # Dequantize into each store's own dtype (they can diverge if a
+            # non-dtype-faithful rope module promoted the keys).
+            k_prom_win = dequantize_key_windows(
+                *store.gather_keys(prom_slots),
+                out_dtype=state.key_states.dtype,
+            )  # [n_prom, H_kv, S, D] — pre-RoPE
+            v_prom_win = dequantize_value_windows(
+                *store.gather_values(prom_slots),
+                out_dtype=state.value_states.dtype,
+            )
+            for owid in prom_ids.tolist():
+                ledger.deactivate(owid)
+
+        # ---- 3c. Drops: free ledger entries (active Q windows dropped, and
+        # dormant entries whose fp window is dropped outright), then compact
+        # the Q store so it stays gap-free (ledger slots shift with it).
+        n_ledger_dropped = 0
+        for owid in owids[0, dropped[0].nonzero().view(-1)].tolist():
+            if owid in ledger:
+                ledger.drop(owid)
+                n_ledger_dropped += 1
+        if n_ledger_dropped > 0:
+            store.compact(ledger.compact_store_slots())
+
+        # ---- 4. Interleaved position map over ALL survivors, both tiers,
+        # sorted by original_window_id (design §5 step 4). The trailing local
+        # window may be partial; it is always fp and always the newest.
+        fp_ids_new = owids[stay_fp | promote].view(1, -1)
+        q_ids_new = owids[stay_q | demote].view(1, -1)
+        tail = (T_fp_old - num_sink) % S
+        fp_positions, q_starts = build_interleaved_position_map(
+            fp_ids_new, q_ids_new, S, num_sink,
+            fp_tail_len=None if tail == 0 else tail,
+        )
+
+        # ---- 6. Ledger position_range update — O(Q_windows) integer writes,
+        # no tensor movement, no re-quant (design §5 step 6).
+        ledger.set_position_starts(
+            q_ids_new[0].tolist(), q_starts[0].tolist()
+        )
+
+        # ---- 5. Rebuild the fp store. Gather the tokens of windows STAYING
+        # fp (tier-aware expansion: fp-store ranks, explicit fp token cap;
+        # Q windows get no token gather — design §5).
+        stay_ranks = fp_rank[stay_fp].view(1, -1)
+        retain_token_idx = policy.expand_to_token_indices(
+            stay_ranks, total_tokens=T_fp_old
+        )
+
+        self.telemetry.record_scores(
+            layer_idx, step, ranking_scores, retain_token_idx
+        )
+
+        old_positions = torch.gather(
+            state.position_ids, 1,
+            retain_token_idx.to(state.position_ids.device),
+        ).clone()
+        state.slice_and_keep(retain_token_idx)
+
+        if n_prom == 0:
+            # Re-rotate survivors straight to their interleaved (gappy) slots;
+            # position_ids bookkeeping becomes those gappy positions.
+            state.rerotate_keys(
+                self.rope_module, old_positions, new_position_ids=fp_positions
+            )
+        else:
+            # Splice the promoted windows in chronologically: un-rotate the
+            # survivors once, merge with the promoted PRE-RoPE windows by
+            # original_window_id, then rotate everything at the interleaved fp
+            # positions in a single pass.
+            k_surv_pre = apply_rope_to_keys(
+                self.rope_module, state.key_states, old_positions, inverse=True
+            )
+            H_kv, D = k_surv_pre.shape[1], k_surv_pre.shape[3]
+            k_prom_flat = (
+                k_prom_win.permute(1, 0, 2, 3).reshape(1, H_kv, n_prom * S, D)
+            )
+            v_prom_flat = (
+                v_prom_win.permute(1, 0, 2, 3).reshape(1, H_kv, n_prom * S, D)
+            )
+            # Per-token sort keys: sink first (-1), then window id; stable so
+            # within-window token order is preserved.
+            stay_ids = owids[stay_fp].view(-1)
+            sizes = torch.full(
+                (stay_ids.numel(),), S, dtype=torch.long, device=device
+            )
+            if tail != 0:
+                sizes[-1] = tail  # newest window is always fp and last
+            tok_ids = torch.cat([
+                torch.full((num_sink,), -1, dtype=torch.long, device=device),
+                torch.repeat_interleave(stay_ids, sizes),
+                torch.repeat_interleave(prom_ids.view(-1), S),
+            ])
+            order = torch.argsort(tok_ids, stable=True).to(
+                state.key_states.device
+            )
+            k_pre_all = torch.cat([k_surv_pre, k_prom_flat], dim=2
+                                  ).index_select(2, order)
+            v_all = torch.cat([state.value_states, v_prom_flat], dim=2
+                              ).index_select(2, order)
+            state.key_states = apply_rope_to_keys(
+                self.rope_module, k_pre_all, fp_positions
+            )
+            state.value_states = v_all.contiguous()
+            state.position_ids = fp_positions.contiguous().clone()
+
+        # ---- Merged-axis bookkeeping: scores / ids / tier mask gathered to
+        # the survivors of BOTH tiers (ascending = chronological).
+        keep_idx = (fp_sel | q_sel)[0].nonzero().view(1, -1)
+        idx_w = keep_idx.unsqueeze(1).expand(B, H_q, -1)
+        state.window_scores = torch.gather(
+            state.window_scores, dim=-1, index=idx_w
+        ).contiguous()
+        state.original_window_ids = torch.gather(
+            owids, 1, keep_idx
+        ).contiguous()
+        state.fp_tier_mask = torch.gather(fp_sel, 1, keep_idx).contiguous()
+
+        # ---- 7. Effective totals: policy tracks T_total (fp + Q), matching
+        # get_seq_length() and the query-position override.
+        policy.set_total_after_compaction(
+            state.seq_length + ledger.active_tokens
+        )
+
+        self.telemetry.record_tier_events(
+            layer_idx, step,
+            promoted=n_prom,
+            demoted=len(demote_owids),
+            reactivated=n_reactivated,
+            dropped=int(dropped.sum().item()),
+            dormant_entries=ledger.dormant_count,
+            active_q_windows=ledger.active_count,
+        )
 
     def reorder_cache(self, beam_idx: Tensor) -> None:
         """Beam search is out of scope (v1)."""

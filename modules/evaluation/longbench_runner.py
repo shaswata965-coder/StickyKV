@@ -465,6 +465,7 @@ class LongBenchRunner:
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
             score_p=cfg.cache.score_p,
+            quant_ratio=cfg.cache.quant_ratio,
         )
 
         # Get RoPE module

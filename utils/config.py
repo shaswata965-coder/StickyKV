@@ -48,6 +48,7 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     score_p: float = 1.0  # Lp-norm exponent for query pooling (p=1 = plain H2O sum)
+    quant_ratio: float = 0.0  # int4 Q-tier share of the memory budget; 0 = tier off
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -108,6 +109,30 @@ class CacheConfig:
                 f"score_p must be >= 1 (p=1 is plain-sum / H2O), got {self.score_p}"
             )
         self.score_p = float(self.score_p)
+
+        # -- quant_ratio (int4 Q-tier memory fraction; mirrors
+        # WindowedCacheConfig: bool rejected, [0, 1), even window_size) --
+        if isinstance(self.quant_ratio, bool):
+            raise ConfigValidationError(
+                f"quant_ratio must be a number in [0, 1), got bool "
+                f"{self.quant_ratio!r}"
+            )
+        if not isinstance(self.quant_ratio, (int, float)):
+            raise ConfigValidationError(
+                f"quant_ratio must be int or float, got "
+                f"{type(self.quant_ratio).__name__}"
+            )
+        if not (0.0 <= self.quant_ratio < 1.0):
+            raise ConfigValidationError(
+                f"quant_ratio must be in [0, 1) — q = 1 leaves no fp budget "
+                f"for sink + local — got {self.quant_ratio}"
+            )
+        self.quant_ratio = float(self.quant_ratio)
+        if self.quant_ratio > 0.0 and self.window_size % 2 != 0:
+            raise ConfigValidationError(
+                f"quant_ratio > 0 requires an even window_size (int4 nibble "
+                f"packing pairs 2 tokens per byte), got {self.window_size}"
+            )
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.

@@ -28,6 +28,13 @@ C:\StickyKV/
 │   └── article_registry.py         # SHA-based article identity tracking
 │
 ├── modules/                         # Core implementation modules
+│   ├── quant/                       # Shared two-tier int4 quantization (imported by BOTH backends)
+│   │   ├── quantizer.py             # KIVI-style affine int4 quantizer, fp16-pinned grids, nibble packing
+│   │   ├── store.py                 # QuantizedStore — dense gap-free code store per layer
+│   │   ├── ledger.py                # QuantLedger — per-window entries, dormant reactivation
+│   │   ├── positions.py             # build_interleaved_position_map() — joint two-tier compaction map
+│   │   └── effective.py             # materialize_effective_kv() — dequant + RoPE-at-read + interleave
+│   │
 │   ├── windowed_cache/              # Flash-attention backend (default)
 │   │   ├── cache.py                 # WindowedCache — HF Cache integration, orchestrates eviction
 │   │   ├── policy.py                # EvictionPolicy — top-K window selection, trigger logic
@@ -208,6 +215,17 @@ query's `position_ids`/`cache_position` to the compacted cache length each step
 **When to use which:**  
 Use eager on Kaggle T4/P100 or any machine without `flash-attn` installed.  
 Use flash-attn2 on A100/H100 for maximum throughput.
+
+### `modules/quant/` — shared two-tier int4 quantization (design.md §2–§8)
+
+A **single** package imported by both cache backends (never duplicated
+per-backend). Enabled by `cache.quant_ratio > 0` (default `0.0` = off, the
+legacy path is byte-identical). Windows not good enough for fp16 but too
+useful to drop are stored as int4 with per-window pinned fp16 scale/zero;
+keys are stored **pre-RoPE** and stamped at read with each window's current
+`position_range`. Codes are written exactly once per window lifetime —
+promotion leaves the ledger entry dormant, re-demotion reactivates it with
+zero recompute. See `tests/test_quant.py` and `tests/test_two_tier_cache.py`.
 
 ---
 
