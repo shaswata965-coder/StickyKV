@@ -278,12 +278,21 @@ class WindowConfig:
 
         remaining = budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
-            raise ConfigValidationError(
-                f"cache_budget={cache_budget} on prefill_len={prefill_len} + "
-                f"max_tokens={max_tokens} yields budget_tokens={budget_tokens}, which is "
-                f"less than num_sink_tokens ({self.num_sink_tokens}) + local_tokens "
-                f"({local_tokens}). Increase cache_budget or reduce sink/local sizes."
+            # sink + local is a structural floor. On an undersized example the
+            # budget can fall below it; degrade to the floor (top_k=0) and warn
+            # once rather than abort a long eval mid-run over one short example.
+            # See WindowedCacheConfig.resolve() for the same policy on the
+            # two-tier path.
+            log.warning(
+                "cache_budget=%s on prefill_len=%s + max_tokens=%s yields "
+                "budget_tokens=%s, which is less than num_sink_tokens (%s) + "
+                "local_tokens (%s). Keeping sink+local with top_k_windows=0 "
+                "(cache slightly exceeds the nominal budget for this example). "
+                "Increase cache_budget or reduce sink/local sizes to avoid this.",
+                cache_budget, prefill_len, max_tokens, budget_tokens,
+                self.num_sink_tokens, local_tokens,
             )
+            return 0
         return remaining // self.window_size
 
 

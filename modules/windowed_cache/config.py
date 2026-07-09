@@ -8,6 +8,7 @@ derived from byte-based budget accounting.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
@@ -318,21 +319,35 @@ class WindowedCacheConfig:
         else:
             local_tokens = self.local_window_size
 
-        # Top-K evictable fp windows (sink + local stay inside the fp share)
+        # Top-K evictable fp windows (sink + local stay inside the fp share).
+        # sink + local is a STRUCTURAL floor: sink tokens anchor attention and
+        # the local window carries recent context that generation depends on.
+        # On an undersized example (short prefill and/or aggressive
+        # cache_budget/quant_ratio) the fp share can shrink below that floor —
+        # note local_tokens snaps UP to a full window_size, so even a small
+        # ratio costs one whole window. Rather than abort (which would kill a
+        # long eval mid-run over one short example), degrade to the floor:
+        # keep sink + local with no evictable top-K windows. The fp tier then
+        # holds exactly sink + local, marginally exceeding the nominal token
+        # budget — unavoidable, since the floor cannot be represented in fewer
+        # tokens than it contains. Dropping local instead would strip recent
+        # context and wreck generation quality, so we keep it and warn once.
         remaining = fp_budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
             tier = "total_budget_tokens" if q == 0.0 else "fp share of the budget"
-            hint = (
-                "Increase cache_budget or reduce sink/local sizes."
-                if q == 0.0
-                else "Increase cache_budget, lower quant_ratio, or reduce sink/local sizes."
+            warnings.warn(
+                f"{tier} ({fp_budget_tokens}) < num_sink_tokens "
+                f"({self.num_sink_tokens}) + local_tokens ({local_tokens}); the "
+                f"budget cannot hold the sink+local floor. Keeping sink+local "
+                f"with top_k_windows=0 (fp tier slightly exceeds the nominal "
+                f"budget for this example). Increase cache_budget, lower "
+                f"quant_ratio, or reduce sink/local/window sizes to avoid this.",
+                RuntimeWarning,
+                stacklevel=2,
             )
-            raise ValueError(
-                f"{tier} ({fp_budget_tokens}) < "
-                f"num_sink_tokens ({self.num_sink_tokens}) + local_tokens ({local_tokens}). "
-                f"{hint}"
-            )
-        top_k_windows = remaining // self.window_size
+            top_k_windows = 0
+        else:
+            top_k_windows = remaining // self.window_size
 
         return ResolvedConfig(
             window_size=self.window_size,

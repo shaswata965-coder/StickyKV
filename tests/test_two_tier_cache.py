@@ -122,14 +122,19 @@ class TestTierResolver:
             cache_budget=0.40, quant_ratio=0.0,
         )
 
-    def test_fp_share_too_small_raises(self):
+    def test_fp_share_too_small_degrades_to_floor(self):
+        """When the fp share can't hold sink+local, resolve() warns and keeps
+        the structural floor (top_k_windows=0) rather than aborting a long run."""
         model_cfg = _FakeModelConfig()
         cfg = WindowedCacheConfig(
             window_size=8, num_sink_tokens=10, local_window_size=40,
             cache_budget=0.10, quant_ratio=0.9,
         )
-        with pytest.raises(ValueError, match="fp share"):
-            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        with pytest.warns(RuntimeWarning, match="fp share"):
+            resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        assert resolved.top_k_windows == 0
+        assert resolved.num_sink_tokens == 10
+        assert resolved.local_tokens == 40
 
 
 # ---------------------------------------------------------------------------

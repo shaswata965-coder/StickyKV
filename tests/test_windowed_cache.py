@@ -202,16 +202,20 @@ class TestConfig:
     # 7. test_cache_budget_smaller_than_protected_raises
     # -------------------------------------------------------------------
 
-    def test_cache_budget_smaller_than_protected_raises(self):
-        """Budget too small for sink + local → ValueError."""
+    def test_cache_budget_smaller_than_protected_degrades_to_floor(self):
+        """Budget too small for sink + local → warn and keep the floor
+        (top_k_windows=0) instead of aborting the run."""
         cfg = _make_config(
             cache_budget=0.05,
             num_sink_tokens=10,
             local_window_size=40,
         )
         model_cfg = _FakeModelConfig()
-        with pytest.raises(ValueError, match="total_budget_tokens"):
-            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        with pytest.warns(RuntimeWarning, match="total_budget_tokens"):
+            resolved = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        assert resolved.top_k_windows == 0
+        assert resolved.num_sink_tokens == 10
+        assert resolved.local_tokens == 40
 
     # -------------------------------------------------------------------
     # 8. test_cache_budget_zero_evictable_is_legal
