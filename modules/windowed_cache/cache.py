@@ -436,6 +436,67 @@ class WindowedCache(_HFCacheBase):
         H_q = state.window_scores.shape[1]
         T_fp_old = state.seq_length
 
+        # Reconcile the merged-axis bookkeeping with the physical fp store.
+        # The score hook scores each token on the NEXT forward pass, so the
+        # token(s) appended on the very step that triggers this eviction are
+        # already physically in the fp store (they are the newest local tokens)
+        # but are not yet represented in window_scores / original_window_ids /
+        # fp_tier_mask — the merged axis lags the store by however many windows
+        # those unscored tokens opened. Left unreconciled, the physical
+        # T_fp_old / tail (which count the untracked window) and the merged
+        # fp-window set disagree: build_interleaved_position_map shrinks the
+        # last tracked window to `tail` while expand_to_token_indices keeps it
+        # full, so the interleaved position map and the retained-token gather
+        # diverge and rerotate_keys crashes on the length mismatch. The missing
+        # windows are always the newest (highest owid) and always fp, so append
+        # them as zero-score fp windows (retained by locality, not by score).
+        phys_fp_windows = (
+            (T_fp_old - num_sink + S - 1) // S if T_fp_old > num_sink else 0
+        )
+        n_fp_tracked = (
+            int(state.fp_tier_mask.sum().item())
+            if state.fp_tier_mask is not None
+            else state.window_scores.shape[-1]
+        )
+        delta = phys_fp_windows - n_fp_tracked
+        if delta > 0:
+            B_w = state.window_scores.shape[0]
+            state.window_scores = torch.cat(
+                [
+                    state.window_scores,
+                    torch.zeros(
+                        B_w, H_q, delta,
+                        device=state.window_scores.device,
+                        dtype=state.window_scores.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+            start_id = self._next_original_window_id[layer_idx]
+            extra_ids = (
+                torch.arange(
+                    start_id, start_id + delta,
+                    device=state.original_window_ids.device, dtype=torch.long,
+                )
+                .unsqueeze(0)
+                .expand(state.original_window_ids.shape[0], -1)
+            )
+            state.original_window_ids = torch.cat(
+                [state.original_window_ids, extra_ids], dim=1
+            )
+            self._next_original_window_id[layer_idx] = start_id + delta
+            if state.fp_tier_mask is not None:
+                state.fp_tier_mask = torch.cat(
+                    [
+                        state.fp_tier_mask,
+                        torch.ones(
+                            state.fp_tier_mask.shape[0], delta,
+                            dtype=torch.bool, device=state.fp_tier_mask.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+
         # Root the accumulated Lp power-sums for ranking (identical to the
         # single-tier path; stored scores stay in power-space).
         p = self.resolved.score_p

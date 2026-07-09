@@ -956,3 +956,110 @@ class TestLongRunConsistency:
                 "window_scores": _sc(torch.rand(W).tolist()),
             })
             check(cache, k_eff)
+
+
+# ---------------------------------------------------------------------------
+# Score-hook lag reconciliation — regression for the merged-axis vs physical
+# store desync (fp positions / retained-token gather length mismatch).
+# ---------------------------------------------------------------------------
+
+
+class TestScoreLagReconciliation:
+    """The flash/eager score hooks score each token on the NEXT forward pass,
+    so the token appended on the very step that triggers an eviction is
+    physically in the fp store but not yet on the merged window axis. If that
+    unscored token opened a new window, `_evict_two_tier` used to mix the
+    physical `T_fp_old`/`tail` with the lagged merged fp-window set and the
+    interleaved position map diverged from the retained-token gather —
+    crashing `rerotate_keys` on a length mismatch. Feeding scores with the
+    realistic one-step lag reproduces it; the reconciliation fixes it.
+
+    The parametrized geometries below were verified to CRASH on the pre-fix
+    code (``rerotate_keys`` length mismatch); the accounting model config uses
+    ``head_dim == _D`` so the resolved tier sizes match the physical windows.
+    """
+
+    @dataclass
+    class _SmallModelConfig:
+        num_attention_heads: int = _H_Q
+        num_key_value_heads: int = _H_KV
+        hidden_size: int = _H_Q * _D
+        head_dim: int = _D
+        num_hidden_layers: int = 1
+
+    class _RealRoPESmall(torch.nn.Module):
+        def forward(self, x, position_ids):
+            D = x.shape[-1]
+            inv = 1.0 / (10000.0 ** (torch.arange(0, D, 2).float() / D))
+            ang = position_ids[..., :, None].float() * inv[None, None, :]
+            emb = torch.cat([ang, ang], dim=-1)
+            return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+
+    def _score_over_effective(self, cache, q, num_sink, S):
+        """Mimic the flash hook: aux SDPA over get_effective_keys → windows."""
+        import torch.nn.functional as F
+        from modules.windowed_cache.scorer import reduce_token_scores_to_windows
+        k = cache.get_effective_keys(0)
+        aw = torch.matmul(q, k.transpose(-2, -1)) * (_D ** -0.5)
+        aw = F.softmax(aw.float(), dim=-1).to(q.dtype)
+        return reduce_token_scores_to_windows(aw.sum(dim=-2), num_sink, S)
+
+    @pytest.mark.parametrize("prefill,num_sink", [(8, 0), (10, 2), (12, 0)])
+    def test_lagged_scores_survive_eviction(self, prefill, num_sink):
+        S = _S
+        cfg = WindowedCacheConfig(
+            window_size=S, num_sink_tokens=num_sink, local_window_size=0.5,
+            cache_budget=0.4, quant_ratio=0.5,
+        )
+        cache = WindowedCache(
+            config=cfg, prefill_len=prefill, model_config=self._SmallModelConfig(),
+            kv_dtype=torch.float32, rope_module=self._RealRoPESmall(),
+            num_layers=1, max_tokens=30,
+        )
+        assert cache.resolved.top_q_windows >= 1  # Q tier actually engages
+        assert cache.resolved.top_k_windows >= 1
+        torch.manual_seed(0)
+
+        def n_windows(t):
+            post = max(t - num_sink, 0)
+            return (post + S - 1) // S if post > 0 else 0
+
+        def check():
+            state = cache._states[0]
+            ledger = cache._q_ledgers[0]
+            t_eff = cache.get_seq_length(0)
+            assert t_eff == state.seq_length + ledger.active_tokens
+            # fp position_ids ∪ active ledger ranges tile arange(t_eff) exactly.
+            q_pos = []
+            for e in ledger.entries.values():
+                if e.active:
+                    q_pos.extend(range(e.position_start, e.position_start + S))
+            union = sorted(state.position_ids[0].tolist() + q_pos)
+            assert union == list(range(t_eff))
+            assert ledger.active_count <= cache.resolved.top_q_windows
+            # The merged fp-window count is reconciled DOWN to the physical
+            # store at eviction (never over-tracks it).
+            T_fp = state.seq_length
+            phys = (T_fp - num_sink + S - 1) // S if T_fp > num_sink else 0
+            assert int(state.fp_tier_mask.sum().item()) <= phys
+
+        # Prefill.
+        k = torch.randn(1, _H_KV, prefill, _D)
+        cache.update(k, k.clone(), 0, cache_kwargs={
+            "cache_position": torch.arange(prefill),
+            "window_scores": torch.rand(1, _H_Q, n_windows(prefill)),
+        })
+        # Hook fires AFTER update — one-step lag is the whole point.
+        q = torch.randn(1, _H_KV, 1, _D)
+        pending = self._score_over_effective(cache, q, num_sink, S)
+
+        for _ in range(30):
+            t = cache.get_seq_length(0)
+            k1 = torch.randn(1, _H_KV, 1, _D)
+            cache.update(k1, k1.clone(), 0, cache_kwargs={
+                "cache_position": torch.tensor([t]),
+                "window_scores": pending,
+            })
+            check()
+            q = torch.randn(1, _H_KV, 1, _D)
+            pending = self._score_over_effective(cache, q, num_sink, S)
