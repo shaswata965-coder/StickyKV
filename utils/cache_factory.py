@@ -32,16 +32,14 @@ _BACKEND_TO_ATTN_IMPL = {
 }
 
 # Highest transformers version the windowed KV cache is known-correct on.
-# RoPE positioning is no longer version-coupled: every eviction compacts AND
-# re-rotates surviving keys to contiguous positions, and a forward pre-hook
-# (utils.position_override) overrides the query's position to the compacted
-# cache length each step — set explicitly, so it does not depend on how HF
-# derives ``cache_position``. The remaining reason to pin <= 4.47.1 is a
-# SEPARATE incompatibility: transformers 5.x builds the causal mask via
+# Eviction compacts surviving keys but keeps their original RoPE rotation (no
+# strip/re-apply) and no longer overrides the query position, so correctness
+# relies on HF passing the query its natural monotonic (absolute) position — the
+# behaviour on <= 4.47.1. transformers 5.x also builds the causal mask via
 # ``create_causal_mask`` → ``Cache.get_mask_sizes()``, which ``WindowedCache``
 # does not implement, so a full-model forward crashes on 5.x (see the
-# "Environment caveat" in design.md). Until that mask-API gap is closed, refuse
-# to run on a newer version rather than crash mid-run.
+# "Environment caveat" in design.md). Until both are addressed, refuse to run on
+# a newer version rather than crash mid-run or produce wrong positions.
 MAX_SUPPORTED_TRANSFORMERS: Tuple[int, int, int] = (4, 47, 1)
 
 

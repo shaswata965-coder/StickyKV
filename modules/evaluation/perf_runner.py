@@ -125,13 +125,12 @@ class PerfRunner:
         cache_backend = c.get("cache_backend", "dynamic")
         cache_pkg = c.get("cache_package")
         budget = c.get("cache_budget")
-        # Windowed-cache setup: resolve classes + RoPE once, but DO NOT install
+        # Windowed-cache setup: resolve classes once, but DO NOT install
         # hooks here. Each warmup/measurement iteration creates a fresh cache,
         # so hooks must be (re)installed on the cache the model actually
         # receives, then removed before the next iteration.
         WC = WCC = install_hooks = None
         cc = None
-        rope = None
         if cache_backend == "windowed" and cache_pkg:
             from utils.cache_factory import (
                 assert_transformers_version_supported,
@@ -146,27 +145,12 @@ class PerfRunner:
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
                       cache_budget=budget if budget is not None else 0.5)
-            # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
-            for nm, mod in model.named_modules():
-                if "rotary" in nm.lower() or "rope" in nm.lower():
-                    rope = mod; break
-            if rope is None:
-                for nm, mod in model.named_modules():
-                    if hasattr(mod, "rotary_emb"):
-                        rope = mod.rotary_emb; break
-            if rope is None:
-                from utils.config import ConfigValidationError
-                raise ConfigValidationError(
-                    "Could not locate a RoPE module on the model. WindowedCache "
-                    "requires a rotary embedding module for key rerotation."
-                )
 
         def _make_windowed_cache():
             # Prefill-only perf measurement (single forward pass, no generation),
             # so no generation budget is needed.
             return WC(config=cc, prefill_len=prefill_len,
                       model_config=model.config, kv_dtype=torch_dtype,
-                      rope_module=rope,
                       num_layers=model.config.num_hidden_layers,
                       max_tokens=0)
 

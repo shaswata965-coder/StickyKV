@@ -466,24 +466,6 @@ class LongBenchRunner:
             cache_budget=budget,
         )
 
-        # Get RoPE module
-        rope = None
-        for name, mod in model.named_modules():
-            if "rotary" in name.lower() or "rope" in name.lower():
-                rope = mod
-                break
-        if rope is None:
-            for name, mod in model.named_modules():
-                if hasattr(mod, "rotary_emb"):
-                    rope = mod.rotary_emb
-                    break
-        if rope is None:
-            from utils.config import ConfigValidationError
-            raise ConfigValidationError(
-                "Could not locate a RoPE module on the model. WindowedCache "
-                "requires a rotary embedding module for key rerotation."
-            )
-
         dtypes = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
@@ -495,7 +477,6 @@ class LongBenchRunner:
             prefill_len=input_ids.shape[-1],
             model_config=model.config,
             kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
-            rope_module=rope,
             num_layers=model.config.num_hidden_layers,
             max_tokens=max_gen_len,
         )

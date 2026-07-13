@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
 from utils.cache_factory import get_cache_classes, validate_backend_attn_pairing
-from utils.config import ConfigValidationError, ExperimentConfig, ParityValidationError
+from utils.config import ExperimentConfig, ParityValidationError
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_string, sha256_tokenizer
 from utils.logger import get_logger
@@ -219,23 +219,6 @@ class OursParityRunner:
         model.eval()
         n_layers = model.config.num_hidden_layers
 
-        # Get rope module once
-        rope = None
-        for name, mod in model.named_modules():
-            if "rotary" in name.lower() or "rope" in name.lower():
-                rope = mod; break
-        if rope is None:
-            for name, mod in model.named_modules():
-                if hasattr(mod, "rotary_emb"):
-                    rope = mod.rotary_emb; break
-        if rope is None:
-            raise ConfigValidationError(
-                "Could not locate a RoPE module on the model. WindowedCache "
-                "requires a rotary embedding module for key rerotation; "
-                "expected a submodule named '*rotary*'/'*rope*' or any "
-                "module exposing a `.rotary_emb` attribute."
-            )
-
         # H2O-style cumulative scoring: no observation window — every query row contributes.
         # top_k_windows is derived from cache.cache_budget so the Jaccard signal slices
         # at exactly the K the production eviction policy actually keeps.
@@ -289,7 +272,6 @@ class OursParityRunner:
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
-                       rope_module=rope,
                        num_layers=n_layers,
                        max_tokens=gen_len)
             hooks = install_hooks(model, cache, cache_config)

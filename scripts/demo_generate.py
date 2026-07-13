@@ -108,21 +108,6 @@ def main() -> None:
     # ── 3. Build cache + hooks ────────────────────────────────────────
     print("[4/5] Building windowed cache …")
 
-    # Locate the RoPE module (needed for key rerotation after eviction)
-    rope = None
-    for name, mod in model.named_modules():
-        if "rotary" in name.lower() or "rope" in name.lower():
-            rope = mod
-            break
-    if rope is None:
-        for name, mod in model.named_modules():
-            if hasattr(mod, "rotary_emb"):
-                rope = mod.rotary_emb
-                break
-    if rope is None:
-        rope = torch.nn.Identity()
-        print("       ⚠ Could not find RoPE module; using Identity (keys won't be rerotated)")
-
     cache_config = WindowedCacheConfig(
         window_size=WINDOW_SIZE,
         num_sink_tokens=NUM_SINK,
@@ -134,7 +119,6 @@ def main() -> None:
         prefill_len=prefill_len,
         model_config=model.config,
         kv_dtype=DTYPE,
-        rope_module=rope,
         num_layers=n_layers,
         max_tokens=MAX_NEW_TOKENS,
     )

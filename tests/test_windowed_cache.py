@@ -1,4 +1,4 @@
-"""Tests for the flash-attn windowed cache package — 24 tests.
+"""Tests for the flash-attn windowed cache package.
 
 All tests run on CPU with mocked attention modules and synthetic data.
 No real model loads.
@@ -23,7 +23,6 @@ from modules.windowed_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_cache.state import CacheState
 from modules.windowed_cache.telemetry import NullTelemetry, Telemetry
 from modules.windowed_cache.hooks import HookHandles
-from utils.position_override import install_position_override_hook
 
 
 # ---------------------------------------------------------------------------
@@ -39,21 +38,6 @@ class _FakeModelConfig:
     hidden_size: int = 4096
     head_dim: int = 128
     num_hidden_layers: int = 32
-
-
-class _NoOpRoPE(torch.nn.Module):
-    """RoPE stub returning cos=1, sin=0 so ``rerotate_keys`` leaves key VALUES
-    unchanged (apply_rotary_pos_emb with cos=1/sin=0 is identity) while still
-    exercising the strip+reapply path and rebasing ``position_ids`` to
-    contiguous. Lets eviction tests assert token survival via key values AND the
-    contiguous position rebasing at once."""
-
-    def forward(self, x, position_ids):
-        seq_len = position_ids.shape[-1]
-        D = x.shape[-1]
-        cos = torch.ones(1, seq_len, D, dtype=x.dtype, device=x.device)
-        sin = torch.zeros(1, seq_len, D, dtype=x.dtype, device=x.device)
-        return cos, sin
 
 
 def _make_config(**overrides):
@@ -310,14 +294,14 @@ class TestScoring:
 class TestEviction:
 
     # -------------------------------------------------------------------
-    # 11. test_position_ids_rebased_to_contiguous_after_eviction
+    # 11. test_eviction_keeps_original_positions_and_keys
     # -------------------------------------------------------------------
 
-    def test_position_ids_rebased_to_contiguous_after_eviction(self):
-        """Eviction compacts THEN re-rotates (KVPress methodology, no
-        keep-original path): ``slice_and_keep`` yields the survivors' original
-        positions as an intermediate, then ``rerotate_keys`` rebases them to
-        contiguous ``arange(T_retained)``."""
+    def test_eviction_keeps_original_positions_and_keys(self):
+        """Eviction only compacts: survivors keep their ORIGINAL positions
+        (no rebasing to contiguous) and their key VALUES are untouched (RoPE is
+        never stripped or re-applied). ``CacheState`` no longer exposes a
+        ``rerotate_keys`` method."""
         state = CacheState()
         B, H, T, D = 1, 4, 20, 64
         state.key_states = torch.randn(B, H, T, D)
@@ -326,89 +310,18 @@ class TestEviction:
         state.position_ids = torch.arange(T).unsqueeze(0)
 
         retain = torch.tensor([[0, 1, 5, 10, 15, 19]])
-        old_positions = state.position_ids.gather(1, retain).clone()
+        survivor_keys = state.key_states.gather(
+            2, retain.unsqueeze(1).unsqueeze(3).expand(B, H, retain.shape[1], D)
+        ).clone()
+
         state.slice_and_keep(retain)
-        # Intermediate: slice_and_keep gathers the survivors' ORIGINAL positions.
+
+        # Positions stay at the survivors' ORIGINAL values (compacted, not rebased).
         assert torch.equal(state.position_ids, torch.tensor([[0, 1, 5, 10, 15, 19]]))
-
-        try:
-            state.rerotate_keys(_NoOpRoPE(), old_positions)
-        except ImportError:
-            pytest.skip("transformers not available for rerotation test")
-
-        # Final: positions rebased to contiguous arange(T_retained).
-        T_ret = retain.shape[1]
-        assert torch.equal(state.position_ids, torch.arange(T_ret).unsqueeze(0))
-
-    # -------------------------------------------------------------------
-    # 12. test_key_rerotation_uses_new_positions
-    # -------------------------------------------------------------------
-
-    def test_key_rerotation_uses_new_positions(self):
-        """After rerotation, keys should be different from before."""
-        state = CacheState()
-        B, H, T, D = 1, 4, 10, 64
-        state.key_states = torch.randn(B, H, T, D)
-        state.value_states = torch.randn(B, H, T, D)
-        state.position_ids = torch.arange(T)
-
-        old_keys = state.key_states.clone()
-        old_positions = torch.tensor([0, 2, 4, 6, 8, 10, 12, 14, 16, 18])
-
-        # Mock rope module
-        class MockRoPE(torch.nn.Module):
-            def forward(self, x, position_ids):
-                seq_len = position_ids.shape[-1]
-                cos = torch.ones(1, seq_len, D) * 0.5
-                sin = torch.ones(1, seq_len, D) * 0.3
-                return cos, sin
-
-        try:
-            state.rerotate_keys(MockRoPE(), old_positions)
-            # Keys should have changed
-            assert not torch.equal(state.key_states, old_keys)
-        except ImportError:
-            pytest.skip("transformers not available for rerotation test")
-
-    # -------------------------------------------------------------------
-    # 13. test_rerotation_uses_model_rope_module
-    # -------------------------------------------------------------------
-
-    def test_rerotation_uses_model_rope_module(self):
-        """Rerotation must use the model's RoPE (for NTK/YaRN preservation)."""
-        # Verified by code inspection: state.rerotate_keys accepts rope_module
-        # and calls it to get cos/sin. The test below confirms the signature.
-        state = CacheState()
-        sig = inspect.signature(state.rerotate_keys)
-        assert "rope_module" in sig.parameters
-
-    # -------------------------------------------------------------------
-    # 14. test_values_not_rerotated
-    # -------------------------------------------------------------------
-
-    def test_values_not_rerotated(self):
-        """Values should remain unchanged after rerotation."""
-        state = CacheState()
-        B, H, T, D = 1, 4, 10, 64
-        state.key_states = torch.randn(B, H, T, D)
-        state.value_states = torch.randn(B, H, T, D)
-        state.position_ids = torch.arange(T)
-
-        old_values = state.value_states.clone()
-        old_positions = torch.arange(T) * 2
-
-        class MockRoPE(torch.nn.Module):
-            def forward(self, x, position_ids):
-                seq_len = position_ids.shape[-1]
-                cos = torch.ones(1, seq_len, D)
-                sin = torch.zeros(1, seq_len, D)
-                return cos, sin
-
-        try:
-            state.rerotate_keys(MockRoPE(), old_positions)
-            assert torch.equal(state.value_states, old_values)
-        except ImportError:
-            pytest.skip("transformers not available")
+        # Key values are the untouched survivors — no re-rotation.
+        assert torch.equal(state.key_states, survivor_keys)
+        # The KVPress rerotation path is gone.
+        assert not hasattr(CacheState, "rerotate_keys")
 
     # -------------------------------------------------------------------
     # 15. test_retained_windows_are_in_chronological_order
@@ -666,7 +579,7 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
     )
     cache = WindowedCache(
         config=cfg, prefill_len=8, model_config=model_cfg,
-        kv_dtype=torch.float32, rope_module=_NoOpRoPE(),
+        kv_dtype=torch.float32,
         num_layers=1, max_tokens=0,
     )
     k = _make_pos_keys(B, H_kv, 8, D)
@@ -696,15 +609,15 @@ class TestBatching:
         assert state.original_window_ids[0].tolist() == [1, 3, 9]
         assert state.original_window_ids[1].tolist() == [5, 7, 9]
 
-        # Eviction always re-rotates: position_ids are rebased to contiguous
-        # arange(T_retained) for every row (the survivors' ORIGINAL positions
-        # live on in original_window_ids above, not in position_ids).
+        # Eviction only compacts: position_ids keep each row's survivors'
+        # ORIGINAL positions (no rebasing). With window_size=1 / num_sink=0 the
+        # token position equals the window id, so they match the ids above.
         assert state.position_ids.shape == (2, 3)
-        assert state.position_ids[0].tolist() == [0, 1, 2]
-        assert state.position_ids[1].tolist() == [0, 1, 2]
+        assert state.position_ids[0].tolist() == [1, 3, 9]
+        assert state.position_ids[1].tolist() == [5, 7, 9]
 
-        # Keys encode their original token index; the no-op RoPE leaves key
-        # values unchanged → confirm the right tokens survived per row.
+        # Keys encode their original token index and are never re-rotated →
+        # confirm the right tokens survived per row.
         kept = state.key_states[:, 0, :, 0]  # [B, T_retained]
         assert kept[0].tolist() == [1.0, 3.0, 9.0]
         assert kept[1].tolist() == [5.0, 7.0, 9.0]
@@ -736,86 +649,6 @@ class TestBatching:
         assert state.position_ids[1].tolist() == [101, 103, 104]
 
 
-class TestPositionOverrideHook:
-    """The query-position override pre-hook forces the query to sit at the
-    COMPACTED cache length each step (KVPress methodology), independent of the
-    monotonic position_ids HF generate would otherwise pass."""
-
-    @staticmethod
-    def _install(seq_len):
-        """Build a fake (model, decoder, captured-kwargs, cache) and install the
-        override pre-hook. ``seq_len`` is the compacted cache length the cache
-        reports via get_seq_length()."""
-        captured: dict = {}
-
-        class _Decoder(torch.nn.Module):
-            def forward(self, **kwargs):
-                captured.update(kwargs)
-                return None
-
-        decoder = _Decoder()
-
-        class _Model:
-            def get_decoder(self_inner):
-                return decoder
-
-        class _Cache:
-            def get_seq_length(self_inner, layer_idx=0):
-                return seq_len
-
-        handles = HookHandles()
-        install_position_override_hook(_Model(), _Cache(), handles)
-        return decoder, captured, handles
-
-    def test_prefill_positions_start_at_zero(self):
-        decoder, captured, handles = self._install(seq_len=0)
-        try:
-            decoder(
-                input_ids=torch.zeros(1, 8, dtype=torch.long),
-                position_ids=torch.arange(8).unsqueeze(0),
-                cache_position=torch.arange(8),
-                attention_mask=torch.ones(1, 8, dtype=torch.long),
-            )
-            assert captured["cache_position"].tolist() == list(range(8))
-            assert captured["position_ids"].tolist() == [list(range(8))]
-            # prefill mask length (8) == past_seen(0)+q_len(8) → left intact.
-            assert captured["attention_mask"] is not None
-        finally:
-            handles.remove()
-
-    def test_decode_query_placed_at_compacted_length(self):
-        # Cache compacted to 5 survivors; generate would pass a monotonic
-        # position (42) and a full-length attention mask (43).
-        decoder, captured, handles = self._install(seq_len=5)
-        try:
-            decoder(
-                input_ids=torch.zeros(1, 1, dtype=torch.long),
-                position_ids=torch.tensor([[42]]),
-                cache_position=torch.tensor([42]),
-                attention_mask=torch.ones(1, 43, dtype=torch.long),
-            )
-            # Query overridden to the compacted length (the "N_survivor" slot).
-            assert captured["cache_position"].tolist() == [5]
-            assert captured["position_ids"].tolist() == [[5]]
-            # Full-length mask (43) != compacted (5+1) → nulled for B=1.
-            assert captured["attention_mask"] is None
-        finally:
-            handles.remove()
-
-    def test_remove_restores_passthrough(self):
-        decoder, captured, handles = self._install(seq_len=5)
-        handles.remove()
-        # After removal the hook no longer rewrites kwargs.
-        decoder(
-            input_ids=torch.zeros(1, 1, dtype=torch.long),
-            position_ids=torch.tensor([[42]]),
-            cache_position=torch.tensor([42]),
-            attention_mask=torch.ones(1, 43, dtype=torch.long),
-        )
-        assert captured["cache_position"].tolist() == [42]
-        assert captured["attention_mask"] is not None
-
-
 # ---------------------------------------------------------------------------
 # Cumulative score accumulation across prefill + decode
 # ---------------------------------------------------------------------------
@@ -833,7 +666,7 @@ def _drive_cache(scores_per_call, B=1, H_kv=2, D=8):
     )
     cache = WindowedCache(
         config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
-        kv_dtype=torch.float32, rope_module=_NoOpRoPE(), num_layers=1, max_tokens=0,
+        kv_dtype=torch.float32, num_layers=1, max_tokens=0,
     )
     k = _make_pos_keys(B, H_kv, 8, D)
     cache.update(k, k.clone(), 0, cache_kwargs={

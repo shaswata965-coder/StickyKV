@@ -65,12 +65,11 @@ class WindowedCacheConfig:
 
     Notes
     -----
-    Eviction always **compacts and re-rotates** (KVPress ``KeyRerotationPress``
-    methodology): surviving keys are gathered contiguous in memory, their RoPE
-    rotation is stripped and re-applied at contiguous positions
-    ``[0..T_retained-1]``, and the query position is overridden to the compacted
-    cache length each step (see ``install_position_override_hook`` in
-    ``hooks.py``).  There is no keep-original-positions path.
+    Eviction only **compacts**: surviving keys are gathered contiguous in
+    memory but keep the RoPE rotation baked in at their original absolute
+    positions — RoPE is never stripped or re-applied.  The query keeps its
+    natural monotonic (absolute) position from HF, so the query<->key relative
+    phase is preserved without any position override.
 
     Scoring is H2O-style cumulative: every query row contributes to the
     per-key score at every step.  There is no observation window.

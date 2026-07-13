@@ -36,8 +36,6 @@ import torch.nn.functional as F
 
 import os
 
-from utils.position_override import install_position_override_hook
-
 from .scorer import compute_window_scores, reduce_token_scores_to_windows
 
 
@@ -153,11 +151,9 @@ def install_score_hooks(
     """
     handles = HookHandles()
 
-    # Always install the query-position override first (independent of scoring):
-    # the cache compacts+re-rotates every eviction, so the query must be placed
-    # at the compacted cache length each step even if scoring degrades to
-    # sink+local only. See utils.position_override.
-    install_position_override_hook(model, cache, handles)
+    # Eviction compacts survivors but keeps their original RoPE positions and
+    # never re-rotates keys, so the query keeps its natural monotonic (absolute)
+    # position from HF and needs no position override.
 
     attn_classes = _get_attn_classes()
     if not attn_classes:

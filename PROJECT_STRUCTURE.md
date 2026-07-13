@@ -74,7 +74,6 @@ C:\StickyKV/
 └── utils/                           # Shared utilities
     ├── config.py                    # Typed config dataclasses + load_config() + validate_parity_pair()
     ├── cache_factory.py             # get_cache_classes() — backend selection + pairing validation
-    ├── position_override.py         # install_position_override_hook() — query→compacted-length pre-hook (KVPress)
     ├── metrics.py                   # Jaccard similarity + aggregation helpers (vectorized, loop-free)
     ├── sticky_metrics.py            # Sticky-K policy analytics — Global LIR + absolute missed mass
     ├── hashing.py                   # sha256_file(), sha256_string()
@@ -199,11 +198,13 @@ Eager attention materializes `attn_weights` and includes them in the output tupl
 `hooks.py` registers a plain `register_forward_hook` and reads them directly.
 The runner must pass `output_attentions=True` to `model.generate()`.
 
-**Both backends** also install the shared query-position override pre-hook
-(`utils/position_override.py`) from `install_score_hooks()`: the cache re-rotates
-survivors to contiguous positions every eviction, so the pre-hook overrides the
-query's `position_ids`/`cache_position` to the compacted cache length each step
-(KVPress methodology). Its handle is removed with the score hooks.
+**Eviction keeps original RoPE positions.** Eviction only *compacts* the cache:
+surviving keys keep the RoPE rotation baked in at their original absolute
+positions — keys are never stripped and re-rotated. The query keeps its natural
+monotonic (absolute) position from HuggingFace, so the query↔key relative RoPE
+phase is preserved without any position-override hook. (This replaces the earlier
+KVPress `KeyRerotationPress` approach, which re-rotated survivors to contiguous
+positions and overrode the query position each step.)
 
 **When to use which:**  
 Use eager on Kaggle T4/P100 or any machine without `flash-attn` installed.  

@@ -22,13 +22,13 @@ class CacheState:
     value_states : Tensor
         Shape ``[B, H_kv, T, D]``.
     position_ids : Tensor
-        Shape ``[B, T]``, int64.  Every eviction compacts then **re-rotates**:
-        ``slice_and_keep`` first gathers the surviving tokens' original
-        positions (so ``rerotate_keys`` can strip RoPE with the correct angles),
-        then ``rerotate_keys`` rebases them to contiguous ``arange(T_retained)``
-        and re-applies RoPE at those positions (KVPress methodology).  The query
-        position is overridden to the compacted cache length each step
-        (``install_position_override_hook``), keeping relative phase exact.
+        Shape ``[B, T]``, int64.  Eviction only **compacts**: surviving keys
+        keep the RoPE rotation they were given at their *original* absolute
+        positions, and ``slice_and_keep`` gathers those original positions so
+        the surviving tokens carry their true positions (just packed
+        contiguously in memory).  RoPE is never stripped or re-applied, and the
+        query keeps its natural (monotonic, absolute) position from HF, so the
+        query<->key relative phase is preserved without any override.
     window_scores : Tensor
         Shape ``[B, H_q, W]``.  Running cumulative per-window scores.
     original_window_ids : Tensor
@@ -148,85 +148,11 @@ class CacheState:
         self.value_states = torch.gather(self.value_states, dim=2, index=idx_k).contiguous()
 
         # Gather position_ids to the surviving tokens' ORIGINAL positions.
-        # This is the intermediate state: the caller has already snapshotted
-        # these originals, and rerotate_keys (called right after) strips RoPE at
-        # these angles and then rebases position_ids to contiguous
-        # arange(T_retained). position_ids is [B, T]; gather each row
-        # independently because rows may evict different windows.
+        # Keys are NOT re-rotated: survivors retain the RoPE rotation baked in
+        # at their original absolute positions, so position_ids must stay at
+        # those original values (just compacted). position_ids is [B, T]; gather
+        # each row independently because rows may evict different windows.
         if self.position_ids is not None:
             self.position_ids = torch.gather(
                 self.position_ids, 1, retain_token_indices.to(self.position_ids.device)
             ).contiguous()
-
-    # -----------------------------------------------------------------
-    # rerotate_keys
-    # -----------------------------------------------------------------
-
-    def rerotate_keys(
-        self,
-        rope_module: torch.nn.Module,
-        old_position_ids: Tensor,
-    ) -> None:
-        """Strip old RoPE rotation and re-apply with contiguous positions.
-
-        Uses the model's own ``apply_rotary_pos_emb`` to preserve NTK / YaRN
-        scaling.  Values are **not** rotated (RoPE applies to keys only in
-        LLaMA / Qwen).
-
-        Parameters
-        ----------
-        rope_module : nn.Module
-            The model's rotary embedding module (e.g. ``model.model.rotary_emb``).
-        old_position_ids : Tensor
-            Shape ``[B, T_retained]`` (per row), or ``[T_retained]`` (shared
-            across the batch, broadcast).  The original positions before
-            compaction.
-        """
-        # Lazy import to avoid circular deps at module level
-        try:
-            from transformers.models.llama.modeling_llama import (
-                apply_rotary_pos_emb,
-            )
-        except ImportError:
-            from transformers.models.qwen2.modeling_qwen2 import (
-                apply_rotary_pos_emb,
-            )
-
-        B = self.key_states.shape[0]
-        T_retained = self.key_states.shape[2]
-        device = self.key_states.device
-
-        # Old positions → cos/sin.  Accept a shared 1-D vector or per-row [B, T].
-        old_pos = old_position_ids
-        if old_pos.dim() == 1:
-            old_pos = old_pos.unsqueeze(0).expand(B, -1)
-        cos_old, sin_old = rope_module(self.value_states, old_pos)
-
-        # Undo old rotation: cos(-θ)=cos(θ), sin(-θ)=-sin(θ)
-        _, k_unrotated = apply_rotary_pos_emb(
-            self.key_states, self.key_states, cos_old, -sin_old
-        )
-
-        # New contiguous positions (same for every row)
-        new_pos = (
-            torch.arange(T_retained, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
-        cos_new, sin_new = rope_module(self.value_states, new_pos)
-
-        # Apply new rotation
-        _, k_rerotated = apply_rotary_pos_emb(
-            k_unrotated, k_unrotated, cos_new, sin_new
-        )
-
-        self.key_states = k_rerotated
-        # Keys now live at contiguous positions [0..T_retained-1]; keep the
-        # bookkeeping in sync (slice_and_keep left the *original* positions) so
-        # a subsequent eviction snapshots correct "old" positions.
-        self.position_ids = (
-            torch.arange(T_retained, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(B, -1)
-            .contiguous()
-        )

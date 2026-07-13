@@ -1,7 +1,9 @@
 """WindowedCache — HuggingFace Cache integration for windowed KV cache.
 
 Orchestration only.  No scoring math, no Top-K math, no attention computation,
-no RoPE math — only calls into :mod:`state` and :mod:`policy`.
+no RoPE math — only calls into :mod:`state` and :mod:`policy`.  Eviction only
+compacts surviving keys; it never strips or re-applies RoPE, so survivors keep
+the rotation baked in at their original absolute positions.
 
 NOTE: This module is byte-identical to ``modules/windowed_cache/cache.py``
 (backends only differ in their ``hooks.py``). Any change here MUST be mirrored
@@ -40,10 +42,6 @@ class WindowedCache(_HFCacheBase):
         HuggingFace ``PretrainedConfig`` or compatible.
     kv_dtype : torch.dtype
         Data type of the KV cache tensors.
-    rope_module : nn.Module
-        The model's rotary embedding module, used to re-rotate surviving keys
-        to contiguous positions after every eviction (KVPress
-        ``KeyRerotationPress`` methodology).
     num_layers : int
         Number of transformer layers.
     telemetry : Telemetry, optional
@@ -56,7 +54,6 @@ class WindowedCache(_HFCacheBase):
         prefill_len: int,
         model_config: Any,
         kv_dtype: torch.dtype,
-        rope_module: torch.nn.Module,
         num_layers: int,
         max_tokens: int,
         telemetry: Optional[Telemetry] = None,
@@ -73,7 +70,6 @@ class WindowedCache(_HFCacheBase):
 
         self.config = config
         self.resolved = config.resolve(prefill_len, model_config, kv_dtype, max_tokens)
-        self.rope_module = rope_module
         self.num_layers = num_layers
         self.telemetry = telemetry if telemetry is not None else NullTelemetry()
 
@@ -122,10 +118,10 @@ class WindowedCache(_HFCacheBase):
         3. Accumulate into ``state.window_scores``.
         4. If ``policy.should_evict(step)``:
            a. Two-step retain: window indices → token indices.
-           b. Snapshot survivors' original positions, then ``state.slice_and_keep``.
-           c. ``state.rerotate_keys`` — strip + re-apply RoPE at contiguous
-              positions ``[0..T_retained-1]`` (always; KVPress methodology).
-           d. Gather ``state.window_scores`` by retained window indices.
+           b. ``state.slice_and_keep`` — compact survivors in memory, keeping
+              their original (compacted) RoPE positions.  Keys are never
+              re-rotated.
+           c. Gather ``state.window_scores`` by retained window indices.
         5. Return ``(state.key_states, state.value_states)``.
         """
         state = self._states[layer_idx]
@@ -251,35 +247,22 @@ class WindowedCache(_HFCacheBase):
                 layer_idx, step, ranking_scores, retain_token_idx
             )
 
-            # b. Snapshot survivors' original positions before compaction so
-            #    rerotate_keys can strip RoPE with the correct (original) angles.
-            #    position_ids is [B, T]; gather per row so each row's snapshot
-            #    matches the tokens it actually keeps.
-            old_positions = torch.gather(
-                state.position_ids, 1,
-                retain_token_idx.to(state.position_ids.device),
-            ).clone()
-
-            # c. Compact K/V (gather survivors contiguous in memory).
+            # b. Compact K/V (gather survivors contiguous in memory). Surviving
+            #    keys keep the RoPE rotation they were given at their original
+            #    absolute positions — no strip/re-apply. slice_and_keep also
+            #    compacts position_ids to those original positions. The query
+            #    keeps its natural monotonic (absolute) position from HF, so the
+            #    query<->key relative RoPE phase stays exact without any
+            #    position override.
             state.slice_and_keep(retain_token_idx)
 
-            # d. Re-rotate surviving keys to contiguous positions
-            #    [0..T_retained-1] (KVPress KeyRerotationPress). This is the only
-            #    eviction path: keys are rebased AND the query's RoPE position is
-            #    overridden to the compacted cache length every step
-            #    (install_position_override_hook), so query<->key relative phase
-            #    stays exact. Because the override sets the query position
-            #    explicitly, this is correct independent of how HF derives
-            #    cache_position across transformers versions.
-            state.rerotate_keys(self.rope_module, old_positions)
-
-            # e. Gather window_scores by retained_window_idx
+            # c. Gather window_scores by retained_window_idx
             idx_w = retained_window_idx.unsqueeze(1).expand(B, H_q, -1)
             state.window_scores = torch.gather(
                 state.window_scores, dim=-1, index=idx_w
             ).contiguous()
 
-            # f. Keep original_window_ids in sync with the surviving windows.
+            # d. Keep original_window_ids in sync with the surviving windows.
             #    Gather per row ([B, W]) because rows may retain different windows.
             if state.original_window_ids is not None:
                 state.original_window_ids = torch.gather(
