@@ -235,18 +235,10 @@ class WindowedCache(_HFCacheBase):
             B = state.key_states.shape[0]
             H_q = state.window_scores.shape[1]
 
-            # state.window_scores holds per-window Lp POWER-SUMS (Σ A^p)
-            # accumulated across prefill + decode. Take the 1/p root now to get
-            # the Lp scores used for ranking. p == 1 is a plain sum (identity
-            # root), so ranking_scores is state.window_scores unchanged and this
-            # path stays byte-identical to the prior behaviour. The stored
-            # window_scores stay in power-space (gathered below) so accumulation
-            # continues correctly after compaction.
-            p = self.resolved.score_p
-            ranking_scores = (
-                state.window_scores if p == 1.0
-                else state.window_scores.pow(1.0 / p)
-            )
+            # state.window_scores holds per-window cumulative received attention
+            # (plain H2O sum) accumulated across prefill + decode. Rank windows
+            # directly by this cumulative score.
+            ranking_scores = state.window_scores
 
             # a. Two-step retain
             retained_window_idx = policy.compute_retain_window_indices(
