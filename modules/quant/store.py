@@ -18,7 +18,7 @@ frozen ``position_range``. Values carry no RoPE (asymmetric store).
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -193,6 +193,46 @@ class QuantizedStore:
             torch.stack(values, dim=0),     # [N_q, H_kv, window, D]
             torch.stack(positions, dim=0),  # [N_q, window]
         )
+
+    def iter_active_windows(
+        self, out_dtype: torch.dtype
+    ) -> Iterator[Tuple[int, Tensor, Tensor, Tensor]]:
+        """Dequantize active windows **one at a time**, lazily (design §11, Phase 2).
+
+        This is the read primitive for the tiled GEMV attention path. Unlike
+        :meth:`gather_active` — which stacks the whole Q tier into one
+        ``[N_q, H_kv, window, D]`` fp tensor before returning — this yields a
+        single window's fp tensors per step and holds no other dequantized state.
+        The caller consumes (attends over) each window and lets it fall out of
+        scope, so the largest fp copy of the *quantized portion* ever resident is
+        **one window** (``window`` tokens), never the full ``T_q``. That is the
+        whole point of the two-tier store: only int4 codes live in memory; the
+        fp16 blow-up happens window-by-window, on demand, and is discarded
+        immediately.
+
+        Yields, in chronological (``original_window_id``) order:
+
+        - ``window_id`` : int
+        - ``key_pre_rope`` : ``[H_kv, window, D]`` — dequantized, **pre-RoPE**
+          (the caller RoPE-stamps at ``position_range``).
+        - ``value`` : ``[H_kv, window, D]``
+        - ``position_range`` : ``[window]`` int64 original absolute positions.
+        """
+        for e in self.ledger.active_entries():
+            key_pre_rope = dequantize_key_window(
+                e.key_codes, e.key_scale, e.key_zero,
+                self.window_size, out_dtype=out_dtype,
+            )
+            value = dequantize_value_window(
+                e.val_codes, e.val_scale, e.val_zero,
+                self.head_dim, out_dtype=out_dtype,
+            )
+            yield (
+                e.original_window_id,
+                key_pre_rope,
+                value,
+                e.position_range.to(torch.long),
+            )
 
     # -- eviction bookkeeping ------------------------------------------------
 

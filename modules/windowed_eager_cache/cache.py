@@ -28,6 +28,7 @@ from .telemetry import NullTelemetry, Telemetry
 
 from modules.quant import (
     QuantizedStore,
+    gemv_decode,
     materialize_effective_kv,
     unrotate_key_window,
 )
@@ -387,6 +388,55 @@ class WindowedCache(_HFCacheBase):
             out_dtype=state.key_states.dtype,
         )
         return eff_k.unsqueeze(0), eff_v.unsqueeze(0)
+
+    def decode_attention(
+        self,
+        layer_idx: int,
+        query_states: Tensor,
+        scaling: Optional[float] = None,
+    ) -> Tensor:
+        """Decode attention output for one step via the tiled GEMV path (design §11).
+
+        Streams the two tiers into an online (flash-style) softmax, consuming the
+        int4 Q tier **one window at a time** — the full effective K/V is never
+        materialized (unlike :meth:`_materialize`). Use this on the decode step
+        instead of ``materialize → SDPA`` to avoid the fp16 blow-up of the whole
+        Q tier; the result equals that path to fp32 reduction-order tolerance.
+
+        Decode only (``query_states`` must carry a single query token), B = 1.
+        At ``q == 0`` (or an empty Q tier) it reduces to plain fp attention over
+        the fp store, so it is safe to call unconditionally on the decode path.
+
+        Parameters
+        ----------
+        layer_idx : int
+        query_states : ``[1, H_q, 1, D]`` — the post-RoPE decode query, row 0.
+        scaling : float, optional — softmax scale; defaults to ``D ** -0.5``.
+
+        Returns
+        -------
+        attn : ``[1, H_q, 1, D]`` attention output.
+        """
+        state = self._states[layer_idx]
+        if state.key_states is None:
+            raise RuntimeError(
+                f"decode_attention: layer {layer_idx} has no cached keys yet "
+                "(call update() first)."
+            )
+        if state.key_states.shape[0] != 1 or query_states.shape[0] != 1:
+            raise NotImplementedError(
+                "decode_attention is batch-size 1 only in v1 (design.md §10)."
+            )
+        store = self._stores[layer_idx]
+        return gemv_decode(
+            query_states[0],           # [H_q, 1, D]
+            state.key_states[0],       # [H_kv, T_fp, D]
+            state.value_states[0],     # [H_kv, T_fp, D]
+            store,
+            rope_module=self.rope_module,
+            scaling=scaling,
+            out_dtype=state.key_states.dtype,
+        ).unsqueeze(0)                 # [1, H_q, 1, D]
 
     def _evict_two_tier(self, layer_idx: int, step: int) -> None:
         """One two-tier eviction (design §5), operating on row 0 (B = 1).

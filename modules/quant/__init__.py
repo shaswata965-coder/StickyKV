@@ -49,6 +49,7 @@ try:  # pragma: no cover - populated incrementally during bring-up
         unrotate_key_window,
         window_id_of,
     )
+    from .gemv import gemv_decode, tiled_gemv_attention  # noqa: F401
 
     __all__ += [
         "LedgerEntry",
@@ -57,6 +58,8 @@ try:  # pragma: no cover - populated incrementally during bring-up
         "materialize_effective_kv",
         "unrotate_key_window",
         "window_id_of",
+        "tiled_gemv_attention",
+        "gemv_decode",
     ]
 except ImportError:
     pass
