@@ -459,6 +459,7 @@ class LongBenchRunner:
             num_sink_tokens=cfg.cache.num_sink_tokens,
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
+            score_p=getattr(cfg.cache, "score_p", 1.0),
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
         )

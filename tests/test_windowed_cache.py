@@ -944,3 +944,90 @@ class TestBatching:
         state.slice_and_keep(retain)
         assert state.position_ids[0].tolist() == [0, 2, 5]
         assert state.position_ids[1].tolist() == [101, 103, 104]
+
+
+# ---------------------------------------------------------------------------
+# Lp-norm continuous accumulation (score_p)
+# ---------------------------------------------------------------------------
+
+
+def _drive_lp_cache(score_p, scores_per_call, B=1, H_kv=2, D=8):
+    """Drive a WindowedCache through prefill + 2 decode steps with a given
+    ``score_p``, injecting per-call window scores. Geometry (window_size=1,
+    num_sink=0, local=1, budget=0.375, prefill=8) → top_k=2 evictable + 1 local;
+    the eviction fires on the 2nd decode call. Keys encode their token index, so
+    the returned sorted survivor list *is* the set of retained window indices."""
+    cfg = WindowedCacheConfig(
+        window_size=1, num_sink_tokens=0, local_window_size=1,
+        cache_budget=0.375, score_p=score_p,
+    )
+    cache = WindowedCache(
+        config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
+        kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+        num_layers=1, max_tokens=0,
+    )
+    k = _make_pos_keys(B, H_kv, 8, D)
+    cache.update(k, k.clone(), 0, cache_kwargs={
+        "cache_position": torch.arange(8), "window_scores": scores_per_call[0],
+    })
+    for i, pos in enumerate((8, 9)):
+        k1 = _make_pos_keys(B, H_kv, 1, D, start=pos)
+        cache.update(k1, k1.clone(), 0, cache_kwargs={
+            "cache_position": torch.arange(pos, pos + 1),
+            "window_scores": scores_per_call[i + 1],
+        })
+    survivors = cache._states[0].key_states[0, 0, :, 0].tolist()
+    return sorted(int(x) for x in survivors)
+
+
+def _lp_score(vals, W, H_q=4):
+    t = torch.zeros(1, H_q, W, dtype=torch.float32)
+    for idx, v in vals.items():
+        t[0, :, idx] = v
+    return t
+
+
+class TestLpAccumulation:
+    """score_p > 1 accumulates per-window POWER-SUMS (Σ A^p) across prefill and
+    decode and roots at eviction; p == 1 is byte-identical to the plain sum."""
+
+    def test_scorer_returns_power_sum_not_rooted(self):
+        # p=1 is exactly the query-sum; p=2 is the pre-root power-sum Σ A^2,
+        # NOT (Σ A^2)^(1/2) — the root now happens in the cache at eviction.
+        attn = torch.rand(1, 2, 5, 8)
+        assert torch.equal(
+            compute_window_scores(attn, 0, 1, p=1.0), attn.sum(dim=-2)
+        )
+        p2 = compute_window_scores(attn, 0, 1, p=2.0)
+        assert torch.allclose(p2, attn.pow(2).sum(dim=-2), atol=1e-6)
+        # Being pre-root, it must differ from the rooted Lp score.
+        assert not torch.allclose(p2, attn.pow(2).sum(dim=-2).sqrt(), atol=1e-3)
+
+    def test_continuous_lp_guards_prefill_spike(self):
+        # Token 2 gets one strong prefill spike (0.9); tokens 0/4 get diffuse
+        # mass (0.20/0.21) over all 10 queries. Under sum the diffuse mass wins;
+        # under p=3 the spike's power dominates and survives dilution.
+        p = 3.0
+        surv_p3 = _drive_lp_cache(3.0, [
+            _lp_score({2: 0.9**p, 0: 8 * 0.20**p, 4: 8 * 0.21**p}, 8),
+            _lp_score({0: 0.20**p, 4: 0.21**p}, 9),
+            _lp_score({0: 0.20**p, 4: 0.21**p}, 10),
+        ])
+        surv_p1 = _drive_lp_cache(1.0, [
+            _lp_score({2: 0.9, 0: 8 * 0.20, 4: 8 * 0.21}, 8),
+            _lp_score({0: 0.20, 4: 0.21}, 9),
+            _lp_score({0: 0.20, 4: 0.21}, 10),
+        ])
+        assert surv_p1 == [0, 4, 9]   # spike token 2 evicted under plain sum
+        assert surv_p3 == [2, 4, 9]   # spike token 2 saved under Lp
+
+    def test_local_window_score_accumulates_into_evictable(self):
+        # Token 8 is the LOCAL window at decode step 0 and is scored 100 that
+        # step; at step 1 it ages into the evictable band. It must survive top-2,
+        # proving scores earned while local are accumulated (not reset).
+        surv = _drive_lp_cache(1.0, [
+            _lp_score({i: 0.1 for i in range(8)} | {7: 0.2}, 8),
+            _lp_score({8: 100.0}, 9),   # scored while local
+            _lp_score({}, 10),          # eviction fires; token 8 now evictable
+        ])
+        assert surv == [7, 8, 9]

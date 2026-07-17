@@ -115,6 +115,7 @@ def install_score_hooks(
 
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
+    score_p = float(getattr(config, "score_p", 1.0))
 
     warned_once = [False]
 
@@ -162,10 +163,18 @@ def install_score_hooks(
                         warned_once[0] = True
                     return
 
-                # attn_weights: [B, H_q, T, S] over the effective-K axis. Sum
+                # attn_weights: [B, H_q, T, S] over the effective-K axis. Reduce
                 # across the T (query) axis — every query row contributes (H2O
-                # cumulative, no obs_window) — to per-key received attention.
-                token_scores = attn_weights.sum(dim=-2)          # [B, H_q, S]
+                # cumulative, no obs_window) — to a per-key Lp power-sum. p == 1
+                # is the plain received-attention sum; p > 1 accumulates the p-th
+                # powers Σ_i A_ij^p (PRE-root, in fp32 so tiny probabilities do
+                # not underflow) and the cache takes the 1/p root at eviction.
+                if score_p != 1.0:
+                    token_scores = (
+                        attn_weights.to(torch.float32).pow(score_p).sum(dim=-2)
+                    )                                            # [B, H_q, S]
+                else:
+                    token_scores = attn_weights.sum(dim=-2)      # [B, H_q, S]
 
                 # At q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
                 # layout, so the key axis of attn_weights is unsorted too; undo

@@ -190,6 +190,17 @@ class TestScoring:
         expected = torch.tensor([[[10.0, 8.0, 7.0, 5.0]]]).expand(B, H_q, -1)
         assert torch.allclose(retained_scores, expected)
 
+    # 11 — Lp power-sum (score_p): p=1 is the plain sum; p>1 is the pre-root
+    #      power-sum Σ A^p (the 1/p root is deferred to the cache at eviction).
+    def test_scorer_returns_power_sum_not_rooted(self):
+        attn = torch.rand(1, 2, 5, 8)
+        assert torch.equal(
+            compute_window_scores(attn, 0, 1, p=1.0), attn.sum(dim=-2)
+        )
+        p2 = compute_window_scores(attn, 0, 1, p=2.0)
+        assert torch.allclose(p2, attn.pow(2).sum(dim=-2), atol=1e-6)
+        assert not torch.allclose(p2, attn.pow(2).sum(dim=-2).sqrt(), atol=1e-3)
+
 
 class TestEviction:
 

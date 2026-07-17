@@ -347,9 +347,22 @@ class WindowedCache(_HFCacheBase):
             B = state.key_states.shape[0]
             H_q = state.window_scores.shape[1]
 
+            # state.window_scores holds per-window Lp POWER-SUMS (Σ A^p)
+            # accumulated across prefill + decode. Take the 1/p root now to get
+            # the Lp scores used for ranking. p == 1 is a plain sum (identity
+            # root), so ranking_scores is state.window_scores unchanged and this
+            # path stays byte-identical to the prior behaviour. The stored
+            # window_scores stay in power-space (gathered below) so accumulation
+            # continues correctly after compaction.
+            p = self.resolved.score_p
+            ranking_scores = (
+                state.window_scores if p == 1.0
+                else state.window_scores.pow(1.0 / p)
+            )
+
             # a. Two-step retain
             retained_window_idx = policy.compute_retain_window_indices(
-                state.window_scores
+                ranking_scores
             )
             retain_token_idx = policy.expand_to_token_indices(
                 retained_window_idx, state.window_scores.shape[2]
@@ -357,7 +370,7 @@ class WindowedCache(_HFCacheBase):
 
             # Telemetry
             self.telemetry.record_scores(
-                layer_idx, step, state.window_scores, retain_token_idx
+                layer_idx, step, ranking_scores, retain_token_idx
             )
 
             # b. Snapshot old positions before compaction (only needed when
@@ -513,14 +526,24 @@ class WindowedCache(_HFCacheBase):
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
-        retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # state.window_scores holds per-window Lp POWER-SUMS (Σ A^p) accumulated
+        # across prefill + decode. Root by 1/p to get the Lp ranking scores; the
+        # stored window_scores stay in power-space (gathered at step 5) so
+        # accumulation continues correctly after compaction. p == 1 is the
+        # identity root ⇒ byte-identical to the plain-sum path.
+        p = self.resolved.score_p
+        ranking_scores = (
+            state.window_scores if p == 1.0
+            else state.window_scores.pow(1.0 / p)
+        )
+        retained_idx, new_tier = policy.compute_two_tier_retain(ranking_scores)
         k_fp, n_q, local_w = policy.tier_counts(W)
         n_fp = k_fp + local_w
 
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
         # retained indices are merged-WINDOW indices (not token indices — the fp
         # and Q survivors live in different stores).
-        self.telemetry.record_scores(layer_idx, step, state.window_scores, retained_idx)
+        self.telemetry.record_scores(layer_idx, step, ranking_scores, retained_idx)
 
         wids = torch.gather(state.original_window_ids, 1, retained_idx)   # [B, W_ret]
         is_q_new = new_tier == 1

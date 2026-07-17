@@ -47,6 +47,7 @@ class CacheConfig:
     window_size: int = 8
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
+    score_p: float = 1.0  # Lp-norm exponent for query pooling (p=1 = plain H2O sum)
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int4 split q in [0,1] (design.md §7); 0 disables the Q tier
     # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
@@ -98,6 +99,21 @@ class CacheConfig:
                     f"local_window_size as float must be in (0, 1], "
                     f"got {self.local_window_size}"
                 )
+
+        # -- score_p (Lp-norm exponent; mirrors WindowedCacheConfig) --
+        if isinstance(self.score_p, bool):
+            raise ConfigValidationError(
+                f"score_p must be a number >= 1, got bool {self.score_p!r}"
+            )
+        if not isinstance(self.score_p, (int, float)):
+            raise ConfigValidationError(
+                f"score_p must be int or float, got {type(self.score_p).__name__}"
+            )
+        if self.score_p < 1.0:
+            raise ConfigValidationError(
+                f"score_p must be >= 1 (p=1 is plain-sum / H2O), got {self.score_p}"
+            )
+        self.score_p = float(self.score_p)
 
         # quant_ratio: two-tier int4 split (design.md §7). Full validation
         # (even window_size when q>0, range) lives in WindowedCacheConfig; here

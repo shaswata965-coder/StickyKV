@@ -175,6 +175,46 @@ def test_q0_store_is_none():
     assert cache._q == 0.0
 
 
+def test_two_tier_eviction_lp_roots_scores_but_stores_power_sums():
+    """score_p>1 on the two-tier path: eviction ranks by the rooted Lp score,
+    and — the load-bearing contract — leaves the stored window_scores in POWER
+    space (un-rooted) so the next step's ``+=`` keeps accumulating Σ A^p.
+
+    The 1/p root is monotone, so a single eviction's top-k retain is the same as
+    the p=1 case on the same power-sums (mirrors
+    ``test_first_eviction_demotes_and_materializes``); the Lp effect lives in the
+    cross-step power-space accumulation, not in one root."""
+    cfg = WindowedCacheConfig(
+        window_size=2, num_sink_tokens=0, local_window_size=2,
+        cache_budget=0.5, quant_ratio=0.5, score_p=2.0,
+    )
+    cache = WindowedCache(
+        config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
+        kv_dtype=torch.float32, rope_module=_RealRoPE(4),
+        num_layers=1, max_tokens=8,
+    )
+    _seed_prefill_state(cache, n_win=4, ws=2)
+    st = cache._states[0]
+    # window_scores are per-window POWER-SUMS Σ A^p (what the hooks now emit).
+    st.window_scores = torch.zeros(1, 2, 4)
+    st.window_scores[0, :, 0] = 100.0
+    st.window_scores[0, :, 1] = 50.0
+    st.window_scores[0, :, 2] = 10.0
+    st.original_window_ids = torch.tensor([[0, 1, 2, 3]])
+
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
+
+    cache._evict_two_tier(0, step=2)
+
+    # Same retain as the p=1 twin: w0→fp (top), w1→Q, w2 dropped, w3 local.
+    assert _active(cache._stores[0]) == [1]
+    assert st.original_window_ids[0].tolist() == [0, 1, 3]
+    # Stored scores stay in POWER space: kept w0 column is still 100.0, NOT the
+    # rooted sqrt(100)=10.0. A stray root here would corrupt later accumulation.
+    assert st.window_scores[0, 0].max().item() == 100.0
+
+
 # ---------------------------------------------------------------------------
 # Slot table + fp-rebuild invariants (Phase 1)
 # ---------------------------------------------------------------------------

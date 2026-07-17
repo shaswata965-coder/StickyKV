@@ -35,6 +35,7 @@ class ResolvedConfig:
     bytes_per_token: int
     total_budget_bytes: int
     total_budget_tokens: int
+    score_p: float = 1.0       # Lp-norm exponent for query pooling (prefill + decode)
     rerotate_on_evict: bool = False
     # --- two-tier quantization (design.md §7) ---
     # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
@@ -81,6 +82,17 @@ class WindowedCacheConfig:
         Must be ``float`` — ``int`` and ``bool`` are rejected with clear errors.
     track_scores : bool
         Enable telemetry recording.  Default ``False``.
+    score_p : float
+        Exponent ``p`` for Lp-norm pooling over query rows: the per-key score
+        is ``s_j = (Σ_i A_ij^p)^(1/p)``, accumulated continuously across
+        **prefill and decode**.  The cache stores per-window power-sums
+        ``Σ_i A_ij^p`` (additive, so accumulation stays a plain ``+=``) and
+        takes the ``1/p`` root at eviction time.  ``p = 1`` (default) is the
+        plain H2O cumulative sum and is byte-identical to the prior behaviour.
+        ``p > 1`` rewards keys attended intensely by a few queries over keys
+        attended diffusely by many; because the largest term dominates the
+        power-sum, a strong early spike is guarded against dilution by later
+        diffuse attention.
     rerotate_on_evict : bool
         If ``True``, re-rotate surviving keys to contiguous positions after
         each eviction (StreamingLLM-style).  **Default ``False``.**  Re-rotation
@@ -137,6 +149,7 @@ class WindowedCacheConfig:
     local_window_size: Union[int, float]
     cache_budget: float
     track_scores: bool = False
+    score_p: float = 1.0
     rerotate_on_evict: bool = False
     quant_ratio: float = 0.0
     quant_memoize_read: Optional[bool] = None
@@ -206,6 +219,24 @@ class WindowedCacheConfig:
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
             )
+
+        # -- score_p (Lp-norm exponent; bool rejected, must be >= 1) --
+        if isinstance(self.score_p, bool):
+            raise ValueError(
+                f"score_p must be a number >= 1, got bool {self.score_p!r}"
+            )
+        if not isinstance(self.score_p, (int, float)):
+            raise ValueError(
+                f"score_p must be int or float, got "
+                f"{type(self.score_p).__name__}"
+            )
+        if self.score_p < 1.0:
+            raise ValueError(
+                f"score_p must be >= 1 (p=1 is plain-sum / H2O), got "
+                f"{self.score_p}"
+            )
+        # Normalize to float so the downstream pow() exponent is unambiguous.
+        self.score_p = float(self.score_p)
 
         # -- quant_ratio (two-tier split, design.md §7) --
         if isinstance(self.quant_ratio, bool):
@@ -376,6 +407,7 @@ class WindowedCacheConfig:
             bytes_per_token=bytes_per_token,
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
+            score_p=self.score_p,
             rerotate_on_evict=self.rerotate_on_evict,
             quant_ratio=q,
             top_k_fp=top_k_fp,

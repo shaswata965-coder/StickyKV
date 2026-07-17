@@ -194,6 +194,7 @@ def install_score_hooks(
 
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
+    score_p = float(getattr(config, "score_p", 1.0))
 
     # Discover attention modules and assign layer indices in module order.
     layer_idx_map: Dict[int, int] = {}
@@ -328,8 +329,20 @@ def install_score_hooks(
                 #    reduction earlier baselines used.
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
                 sm_dtype = _score_softmax_dtype()
+                # Lp-norm pooling over the query rows, applied on every pass
+                # (prefill AND decode). p == 1 is the plain H2O sum. p > 1
+                # accumulates the p-th powers Σ A^p (PRE-root): keys attended
+                # intensely by a few queries dominate keys attended diffusely by
+                # many. The root is NOT taken here — the cache accumulates these
+                # per-window power-sums continuously across prefill and decode
+                # and takes the 1/p root at eviction time (the power-sum is
+                # additive across chunks, steps, and windows; the root is not).
+                # Powers are summed in fp32 (the softmax stays fp32, skipping the
+                # bf16 cast) so tiny softmax probabilities do not underflow.
+                use_lp = score_p != 1.0
+                score_dtype = torch.float32 if use_lp else q.dtype
                 token_scores = torch.zeros(
-                    B, H_kv, num_groups, S, device=q.device, dtype=q.dtype
+                    B, H_kv, num_groups, S, device=q.device, dtype=score_dtype
                 )
                 chunk = _prefill_score_chunk()
                 for start in range(0, T, chunk):
@@ -351,8 +364,14 @@ def install_score_hooks(
                         )
                         aw = aw.masked_fill(causal, float("-inf"))
 
-                    aw = F.softmax(aw, dim=-1, dtype=sm_dtype).to(q.dtype)
-                    token_scores += aw.sum(dim=-2)                   # [B,H_kv,rep,S]
+                    if use_lp:
+                        # Keep aw in fp32 through the power so tiny probabilities
+                        # do not underflow; accumulate the p-th powers (pre-root).
+                        aw = F.softmax(aw, dim=-1, dtype=torch.float32)
+                        token_scores += aw.pow(score_p).sum(dim=-2)  # [B,H_kv,rep,S]
+                    else:
+                        aw = F.softmax(aw, dim=-1, dtype=sm_dtype).to(q.dtype)
+                        token_scores += aw.sum(dim=-2)               # [B,H_kv,rep,S]
                     del aw
 
                 # Merge (H_kv, n_rep) back to H_q in the original head order.
